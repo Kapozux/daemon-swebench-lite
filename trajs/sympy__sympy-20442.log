@@ -1,0 +1,558 @@
+plan-unwanted
+我先复现一下这个 bug。
+
+```bash-action
+cd /testbed && python -c "from sympy.physics.units import *; from sympy.physics.units.util import convert_to; print(convert_to(joule*second, joule))"
+```
+executing输出 Traceback (most recent call last):
+  File "/testbed/sympy/__init__.py", line 22, in <module>
+    import mpmath
+ModuleNotFoundError: No module named 'mpmath'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/testbed/sympy/__init__.py", line 24, in <module>
+    raise ImportError("SymPy now depends on mpmath as an external library. "
+ImportError: SymPy now depends on mpmath as an external library. See https://docs.sympy.org/latest/install.html#mpmath for more information.
+
+
+mpmath 没装。让我检查一下环境。
+
+```bash-action
+cd /testbed && pip install mpmath 2>&1 | tail -5
+```
+executing输出   Downloading mpmath-1.4.1-py3-none-any.whl.metadata (9.1 kB)
+Downloading mpmath-1.4.1-py3-none-any.whl (567 kB)
+Installing collected packages: mpmath
+Successfully installed mpmath-1.4.1
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+mpmath 现在装好了。重新复现。
+
+```bash-action
+cd /testbed && python -c "from sympy.physics.units import *; from sympy.physics.units.util import convert_to; print(convert_to(joule*second, joule))"
+```2026_09_21_11_08_1789988932
+executing输出 10**(2/3)*joule**(7/9)
+
+
+确认 bug 存在（我这版显示 `10**(2/3)*joule**(7/9)`，本质一样）。查看 convert_to 源码。
+
+```bash-action
+cd /testbed && sed -n '1,200p' sympy/physics/units/util.py
+```2026_09_21_11_08_17899889342026_09_21_11_08_1789988936
+executing输出 """
+Several methods to simplify expressions involving unit objects.
+"""
+
+from sympy import Add, Mul, Pow, Tuple, sympify
+from sympy.core.compatibility import reduce, Iterable, ordered
+from sympy.physics.units.dimensions import Dimension
+from sympy.physics.units.prefixes import Prefix
+from sympy.physics.units.quantities import Quantity
+from sympy.utilities.iterables import sift
+
+
+def _get_conversion_matrix_for_expr(expr, target_units, unit_system):
+    from sympy import Matrix
+
+    dimension_system = unit_system.get_dimension_system()
+
+    expr_dim = Dimension(unit_system.get_dimensional_expr(expr))
+    dim_dependencies = dimension_system.get_dimensional_dependencies(expr_dim, mark_dimensionless=True)
+    target_dims = [Dimension(unit_system.get_dimensional_expr(x)) for x in target_units]
+    canon_dim_units = [i for x in target_dims for i in dimension_system.get_dimensional_dependencies(x, mark_dimensionless=True)]
+    canon_expr_units = {i for i in dim_dependencies}
+
+    if not canon_expr_units.issubset(set(canon_dim_units)):
+        return None
+
+    seen = set()
+    canon_dim_units = [i for i in canon_dim_units if not (i in seen or seen.add(i))]
+
+    camat = Matrix([[dimension_system.get_dimensional_dependencies(i, mark_dimensionless=True).get(j, 0) for i in target_dims] for j in canon_dim_units])
+    exprmat = Matrix([dim_dependencies.get(k, 0) for k in canon_dim_units])
+
+    res_exponents = camat.solve_least_squares(exprmat, method=None)
+    return res_exponents
+
+
+def convert_to(expr, target_units, unit_system="SI"):
+    """
+    Convert ``expr`` to the same expression with all of its units and quantities
+    represented as factors of ``target_units``, whenever the dimension is compatible.
+
+    ``target_units`` may be a single unit/quantity, or a collection of
+    units/quantities.
+
+    Examples
+    ========
+
+    >>> from sympy.physics.units import speed_of_light, meter, gram, second, day
+    >>> from sympy.physics.units import mile, newton, kilogram, atomic_mass
+....(省略中间部分)...
+pr.atoms(Quantity), lambda i: i.dimension)
+    for k in d:
+        if len(d[k]) == 1:
+            continue
+        v = list(ordered(d[k]))
+        ref = v[0]/v[0].scale_factor
+        expr = expr.xreplace({vi: ref*vi.scale_factor for vi in v[1:]})
+
+    return expr
+
+
+def check_dimensions(expr, unit_system="SI"):
+    """Return expr if there are not unitless values added to
+    dimensional quantities, else raise a ValueError."""
+    # the case of adding a number to a dimensional quantity
+    # is ignored for the sake of SymPy core routines, so this
+    # function will raise an error now if such an addend is
+    # found.
+    # Also, when doing substitutions, multiplicative constants
+    # might be introduced, so remove those now
+
+    from sympy.physics.units import UnitSystem
+    unit_system = UnitSystem.get_unit_system(unit_system)
+
+    adds = expr.atoms(Add)
+    DIM_OF = unit_system.get_dimension_system().get_dimensional_dependencies
+    for a in adds:
+        deset = set()
+        for ai in a.args:
+            if ai.is_number:
+                deset.add(())
+                continue
+            dims = []
+            skip = False
+            for i in Mul.make_args(ai):
+                if i.has(Quantity):
+                    i = Dimension(unit_system.get_dimensional_expr(i))
+                if i.has(Dimension):
+                    dims.extend(DIM_OF(i).items())
+                elif i.free_symbols:
+                    skip = True
+                    break
+            if not skip:
+                deset.add(tuple(sorted(dims)))
+                if len(deset) > 1:
+                    raise ValueError(
+                        "addends have incompatible dimensions")
+
+    # clear multiplicative constants on Dimensions which may be
+    # left after substitution
+    reps = {}
+    for m in expr.atoms(Mul):
+        if any(isinstance(i, Dimension) for i in m.args):
+            reps[m] = m.func(*[
+                i for i in m.args if not i.is_number])
+
+    return expr.xreplace(reps)
+
+
+让我看完整的 convert_to 函数的中间部分。
+
+```bash-action
+cd /testbed && sed -n '50,130p' sympy/physics/units/util.py
+```2026_09_21_11_08_17899889372026_09_21_11_08_1789988937
+executing输出     >>> from sympy.physics.units import kilometer, centimeter
+    >>> from sympy.physics.units import gravitational_constant, hbar
+    >>> from sympy.physics.units import convert_to
+    >>> convert_to(mile, kilometer)
+    25146*kilometer/15625
+    >>> convert_to(mile, kilometer).n()
+    1.609344*kilometer
+    >>> convert_to(speed_of_light, meter/second)
+    299792458*meter/second
+    >>> convert_to(day, second)
+    86400*second
+    >>> 3*newton
+    3*newton
+    >>> convert_to(3*newton, kilogram*meter/second**2)
+    3*kilogram*meter/second**2
+    >>> convert_to(atomic_mass_constant, gram)
+    1.660539060e-24*gram
+
+    Conversion to multiple units:
+
+    >>> convert_to(speed_of_light, [meter, second])
+    299792458*meter/second
+    >>> convert_to(3*newton, [centimeter, gram, second])
+    300000*centimeter*gram/second**2
+
+    Conversion to Planck units:
+
+    >>> convert_to(atomic_mass_constant, [gravitational_constant, speed_of_light, hbar]).n()
+    7.62963085040767e-20*gravitational_constant**(-0.5)*hbar**0.5*speed_of_light**0.5
+
+    """
+    from sympy.physics.units import UnitSystem
+    unit_system = UnitSystem.get_unit_system(unit_system)
+
+    if not isinstance(target_units, (Iterable, Tuple)):
+        target_units = [target_units]
+
+    if isinstance(expr, Add):
+        return Add.fromiter(convert_to(i, target_units, unit_system) for i in expr.args)
+
+    expr = sympify(expr)
+
+    if not isinstance(expr, Quantity) and expr.has(Quantity):
+        expr = expr.replace(lambda x: isinstance(x, Quantity), lambda x: x.convert_to(target_units, unit_system))
+
+    def get_total_scale_factor(expr):
+        if isinstance(expr, Mul):
+            return reduce(lambda x, y: x * y, [get_total_scale_factor(i) for i in expr.args])
+        elif isinstance(expr, Pow):
+            return get_total_scale_factor(expr.base) ** expr.exp
+        elif isinstance(expr, Quantity):
+            return unit_system.get_quantity_scale_factor(expr)
+        return expr
+
+    depmat = _get_conversion_matrix_for_expr(expr, target_units, unit_system)
+    if depmat is None:
+        return expr
+
+    expr_scale_factor = get_total_scale_factor(expr)
+    return expr_scale_factor * Mul.fromiter((1/get_total_scale_factor(u) * u) ** p for u, p in zip(target_units, depmat))
+
+
+def quantity_simplify(expr):
+    """Return an equivalent expression in which prefixes are replaced
+    with numerical values and all units of a given dimension are the
+    unified in a canonical manner.
+
+    Examples
+    ========
+
+    >>> from sympy.physics.units.util import quantity_simplify
+    >>> from sympy.physics.units.prefixes import kilo
+    >>> from sympy.physics.units import foot, inch
+    >>> quantity_simplify(kilo*foot*inch)
+    250*foot**2/3
+    >>> quantity_simplify(foot - 6*inch)
+    foot/2
+    """
+
+    if expr.is_Atom or not expr.has(Prefix, Quantity):
+        return expr
+
+
+我理解了 bug 的成因。让我分析一下。
+
+问题在于 `_get_conversion_matrix_for_expr` 用 `solve_least_squares` 来解。当目标单位维度不足以张成表达式的全部维度时，它返回一个"最小二乘"解（分数幂），而不是 `None`。
+
+比如 `J*s` 的维度是 `mass*length**2/time`（3维），而 `joule` 的维度是 `mass*length**2/time**2`（仍是3维，但注意在 mark_dimensionless 的维度体系里，实际上 J 包含 mass, length, time 三个基本维度）。
+
+实际上问题是：`canon_expr_units.issubset(canon_dim_units)` 检查通过了，因为 expr 的所有维度单位都出现在 target 的维度集合中。但线性系统 `camat * x = exprmat` 是不相容的（欠定/无精确解），`solve_least_squares` 返回了一个近似解而非报错。
+
+正确的行为：如果方程组没有**精确**解，应该返回 `None`。让我验证一下。
+
+```bash-action
+cd /testbed && python -c "
+from sympy.physics.units import *
+from sympy.physics.units.util import _get_conversion_matrix_for_expr
+from sympy.physics.units import UnitSystem
+us = UnitSystem.get_unit_system('SI')
+print(_get_conversion_matrix_for_expr(joule*second, [joule], us))
+"
+```2026_09_21_11_08_17899889392026_09_21_11_08_17899889412026_09_21_11_08_1789988939
+executing输出 Matrix([[7/9]])
+
+
+确认了，`solve_least_squares` 返回 `7/9`，这是近似解。正确的修复方式是：如果方程没有精确解，返回 `None`。
+
+让我确认 `solve_least_squares` 的行为，并查看是应该检查残差。
+
+```bash-action
+cd /testbed && python -c "
+from sympy import Matrix
+from sympy.physics.units import *
+from sympy.physics.units import UnitSystem
+from sympy.physics.units.dimensions import Dimension
+us = UnitSystem.get_unit_system('SI')
+ds = us.get_dimension_system()
+expr = joule*second
+target_units=[joule]
+expr_dim = Dimension(us.get_dimensional_expr(expr))
+dim_dependencies = ds.get_dimensional_dependencies(expr_dim, mark_dimensionless=True)
+print('expr dim_deps', dim_dependencies)
+target_dims = [Dimension(us.get_dimensional_expr(x)) for x in target_units]
+print('target dims', target_dims)
+for x in target_dims:
+    print(ds.get_dimensional_dependencies(x, mark_dimensionless=True))
+"
+```2026_09_21_11_08_1789988943
+executing输出 expr dim_deps {'mass': 1, 'length': 2, 'time': -1}
+target dims [Dimension(energy)]
+{'mass': 1, 'length': 2, 'time': -2}
+
+
+现在清楚了。`canon_dim_units = ['mass', 'length', 'time']`，`camat` 是一个 3x1 矩阵（列数=1个目标单位），`exprmat` 是 3x1。系统欠定（3个方程1个未知数），`solve_least_squares` 返回近似解。
+
+正确的修复：解出 `res_exponents` 后，验证 `camat * res_exponents == exprmat`，否则返回 `None`。
+
+我用 `solve` 而不是 `solve_least_squares` 更合适——它只在有精确解时返回。但 `solve` 对非方阵/欠定系统可能行为不同。最稳健的做法是保留 `solve_least_squares`，然后校验残差。
+
+让我看下 `_get_conversion_matrix_for_expr` 完整代码并修改。
+
+```bash-action
+cd /testbed && sed -n '15,36p' sympy/physics/units/util.py
+```2026_09_21_11_09_17899889442026_09_21_11_09_1789988945
+executing输出 
+    dimension_system = unit_system.get_dimension_system()
+
+    expr_dim = Dimension(unit_system.get_dimensional_expr(expr))
+    dim_dependencies = dimension_system.get_dimensional_dependencies(expr_dim, mark_dimensionless=True)
+    target_dims = [Dimension(unit_system.get_dimensional_expr(x)) for x in target_units]
+    canon_dim_units = [i for x in target_dims for i in dimension_system.get_dimensional_dependencies(x, mark_dimensionless=True)]
+    canon_expr_units = {i for i in dim_dependencies}
+
+    if not canon_expr_units.issubset(set(canon_dim_units)):
+        return None
+
+    seen = set()
+    canon_dim_units = [i for i in canon_dim_units if not (i in seen or seen.add(i))]
+
+    camat = Matrix([[dimension_system.get_dimensional_dependencies(i, mark_dimensionless=True).get(j, 0) for i in target_dims] for j in canon_dim_units])
+    exprmat = Matrix([dim_dependencies.get(k, 0) for k in canon_dim_units])
+
+    res_exponents = camat.solve_least_squares(exprmat, method=None)
+    return res_exponents
+
+
+
+
+现在修改：如果 `camat * res_exponents != exprmat`，说明没有精确解，返回 `None`。
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'sympy/physics/units/util.py'
+s = open(p).read()
+old = """    res_exponents = camat.solve_least_squares(exprmat, method=None)
+    return res_exponents
+"""
+new = """    res_exponents = camat.solve_least_squares(exprmat, method=None)
+    if any(camat * res_exponents - exprmat):
+        return None
+    return res_exponents
+"""
+assert old in s
+s = s.replace(old, new)
+open(p, 'w').write(s)
+print("done")
+EOF
+```2026_09_21_11_09_17899889462026_09_21_11_09_17899889482026_09_21_11_09_1789988945
+executing输出 done
+
+
+现在重新运行复现脚本验证修复。
+
+```bash-action
+cd /testbed && python -c "
+from sympy.physics.units import *
+from sympy.physics.units.util import convert_to
+print('bug case:', convert_to(joule*second, joule))
+print('case2:', convert_to(joule*second, joule*second))
+print('case3:', convert_to(joule*second, kg*m**2/s))
+print('case4:', convert_to(joule*second, mins))
+print('normal:', convert_to(mile, kilometer))
+print('multi:', convert_to(3*newton, [centimeter, gram, second]))
+"
+```2026_09_21_11_09_17899889502026_09_21_11_09_17899889532026_09_21_11_09_1789988952
+executing输出 Traceback (most recent call last):
+  File "<string>", line 7, in <module>
+NameError: name 'mins' is not defined. Did you mean: 'miles'?
+bug case: joule*second
+case2: joule*second
+case3: kilogram*meter**2/second
+
+
+bug case 现在返回 `joule*second`（未改动的原表达式），case2/case3 正常。`mins` 没导入，换个方式再验证 case4 和其他场景。
+
+```bash-action
+cd /testbed && python -c "
+from sympy.physics.units import *
+from sympy.physics.units.util import convert_to
+from sympy.physics.units import minute as mins
+print('case4:', convert_to(joule*second, mins))
+print('mile:', convert_to(mile, kilometer))
+print('multi:', convert_to(3*newton, [centimeter, gram, second]))
+print('planck:', convert_to(atomic_mass_constant, [gravitational_constant, speed_of_light, hbar]).n())
+print('c:', convert_to(speed_of_light, meter/second))
+print('day:', convert_to(day, second))
+"
+```2026_09_21_11_09_17899889542026_09_21_11_09_17899889572026_09_21_11_09_17899889562026_09_21_11_09_1789988954
+executing输出 case4: joule*minute/60
+mile: 25146*kilometer/15625
+multi: 300000*centimeter*gram/second**2
+planck: 7.62963087839509e-20*gravitational_constant**(-0.5)*hbar**0.5*speed_of_light**0.5
+c: 299792458*meter/second
+day: 86400*second
+
+
+全部场景正常。现在运行仓库中覆盖该模块的测试文件。
+
+```bash-action
+cd /testbed && python -m pytest sympy/physics/units/tests/test_util.py -q 2>&1 | tail -30
+```2026_09_21_11_09_17899889582026_09_21_11_09_17899889612026_09_21_11_09_17899889602026_09_21_11_09_1789988958
+executing输出 /opt/miniconda3/bin/python: No module named pytest
+
+
+pytest 不可用，用 sympy 自带的测试运行器。
+
+```bash-action
+cd /testbed && python -m sympy.physics.units.tests.test_util 2>&1 | tail -30
+```2026_09_21_11_09_17899889622026_09_21_11_09_17899889642026_09_21_11_09_17899889632026_09_21_11_09_1789988962
+executing输出 
+
+没输出，可能需要用 test runner。改用 doctest + 显式调用测试函数。
+
+```bash-action
+cd /testbed && python -c "
+import sympy
+from sympy.physics.units.tests import test_util
+import inspect
+for name, fn in inspect.getmembers(test_util, inspect.isfunction):
+    if name.startswith('test_'):
+        fn()
+        print('ok', name)
+print('ALL PASSED')
+"
+```2026_09_21_11_09_17899889642026_09_21_11_09_17899889672026_09_21_11_09_17899889662026_09_21_11_09_17899889652026_09_21_11_09_1789988963
+executing输出 ok test_check_dimensions
+ok test_convert_to_quantities
+ok test_convert_to_tuples_of_quantities
+ok test_dim_simplify_add
+ok test_dim_simplify_mul
+ok test_dim_simplify_pow
+ok test_dim_simplify_rec
+ok test_eval_simplify
+ok test_quantity_simplify
+ALL PASSED
+
+
+所有测试通过。运行 doctest 也确认一下。
+
+```bash-action
+cd /testbed && python -m doctest sympy/physics/units/util.py -v 2>&1 | tail -5
+```2026_09_21_11_09_17899889672026_09_21_11_09_17899889692026_09_17899889682026_09_21_11_09_17899889662026_09_21_11_09_1789988957
+executing输出 1 items had failures:
+   2 of  15 in util.convert_to
+20 tests in 5 items.
+18 passed and 2 failed.
+***Test Failed*** 2 failures.
+
+
+doctest 有 2 个失败。让我看具体是哪些——可能是我的改动影响的，也可能是文档字符串里有已知的（例如 `.n()` 相关的空格格式问题）。
+
+```bash-action
+cd /testbed && python -m doctest sympy/physics/units/util.py 2>&1 | head -40
+```2026_09_21_11_09_17899889692026_09_21_11_09_17899889712026_09_21_11_09_17899889702026_09_21_11_09_17899889682026_09_21_11_09_17899889592026_09_21_11_09_17899889582026_09_21_11_09_1789988958
+executing输出 **********************************************************************
+File "/testbed/sympy/physics/units/util.py", line 67, in util.convert_to
+Failed example:
+    convert_to(atomic_mass_constant, gram)
+Expected:
+    1.660539060e-24*gram
+Got:
+    1.6605390666e-24*gram
+**********************************************************************
+File "/testbed/sympy/physics/units/util.py", line 79, in util.convert_to
+Failed example:
+    convert_to(atomic_mass_constant, [gravitational_constant, speed_of_light, hbar]).n()
+Expected:
+    7.62963085040767e-20*gravitational_constant**(-0.5)*hbar**0.5*speed_of_light**0.5
+Got:
+    7.62963087839509e-20*gravitational_constant**(-0.5)*hbar**0.5*speed_of_light**0.5
+**********************************************************************
+1 items had failures:
+   2 of  15 in util.convert_to
+***Test Failed*** 2 failures.
+
+
+这两个 doctest 失败是物理常量的数值精度差异（`atomic_mass_constant` 的数值在版本间有细微差别），跟我的改动无关——它们在我改之前就会出现。原因是质量常数定义常量更新了，与本次修复无关。
+
+为确认这一点，检查我改动前这两个 doctest 是否也失败：
+
+```bash-action
+cd /testbed && git stash && python -m doctest sympy/physics/units/util.py 2>&1 | head -20; git stash pop
+```2026_09_21_11_09_17899889712026_09_21_11_09_17899889732026_09_21_11_09_17899889732026_09_21_11_09_17899889712026_09_21_11_09_17899889622026_09_21_11_09_1789988961
+executing输出 Saved working directory and index state WIP on master: de8dcedcb1 SWE-bench
+**********************************************************************
+File "/testbed/sympy/physics/units/util.py", line 65, in util.convert_to
+Failed example:
+    convert_to(atomic_mass_constant, gram)
+Expected:
+    1.660539060e-24*gram
+Got:
+    1.6605390666e-24*gram
+**********************************************************************
+File "/testbed/sympy/physics/units/util.py", line 77, in util.convert_to
+Failed example:
+    convert_to(atomic_mass_constant, [gravitational_constant, speed_of_light, hbar]).n()
+Expected:
+    7.62963085040767e-20*gravitational_constant**(-0.5)*hbar**0.5*speed_of_light**0.5
+Got:
+    7.62963087839509e-20*gravitational_constant**(-0.5)*hbar**0.5*speed_of_light**0.5
+**********************************************************************
+1 items had failures:
+   2 of  15 in util.convert_to
+***Test Failed*** 2 failures.
+On branch master
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   sympy/physics/units/util.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Dropped refs/stash@{0} (fcd8cf023f53ba95d35cee9f40c18fe1438b460c)
+
+
+确认：这 2 个 doctest 失败在改动前就存在，是常量精度问题，与我的修复无关。stash pop 已恢复我的改动。
+
+现在用 git diff 确认最终改动。
+
+```bash-action
+cd /testbed && git diff sympy/physics/units/util.py
+```2026_09_21_11_09_17899889742026_09_21_11_09_17899889762026_09_21_11_09_17899889752026_09_21_11_09_17899889742026_09_21_11_09_17899889632026_09_21_11_09_1789988963
+executing输出 diff --git a/sympy/physics/units/util.py b/sympy/physics/units/util.py
+index b03ed4cd88..264b90b47d 100755
+--- a/sympy/physics/units/util.py
++++ b/sympy/physics/units/util.py
+@@ -31,6 +31,8 @@ def _get_conversion_matrix_for_expr(expr, target_units, unit_system):
+     exprmat = Matrix([dim_dependencies.get(k, 0) for k in canon_dim_units])
+ 
+     res_exponents = camat.solve_least_squares(exprmat, method=None)
++    if any(camat * res_exponents - exprmat):
++        return None
+     return res_exponents
+ 
+ 
+
+
+改动符合预期：只加了两行——用最小二乘解算出的指数回代校验，如果方程没有精确解就返回 `None`，从而让 `convert_to` 走"无法转换则返回原表达式"的分支，而不是给出荒谬的分数幂结果。
+
+验证总结：
+- Bug 复现：`convert_to(joule*second, joule)` 原来返回 `10**(2/3)*joule**(7/9)`，现在返回 `joule*second`（未改动的原表达式，符合 issue 期望之一）。
+- 相关场景（`joule*second`、`kg*m**2/s`、`mins`、`mile→kilometer`、多单位、Planck 单位等）均正常。
+- 模块测试 `test_util.py` 全部 9 个测试通过。
+- doctest 的 2 个失败是常量数值精度差异，改动前后均存在，与本修复无关。
+
+修复完成。
+
+```bash-action
+exit
+```

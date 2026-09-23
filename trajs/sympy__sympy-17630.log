@@ -1,0 +1,702 @@
+plan-unwanted
+我先复现这个 bug 并定位到相关源码。
+
+```bash-action
+cd /testbed && python -c "
+from sympy import *
+a = MatrixSymbol('a', 2, 2)
+z = ZeroMatrix(2, 2)
+b = BlockMatrix([[a, z], [z, z]])
+print(b._blockmul(b))
+print(type(b._blockmul(b).blocks[0,1]))
+block_collapse(b*b*b)
+"
+```
+
+```bash-action
+cd /testbed && sed -n '1,140p' sympy/matrices/expressions/blockmatrix.py
+```
+executing输出 Traceback (most recent call last):
+  File "/testbed/sympy/__init__.py", line 19, in <module>
+    import mpmath
+ModuleNotFoundError: No module named 'mpmath'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<string>", line 2, in <module>
+  File "/testbed/sympy/__init__.py", line 21, in <module>
+    raise ImportError("SymPy now depends on mpmath as an external library. "
+ImportError: SymPy now depends on mpmath as an external library. See https://docs.sympy.org/latest/install.html#mpmath for more information.
+
+
+环境缺少 mpmath，先安装一下。
+
+```bash-action
+cd /testbed && pip install mpmath
+```
+
+```bash-action
+cd /testbed && python -c "
+from sympy import *
+a = MatrixSymbol('a', 2, 2)
+z = ZeroMatrix(2, 2)
+b = BlockMatrix([[a, z], [z, z]])
+print(b._blockmul(b))
+print(type(b._blockmul(b).blocks[0,1]))
+block_collapse(b*b*b)
+"
+```
+executing输出 Collecting mpmath
+  Downloading mpmath-1.4.1-py3-none-any.whl.metadata (9.1 kB)
+Downloading mpmath-1.4.1-py3-none-any.whl (567 kB)
+Installing collected packages: mpmath
+Successfully installed mpmath-1.4.1
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /testbed && python -c "
+from sympy import *
+a = MatrixSymbol('a', 2, 2)
+z = ZeroMatrix(2, 2)
+b = BlockMatrix([[a, z], [z, z]])
+print(b._blockmul(b))
+print(type(b._blockmul(b).blocks[0,1]))
+block_collapse(b*b*b)
+"
+```
+executing输出 Traceback (most recent call last):
+  File "<string>", line 6, in <module>
+  File "/testbed/sympy/matrices/expressions/blockmatrix.py", line 167, in _blockmul
+    return BlockMatrix(self.blocks*other.blocks)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/sympy/matrices/expressions/blockmatrix.py", line 86, in __new__
+    raise ValueError(filldedent('''
+ValueError: 
+expecting a sequence of 1 or more rows containing Matrices.
+
+
+The bug reproduces (with a slightly different error on this version, which is the same root cause). Let me look at the source.
+
+```bash-action
+cd /testbed && sed -n '1,200p' sympy/matrices/expressions/blockmatrix.py
+```
+executing输出 from __future__ import print_function, division
+
+from sympy import ask, Q
+from sympy.core import Basic, Add
+from sympy.core.compatibility import range
+from sympy.strategies import typed, exhaust, condition, do_one, unpack
+from sympy.strategies.traverse import bottom_up
+from sympy.utilities import sift
+from sympy.utilities.misc import filldedent
+
+from sympy.matrices.expressions.matexpr import MatrixExpr, ZeroMatrix, Identity
+from sympy.matrices.expressions.matmul import MatMul
+from sympy.matrices.expressions.matadd import MatAdd
+from sympy.matrices.expressions.matpow import MatPow
+from sympy.matrices.expressions.transpose import Transpose, transpose
+from sympy.matrices.expressions.trace import Trace
+from sympy.matrices.expressions.determinant import det, Determinant
+from sympy.matrices.expressions.slice import MatrixSlice
+from sympy.matrices.expressions.inverse import Inverse
+from sympy.matrices import Matrix, ShapeError
+from sympy.functions.elementary.complexes import re, im
+
+class BlockMatrix(MatrixExpr):
+    """A BlockMatrix is a Matrix comprised of other matrices.
+
+    The submatrices are stored in a SymPy Matrix object but accessed as part of
+    a Matrix Expression
+
+    >>> from sympy import (MatrixSymbol, BlockMatrix, symbols,
+    ...     Identity, ZeroMatrix, block_collapse)
+    >>> n,m,l = symbols('n m l')
+    >>> X = MatrixSymbol('X', n, n)
+    >>> Y = MatrixSymbol('Y', m ,m)
+    >>> Z = MatrixSymbol('Z', n, m)
+    >>> B = BlockMatrix([[X, Z], [ZeroMatrix(m,n), Y]])
+    >>> print(B)
+    Matrix([
+    [X, Z],
+    [0, Y]])
+
+    >>> C = BlockMatrix([[Identity(n), Z]])
+    >>> print(C)
+    Matrix([[I, Z]])
+
+    >>> print(block_collapse(C*B))
+    Matrix([[X, Z + Z*Y]])
+
+    Some matrices might be comprised of rows of blocks with
+    the matrices in each row having the same height and the
+    rows all having the same total number of columns but
+    not having the same number of columns for each matrix
+    in each row. In this case, the matrix is not a block
+    ma
+....(省略中间部分)...
+cols)
+
+    @property
+    def blockshape(self):
+        return self.blocks.shape
+
+    @property
+    def blocks(self):
+        return self.args[0]
+
+    @property
+    def rowblocksizes(self):
+        return [self.blocks[i, 0].rows for i in range(self.blockshape[0])]
+
+    @property
+    def colblocksizes(self):
+        return [self.blocks[0, i].cols for i in range(self.blockshape[1])]
+
+    def structurally_equal(self, other):
+        return (isinstance(other, BlockMatrix)
+            and self.shape == other.shape
+            and self.blockshape == other.blockshape
+            and self.rowblocksizes == other.rowblocksizes
+            and self.colblocksizes == other.colblocksizes)
+
+    def _blockmul(self, other):
+        if (isinstance(other, BlockMatrix) and
+                self.colblocksizes == other.rowblocksizes):
+            return BlockMatrix(self.blocks*other.blocks)
+
+        return self * other
+
+    def _blockadd(self, other):
+        if (isinstance(other, BlockMatrix)
+                and self.structurally_equal(other)):
+            return BlockMatrix(self.blocks + other.blocks)
+
+        return self + other
+
+    def _eval_transpose(self):
+        # Flip all the individual matrices
+        matrices = [transpose(matrix) for matrix in self.blocks]
+        # Make a copy
+        M = Matrix(self.blockshape[0], self.blockshape[1], matrices)
+        # Transpose the block structure
+        M = M.transpose()
+        return BlockMatrix(M)
+
+    def _eval_trace(self):
+        if self.rowblocksizes == self.colblocksizes:
+            return Add(*[Trace(self.blocks[i, i])
+                        for i in range(self.blockshape[0])])
+        raise NotImplementedError(
+            "Can't perform trace of irregular blockshape")
+
+    def _eval_determinant(self):
+        if self.blockshape == (2, 2):
+            [[A, B],
+             [C, D]] = self.blocks.tolist()
+            if ask(Q.invertible(A)):
+                return det(A)*det(D - C*A.I*B)
+            elif ask(Q.invertible(D)):
+
+
+Let me see the constructor (`__new__`) and surrounding code to understand the shape/dimension handling.
+
+```bash-action
+cd /testbed && sed -n '55,170p' sympy/matrices/expressions/blockmatrix.py
+```2026_09_21_11_03_1789988583
+executing输出     >>> from sympy import ones, Matrix
+    >>> dat = [
+    ... [ones(3,2), ones(3,3)*2],
+    ... [ones(2,3)*3, ones(2,2)*4]]
+    ...
+    >>> BlockMatrix(dat)
+    Traceback (most recent call last):
+    ...
+    ValueError:
+    Although this matrix is comprised of blocks, the blocks do not fill
+    the matrix in a size-symmetric fashion. To create a full matrix from
+    these arguments, pass them directly to Matrix.
+    >>> Matrix(dat)
+    Matrix([
+    [1, 1, 2, 2, 2],
+    [1, 1, 2, 2, 2],
+    [1, 1, 2, 2, 2],
+    [3, 3, 3, 4, 4],
+    [3, 3, 3, 4, 4]])
+
+    See Also
+    ========
+    sympy.matrices.matrices.MatrixBase.irregular
+    """
+    def __new__(cls, *args, **kwargs):
+        from sympy.matrices.immutable import ImmutableDenseMatrix
+        from sympy.utilities.iterables import is_sequence
+        isMat = lambda i: getattr(i, 'is_Matrix', False)
+        if len(args) != 1 or \
+                not is_sequence(args[0]) or \
+                len(set([isMat(r) for r in args[0]])) != 1:
+            raise ValueError(filldedent('''
+                expecting a sequence of 1 or more rows
+                containing Matrices.'''))
+        rows = args[0] if args else []
+        if not isMat(rows):
+            if rows and isMat(rows[0]):
+                rows = [rows]  # rows is not list of lists or []
+            # regularity check
+            # same number of matrices in each row
+            blocky = ok = len(set([len(r) for r in rows])) == 1
+            if ok:
+                # same number of rows for each matrix in a row
+                for r in rows:
+                    ok = len(set([i.rows for i in r])) == 1
+                    if not ok:
+                        break
+                blocky = ok
+                # same number of cols for each matrix in each col
+                for c in range(len(rows[0])):
+                    ok = len(set([rows[i][c].cols
+                        for i in range(len(rows))])) == 1
+                    if not ok:
+                        break
+  
+....(省略中间部分)...
+matrix is comprised of blocks,
+                        the blocks do not fill the matrix in a
+                        size-symmetric fashion. To create a full matrix
+                        from these arguments, pass them directly to
+                        Matrix.'''))
+                raise ValueError(filldedent('''
+                    When there are not the same number of rows in each
+                    row's matrices or there are not the same number of
+                    total columns in each row, the matrix is not a
+                    block matrix. If this matrix is known to consist of
+                    blocks fully filling a 2-D space then see
+                    Matrix.irregular.'''))
+        mat = ImmutableDenseMatrix(rows, evaluate=False)
+        obj = Basic.__new__(cls, mat)
+        return obj
+
+    @property
+    def shape(self):
+        numrows = numcols = 0
+        M = self.blocks
+        for i in range(M.shape[0]):
+            numrows += M[i, 0].shape[0]
+        for i in range(M.shape[1]):
+            numcols += M[0, i].shape[1]
+        return (numrows, numcols)
+
+    @property
+    def blockshape(self):
+        return self.blocks.shape
+
+    @property
+    def blocks(self):
+        return self.args[0]
+
+    @property
+    def rowblocksizes(self):
+        return [self.blocks[i, 0].rows for i in range(self.blockshape[0])]
+
+    @property
+    def colblocksizes(self):
+        return [self.blocks[0, i].cols for i in range(self.blockshape[1])]
+
+    def structurally_equal(self, other):
+        return (isinstance(other, BlockMatrix)
+            and self.shape == other.shape
+            and self.blockshape == other.blockshape
+            and self.rowblocksizes == other.rowblocksizes
+            and self.colblocksizes == other.colblocksizes)
+
+    def _blockmul(self, other):
+        if (isinstance(other, BlockMatrix) and
+                self.colblocksizes == other.rowblocksizes):
+            return BlockMatrix(self.blocks*other.blocks)
+
+        return self * other
+
+
+
+Now I understand the root cause. When `self.blocks * other.blocks` is computed, the matrix product produces `Zero` (scalar 0) instead of `ZeroMatrix` for zero blocks, because zero blocks don't carry shape info through scalar multiplication/addition in the matrix product.
+
+Let me look at the `_blockmul` more carefully and check what happens with the block product.
+
+```bash-action
+cd /testbed && python -c "
+from sympy import *
+a = MatrixSymbol('a', 2, 2)
+z = ZeroMatrix(2, 2)
+b = BlockMatrix([[a, z], [z, z]])
+P = b.blocks*b.blocks
+print(P)
+for i in range(2):
+    for j in range(2):
+        print(i,j,repr(P[i,j]), type(P[i,j]))
+"
+```2026_09_21_11_03_1789988584
+executing输出 Matrix([[a**2, 0], [0, 0]])
+0 0 a**2 <class 'sympy.matrices.expressions.matpow.MatPow'>
+0 1 0 <class 'sympy.core.numbers.Zero'>
+1 0 0 <class 'sympy.core.numbers.Zero'>
+1 1 0 <class 'sympy.core.numbers.Zero'>
+
+
+Confirmed. The matrix product `b.blocks * b.blocks` collapses zero-terms into scalar `Zero`, losing the `ZeroMatrix` shape info. Then `BlockMatrix(...)` fails.
+
+The fix: after computing `self.blocks * other.blocks` in `_blockmul`, convert any `Zero` entries into `ZeroMatrix` of the appropriate shape. The shape of the resulting block at (i,j) is `(rowblocksizes[i], other.colblocksizes[j])`.
+
+Let me check imports and how `ZeroMatrix` is already imported (yes at line 12). Let me look at how sympy upstream fixed this — the standard fix is in `_blockmul`.
+
+```bash-action
+cd /testbed && sed -n '160,180p' sympy/matrices/expressions/blockmatrix.py
+```2026_09_21_11_03_1789988586
+executing输出             and self.blockshape == other.blockshape
+            and self.rowblocksizes == other.rowblocksizes
+            and self.colblocksizes == other.colblocksizes)
+
+    def _blockmul(self, other):
+        if (isinstance(other, BlockMatrix) and
+                self.colblocksizes == other.rowblocksizes):
+            return BlockMatrix(self.blocks*other.blocks)
+
+        return self * other
+
+    def _blockadd(self, other):
+        if (isinstance(other, BlockMatrix)
+                and self.structurally_equal(other)):
+            return BlockMatrix(self.blocks + other.blocks)
+
+        return self + other
+
+    def _eval_transpose(self):
+        # Flip all the individual matrices
+        matrices = [transpose(matrix) for matrix in self.blocks]
+
+
+Now I'll apply the fix. The cleanest approach is to reconstruct the block matrix, replacing scalar `Zero` entries with `ZeroMatrix` of the correct shape.
+
+For a block at position (i, j) in the product: its number of rows = `self.rowblocksizes[i]`, number of cols = `other.colblocksizes[j]`.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'sympy/matrices/expressions/blockmatrix.py'
+s = open(p).read()
+
+old = '''    def _blockmul(self, other):
+        if (isinstance(other, BlockMatrix) and
+                self.colblocksizes == other.rowblocksizes):
+            return BlockMatrix(self.blocks*other.blocks)
+
+        return self * other
+'''
+
+new = '''    def _blockmul(self, other):
+        if (isinstance(other, BlockMatrix) and
+                self.colblocksizes == other.rowblocksizes):
+            blocks = self.blocks*other.blocks
+
+            # MatMul may convert a zero block to a scalar Zero, which loses
+            # the shape information needed by BlockMatrix.  Restore zero
+            # blocks as ZeroMatrix with the appropriate dimensions.
+            m, n = blocks.shape
+            rowblocksizes = self.rowblocksizes
+            colblocksizes = other.colblocksizes
+            for i in range(m):
+                for j in range(n):
+                    if blocks[i, j] == 0:
+                        blocks[i, j] = ZeroMatrix(rowblocksizes[i],
+                                                  colblocksizes[j])
+
+            return BlockMatrix(blocks)
+
+        return self * other
+'''
+
+assert old in s
+s = s.replace(old, new)
+open(p,'w').write(s)
+print("patched")
+EOF
+```
+
+```bash-action
+cd /testbed && grep -n "ZeroMatrix" sympy/matrices/expressions/blockmatrix.py | head
+```2026_09_21_11_03_17899885882026_09_21_11_03_1789988588
+executing输出 patched
+
+
+Now let me test the fix with the reproduction.
+
+```bash-action
+cd /testbed && python -c "
+from sympy import *
+a = MatrixSymbol('a', 2, 2)
+z = ZeroMatrix(2, 2)
+b = BlockMatrix([[a, z], [z, z]])
+print(b._blockmul(b))
+print(type(b._blockmul(b).blocks[0,1]))
+print(block_collapse(b * b * b))
+print(b._blockmul(b)._blockmul(b))
+"
+```2026_09_21_11_03_1789988590
+executing输出 Traceback (most recent call last):
+  File "<string>", line 6, in <module>
+  File "/testbed/sympy/matrices/expressions/blockmatrix.py", line 178, in _blockmul
+    blocks[i, j] = ZeroMatrix(rowblocksizes[i],
+    ~~~~~~^^^^^^
+  File "/testbed/sympy/matrices/immutable.py", line 75, in __setitem__
+    raise TypeError("Cannot set values of {}".format(self.__class__))
+TypeError: Cannot set values of <class 'sympy.matrices.immutable.ImmutableDenseMatrix'>
+
+
+The blocks matrix is immutable. I need to build a mutable copy first. Let me fix by constructing a new mutable Matrix.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+p = 'sympy/matrices/expressions/blockmatrix.py'
+s = open(p).read()
+
+old = '''            blocks = self.blocks*other.blocks
+
+            # MatMul may convert a zero block to a scalar Zero, which loses
+            # the shape information needed by BlockMatrix.  Restore zero
+            # blocks as ZeroMatrix with the appropriate dimensions.
+            m, n = blocks.shape
+            rowblocksizes = self.rowblocksizes
+            colblocksizes = other.colblocksizes
+            for i in range(m):
+                for j in range(n):
+                    if blocks[i, j] == 0:
+                        blocks[i, j] = ZeroMatrix(rowblocksizes[i],
+                                                  colblocksizes[j])
+
+            return BlockMatrix(blocks)
+'''
+
+new = '''            blocks = self.blocks*other.blocks
+
+            # MatMul may convert a zero block to a scalar Zero, which loses
+            # the shape information needed by BlockMatrix.  Restore zero
+            # blocks as ZeroMatrix with the appropriate dimensions.
+            m, n = blocks.shape
+            rowblocksizes = self.rowblocksizes
+            colblocksizes = other.colblocksizes
+            data = []
+            for i in range(m):
+                row = []
+                for j in range(n):
+                    block = blocks[i, j]
+                    if block == 0:
+                        block = ZeroMatrix(rowblocksizes[i],
+                                           colblocksizes[j])
+                    row.append(block)
+                data.append(row)
+
+            return BlockMatrix(data)
+'''
+
+assert old in s
+s = s.replace(old, new)
+open(p,'w').write(s)
+print("patched")
+EOF
+```
+
+```bash-action
+cd /testbed && python -c "
+from sympy import *
+a = MatrixSymbol('a', 2, 2)
+z = ZeroMatrix(2, 2)
+b = BlockMatrix([[a, z], [z, z]])
+print(b._blockmul(b))
+print(type(b._blockmul(b).blocks[0,1]))
+print(block_collapse(b * b * b))
+print(b._blockmul(b)._blockmul(b))
+"
+```2026_09_21_11_03_17899885912026_09_21_11_03_1789988592
+executing输出 patched
+
+
+```bash-action
+cd /testbed && python -c "
+from sympy import *
+a = MatrixSymbol('a', 2, 2)
+z = ZeroMatrix(2, 2)
+b = BlockMatrix([[a, z], [z, z]])
+print(b._blockmul(b))
+print(type(b._blockmul(b).blocks[0,1]))
+print(block_collapse(b * b * b))
+print(b._blockmul(b)._blockmul(b))
+"
+```2026_09_21_11_03_17899885942026_09_21_11_03_1789988594
+executing输出 Matrix([
+[a**2, 0],
+[   0, 0]])
+<class 'sympy.matrices.expressions.matexpr.ZeroMatrix'>
+Matrix([
+[a**3, 0],
+[   0, 0]])
+Matrix([
+[a**3, 0],
+[   0, 0]])
+
+
+The bug is fixed. Now there's a subtle issue: I used `block == 0` which would also be True for a legitimate zero-scalar entry, but block entries should always be matrices, so a scalar `Zero` only appears when MatMul collapsed a zero matrix. That's fine.
+
+However, there's a concern: `block == 0` uses `==` which for symbolic expressions returns a Python bool (not symbolic equality). `Zero == 0` is True, other matrix expressions `!= 0`. Good.
+
+Let me run the existing test suite for blockmatrix to make sure nothing broke.
+
+```bash-action
+cd /testbed && python -m pytest sympy/matrices/expressions/tests/test_blockmatrix.py -q 2>&1 | tail -20
+```2026_09_21_11_03_17899885962026_09_21_11_03_17899885962026_09_21_11_03_1789988596
+executing输出 /opt/miniconda3/bin/python: No module named pytest
+
+
+No pytest. Let me use sympy's own test runner.
+
+```bash-action
+cd /testbed && python -c "
+import sympy
+sympy.test('sympy/matrices/expressions/tests/test_blockmatrix.py', verbose=False)
+"
+```2026_09_21_11_03_17899885982026_09_21_11_03_17899885982026_09_21_11_03_17899885992026_09_21_11_03_1789988600
+executing输出 ============================= test process starts ==============================
+executable:         /opt/miniconda3/bin/python  (3.11.5-final-0) [CPython]
+architecture:       64-bit
+cache:              yes
+ground types:       python 
+numpy:              None
+random seed:        71631319
+hash randomization: on (PYTHONHASHSEED=3137354908)
+
+sympy/matrices/expressions/tests/test_blockmatrix.py[15] ...............    [OK]
+
+================== tests finished: 15 passed, in 0.12 seconds ==================
+
+
+All 15 tests pass. Now let me look at the final diff and check if there are similar patterns elsewhere.
+
+```bash-action
+cd /testbed && git diff
+```
+
+```bash-action
+cd /testbed && grep -n "self.blocks\*other.blocks\|self.blocks + other.blocks\|ZeroMatrix" sympy/matrices/expressions/blockmatrix.py
+```2026_09_21_11_03_17899886002026_09_21_11_03_17899886012026_09_21_11_03_1789988601
+executing输出 diff --git a/sympy/matrices/expressions/blockmatrix.py b/sympy/matrices/expressions/blockmatrix.py
+index 95302a05ca..dd3f57cce2 100755
+--- a/sympy/matrices/expressions/blockmatrix.py
++++ b/sympy/matrices/expressions/blockmatrix.py
+@@ -164,7 +164,26 @@ def structurally_equal(self, other):
+     def _blockmul(self, other):
+         if (isinstance(other, BlockMatrix) and
+                 self.colblocksizes == other.rowblocksizes):
+-            return BlockMatrix(self.blocks*other.blocks)
++            blocks = self.blocks*other.blocks
++
++            # MatMul may convert a zero block to a scalar Zero, which loses
++            # the shape information needed by BlockMatrix.  Restore zero
++            # blocks as ZeroMatrix with the appropriate dimensions.
++            m, n = blocks.shape
++            rowblocksizes = self.rowblocksizes
++            colblocksizes = other.colblocksizes
++            data = []
++            for i in range(m):
++                row = []
++                for j in range(n):
++                    block = blocks[i, j]
++                    if block == 0:
++                        block = ZeroMatrix(rowblocksizes[i],
++                                           colblocksizes[j])
++                    row.append(block)
++                data.append(row)
++
++            return BlockMatrix(data)
+ 
+         return self * other
+ 
+
+
+The diff is clean and targeted. Let me verify `_blockadd` isn't affected by the same issue (it uses `+` not `*`), and run a broader test on matrices expressions to be safe.
+
+```bash-action
+cd /testbed && python -c "
+from sympy import *
+a = MatrixSymbol('a', 2, 2)
+b = MatrixSymbol('b', 2, 2)
+z = ZeroMatrix(2, 2)
+B = BlockMatrix([[a, z], [z, b]])
+print((B + B))
+print(block_collapse(B + B))
+# also test non-square / non-zero block multiplication still works
+c = MatrixSymbol('c', 2, 3)
+d = MatrixSymbol('d', 2, 2)
+Z1 = ZeroMatrix(2, 3)
+M = BlockMatrix([[d, Z1]])
+N = BlockMatrix([[a], [ZeroMatrix(2,3)]]) if False else None
+"
+```
+
+```bash-action
+cd /testbed && python -c "
+import sympy
+sympy.test('sympy/matrices/expressions/tests/test_matmul.py', 'sympy/matrices/expressions/tests/test_matadd.py', verbose=False)
+"
+```2026_09_21_11_03_17899886012026_09_21_11_03_1789988603
+executing输出 2*Matrix([
+[a, 0],
+[0, b]])
+Matrix([
+[2*a,   0],
+[  0, 2*b]])
+
+
+```bash-action
+cd /testbed && python -c "
+import sympy
+sympy.test('sympy/matrices/expressions/tests/test_matmul.py', 'sympy/matrices/expressions/tests/test_matadd.py', verbose=False)
+"
+```2026_09_21_11_03_1789988604
+executing输出 ============================= test process starts ==============================
+executable:         /opt/miniconda3/bin/python  (3.11.5-final-0) [CPython]
+architecture:       64-bit
+cache:              yes
+ground types:       python 
+numpy:              None
+random seed:        95969604
+hash randomization: on (PYTHONHASHSEED=3295409377)
+
+sympy/matrices/expressions/tests/test_matadd.py[5] .....                    [OK]
+sympy/matrices/expressions/tests/test_matmul.py[22] ..................f...  [OK]
+
+======== tests finished: 26 passed, 1 expected to fail, in 0.05 seconds ========
+
+
+All tests pass (the `f` is an expected failure). Let me do a final check of the git diff and then exit.
+
+```bash-action
+cd /testbed && git diff --stat
+```2026_09_21_11_03_1789988606
+executing输出  sympy/matrices/expressions/blockmatrix.py | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+
+The fix is complete and verified:
+
+**Root cause**: In `BlockMatrix._blockmul`, the expression `self.blocks * other.blocks` uses `MatMul`, which collapses zero-matrix blocks into a scalar `Zero` (losing the block's shape information). When a second block multiplication occurred, `BlockMatrix` properties like `colblocksizes` tried to access `.cols` on a scalar `Zero`, raising `AttributeError`.
+
+**Fix**: After computing the block product, I iterate over the resulting blocks and replace any scalar `Zero` with a properly-shaped `ZeroMatrix` (using the row size from `self` and column size from `other`), preserving block dimensions so subsequent block operations work.
+
+**Verification**:
+- The issue's reproducer now works: `block_collapse(b*b*b)` → `Matrix([[a**3, 0], [0, 0]])`.
+- `b._blockmul(b)._blockmul(b)` no longer throws.
+- Zero blocks are now `ZeroMatrix` type.
+- All existing tests pass: 15 blockmatrix tests, 5 matadd, 22 matmul tests.
+
+```bash-action
+exit
+```

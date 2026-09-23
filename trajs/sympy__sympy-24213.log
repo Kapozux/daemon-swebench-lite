@@ -1,0 +1,405 @@
+plan-needed
+## 计划
+
+### 1. 定位问题源码
+- 查看 `/testbed/sympy/physics/units/unitsystem.py` 中的 `_collect_factor_and_dimension` 方法，重点是加法分支（Add）的维度比较逻辑。
+
+### 2. 分析根因
+- 加法分支会逐一比较每一项的维度是否"相等"。
+- 问题在于：`acceleration*time` 和 `velocity` 在物理上是等价的（量纲上都是 length/time），但作为 SymPy 的 `Dimension` 表达式它们不是同一个符号对象，直接比较会失败。
+- 需要通过 `SI` 的维度系统把两边都化简（比如用 `get_dimension_system().equivalent_dims()` 或对表达式代入基本维度）后再判断等价性，而不是用 `==` 直接比较。
+
+### 3. 修复方案
+- 在加法分支中，把当前用来做相等的比较逻辑改为调用维度系统的等价判断方法（`equivalent_dims`），该方法会考虑维度之间的依赖关系（如 velocity = length/time，acceleration = length/time²）。
+- 只修改 `unitsystem.py` 里相关的判断，不做无关改动。
+
+### 4. 验证
+- 编写一个最小复现脚本（在 `/tmp` 下，不进仓库），运行 issue 中的代码确认修复前报错、修复后正常返回。
+- 找到仓库中覆盖 `_collect_factor_and_dimension` 的已有测试（如 `sympy/physics/units/tests/test_quantities.py` 或 `test_dimensionsystem.py`），跑一遍确认无回归。
+- `git diff` 检查改动，确认后 `exit`。
+
+请确认是否按此计划执行。
+plan-finish
+我先看一下问题源码。
+
+```bash-action
+cd /testbed && sed -n '120,220p' sympy/physics/units/unitsystem.py
+```
+executing输出         """
+        Check if the underlying dimension system is consistent.
+        """
+        # test is performed in DimensionSystem
+        return self.get_dimension_system().is_consistent
+
+    @property
+    def derived_units(self) -> tDict[Dimension, Quantity]:
+        return self._derived_units
+
+    def get_dimensional_expr(self, expr):
+        from sympy.physics.units import Quantity
+        if isinstance(expr, Mul):
+            return Mul(*[self.get_dimensional_expr(i) for i in expr.args])
+        elif isinstance(expr, Pow):
+            return self.get_dimensional_expr(expr.base) ** expr.exp
+        elif isinstance(expr, Add):
+            return self.get_dimensional_expr(expr.args[0])
+        elif isinstance(expr, Derivative):
+            dim = self.get_dimensional_expr(expr.expr)
+            for independent, count in expr.variable_count:
+                dim /= self.get_dimensional_expr(independent)**count
+            return dim
+        elif isinstance(expr, Function):
+            args = [self.get_dimensional_expr(arg) for arg in expr.args]
+            if all(i == 1 for i in args):
+                return S.One
+            return expr.func(*args)
+        elif isinstance(expr, Quantity):
+            return self.get_quantity_dimension(expr).name
+        return S.One
+
+    def _collect_factor_and_dimension(self, expr):
+        """
+        Return tuple with scale factor expression and dimension expression.
+        """
+        from sympy.physics.units import Quantity
+        if isinstance(expr, Quantity):
+            return expr.scale_factor, expr.dimension
+        elif isinstance(expr, Mul):
+            factor = 1
+            dimension = Dimension(1)
+            for arg in expr.args:
+                arg_factor, arg_dim = self._collect_factor_and_dimension(arg)
+                factor *= arg_factor
+                dimension *= arg_dim
+            return factor, dimension
+        elif isinstance(expr, Pow):
+            factor, dim = self._collect_factor_and_dimension(expr.base)
+            exp_factor, exp_dim = self._collect_factor_and_dimension(expr.exp)
+            if self.get_dimension_system().is_dimensionless(exp_dim):
+                exp_dim = 1
+            return factor ** exp_factor, dim ** (exp_factor * exp_dim)
+        elif isinstance(expr, Add):
+            factor, dim = self._collect_factor_and_dimension(expr.args[0])
+            for addend in expr.args[1:]:
+                addend_factor, addend_dim = \
+                    self._collect_factor_and_dimension(addend)
+                if dim != addend_dim:
+                    raise ValueError(
+                        'Dimension of "{}" is {}, '
+                        'but it should be {}'.format(
+                            addend, addend_dim, dim))
+                factor += addend_factor
+            return factor, dim
+        elif isinstance(expr, Derivative):
+            factor, dim = self._collect_factor_and_dimension(expr.args[0])
+            for independent, count in expr.variable_count:
+                ifactor, idim = self._collect_factor_and_dimension(independent)
+                factor /= ifactor**count
+                dim /= idim**count
+            return factor, dim
+        elif isinstance(expr, Function):
+            fds = [self._collect_factor_and_dimension(arg) for arg in expr.args]
+            dims = [Dimension(1) if self.get_dimension_system().is_dimensionless(d[1]) else d[1] for d in fds]
+            return (expr.func(*(f[0] for f in fds)), *dims)
+        elif isinstance(expr, Dimension):
+            return S.One, expr
+        else:
+            return expr, Dimension(1)
+
+    def get_units_non_prefixed(self) -> tSet[Quantity]:
+        """
+        Return the units of the system that do not have a prefix.
+        """
+        return set(filter(lambda u: not u.is_prefixed and not u.is_physical_constant, self._units))
+
+
+现在看维度系统里可用的等价判断方法。
+
+```bash-action
+cd /testbed && grep -n "equivalent_dims\|def is_dimensionless\|def get_dimensional_dependencies" sympy/physics/units/dimensions.py sympy/physics/units/dimensionsystem.py
+```2026_09_21_11_17_1789989470
+executing输出 sympy/physics/units/dimensions.py:422:    def get_dimensional_dependencies(self, name, mark_dimensionless=False):
+sympy/physics/units/dimensions.py:428:    def equivalent_dims(self, dim1, dim2):
+sympy/physics/units/dimensions.py:447:    def is_dimensionless(self, dimension):
+grep: sympy/physics/units/dimensionsystem.py: No such file or directory
+
+
+```bash-action
+cd /testbed && sed -n '400,460p' sympy/physics/units/dimensions.py
+```2026_09_21_11_17_1789989472
+executing输出             result = dimension.name.func(*args)
+
+            dicts = [get_for_name(i) for i in dimension.name.args]
+
+            if isinstance(result, Dimension):
+                return self.get_dimensional_dependencies(result)
+            elif result.func == dimension.name.func:
+                if isinstance(dimension.name, TrigonometricFunction):
+                    if dicts[0] in ({}, {Dimension('angle'): 1}):
+                        return {}
+                    else:
+                        raise TypeError("The input argument for the function {} must be dimensionless or have dimensions of angle.".format(dimension.func))
+                else:
+                    if all(item == {} for item in dicts):
+                        return {}
+                    else:
+                        raise TypeError("The input arguments for the function {} must be dimensionless.".format(dimension.func))
+            else:
+                return get_for_name(result)
+
+        raise TypeError("Type {} not implemented for get_dimensional_dependencies".format(type(dimension.name)))
+
+    def get_dimensional_dependencies(self, name, mark_dimensionless=False):
+        dimdep = self._get_dimensional_dependencies_for_name(name)
+        if mark_dimensionless and dimdep == {}:
+            return {Dimension(1): 1}
+        return {k: v for k, v in dimdep.items()}
+
+    def equivalent_dims(self, dim1, dim2):
+        deps1 = self.get_dimensional_dependencies(dim1)
+        deps2 = self.get_dimensional_dependencies(dim2)
+        return deps1 == deps2
+
+    def extend(self, new_base_dims, new_derived_dims=(), new_dim_deps=None):
+        deps = dict(self.dimensional_dependencies)
+        if new_dim_deps:
+            deps.update(new_dim_deps)
+
+        new_dim_sys = DimensionSystem(
+            tuple(self.base_dims) + tuple(new_base_dims),
+            tuple(self.derived_dims) + tuple(new_derived_dims),
+            deps
+        )
+        new_dim_sys._quantity_dimension_map.update(self._quantity_dimension_map)
+        new_dim_sys._quantity_scale_factors.update(self._quantity_scale_factors)
+        return new_dim_sys
+
+    def is_dimensionless(self, dimension):
+        """
+        Check if the dimension object really has a dimension.
+
+        A dimension should have at least one component with non-zero power.
+        """
+        if dimension.name == 1:
+            return True
+        return self.get_dimensional_dependencies(dimension) == {}
+
+    @property
+    def list_can_dims(self):
+        """
+        Useless method, kept for compatibility with previous versions.
+
+
+先写最小复现脚本确认 bug 存在。
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+from sympy.physics import units
+from sympy.physics.units.systems.si import SI
+
+v1 = units.Quantity('v1')
+SI.set_quantity_dimension(v1, units.velocity)
+SI.set_quantity_scale_factor(v1, 2 * units.meter / units.second)
+
+a1 = units.Quantity('a1')
+SI.set_quantity_dimension(a1, units.acceleration)
+SI.set_quantity_scale_factor(a1, -9.8 * units.meter / units.second**2)
+
+t1 = units.Quantity('t1')
+SI.set_quantity_dimension(t1, units.time)
+SI.set_quantity_scale_factor(t1, 5 * units.second)
+
+expr1 = a1*t1 + v1
+print(SI._collect_factor_and_dimension(expr1))
+EOF
+python /tmp/repro.py
+```2026_09_21_11_17_17899894722026_09_21_11_17_1789989472
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    from sympy.physics import units
+ModuleNotFoundError: No module named 'sympy'
+
+
+需要正确的 python 环境。
+
+```bash-action
+cd /testbed && which python python3 && ls
+```2026_09_21_11_17_17899894732026_09_21_11_17_1789989474
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python3
+AUTHORS
+CODEOWNERS
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+LICENSE
+MANIFEST.in
+My_agent.py
+PULL_REQUEST_TEMPLATE.md
+README.md
+__pycache__
+actions.py
+asv.conf.actions.json
+asv.conf.travis.json
+banner.svg
+bin
+chat_export.py
+chat_history
+codecov.yml
+conftest.py
+coveragerc_travis
+data
+doc
+examples
+github_deploy_key.enc
+isympy.py
+llm.py
+pytest.ini
+release
+setup.cfg
+setup.py
+setupegg.py
+sympy
+sympy.egg-info
+system_prompt.txt
+
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_11_17_17899894752026_09_21_11_17_17899894762026_09_21_11_17_1789989477
+executing输出 Traceback (most recent call last):
+  File "/testbed/sympy/__init__.py", line 22, in <module>
+    import mpmath
+ModuleNotFoundError: No module named 'mpmath'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    from sympy.physics import units
+  File "/testbed/sympy/__init__.py", line 24, in <module>
+    raise ImportError("SymPy now depends on mpmath as an external library. "
+ImportError: SymPy now depends on mpmath as an external library. See https://docs.sympy.org/latest/install.html#mpmath for more information.
+
+
+mpmath 缺失，安装一下依赖。
+
+```bash-action
+cd /testbed && pip install mpmath 2>&1 | tail -3
+```2026_09_21_11_17_17899894762026_09_21_11_17_17899894772026_09_21_11_17_1789989478
+executing输出 Installing collected packages: mpmath
+Successfully installed mpmath-1.4.1
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_11_18_17899894802026_09_21_11_18_17899894812026_09_21_11_18_17899894822026_09_21_11_18_1789989481
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 17, in <module>
+    print(SI._collect_factor_and_dimension(expr1))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/sympy/physics/units/unitsystem.py", line 179, in _collect_factor_and_dimension
+    raise ValueError(
+ValueError: Dimension of "v1" is Dimension(velocity), but it should be Dimension(acceleration*time)
+
+
+Bug 已复现。根因确认：加法分支用 `dim != addend_dim` 直接比较 `Dimension` 符号，而 `velocity` 与 `acceleration*time` 在维度系统里是等价的，通过 `equivalent_dims` 才能正确判断。
+
+现在修改源码：
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'sympy/physics/units/unitsystem.py'
+s = open(p).read()
+old = """                if dim != addend_dim:
+                    raise ValueError("""
+new = """                if not self.get_dimension_system().equivalent_dims(dim, addend_dim):
+                    raise ValueError("""
+assert s.count(old) == 1, s.count(old)
+open(p, 'w').write(s.replace(old, new))
+print("done")
+EOF
+```2026_09_21_11_18_17899894832026_09_21_11_18_17899894842026_09_21_11_18_17899894832026_09_21_11_18_1789989483
+executing输出 done
+
+
+检查同文件里是否有同样的 `!=` 维度比较写法需要一并修。
+
+```bash-action
+cd /testbed && grep -n "dim != \|dim == \|!= addend_dim\|!= idim\|!= exp_dim" sympy/physics/units/unitsystem.py
+```2026_09_21_11_18_17899894842026_09_21_11_18_17899894852026_09_21_11_18_17899894862026_09_21_11_18_17899894852026_09_21_11_18_1789989485
+executing输出 
+
+没有其他同类比较。现在重跑复现脚本确认修复。
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_11_18_17899894862026_09_21_11_18_17899894872026_09_21_11_18_17899894882026_09_21_11_18_17899894872026_09_21_11_18_17899894872026_09_21_11_18_17899894872026_09_21_11_18_1789989487
+executing输出 (-47.0000000000000, Dimension(acceleration*time))
+
+
+修复成功，返回对应物理值（-9.8*5 + 2 = -47）和等效维度。现在跑覆盖该模块的已有测试。
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python -m pytest sympy/physics/units/tests/ -q 2>&1 | tail -20
+```2026_09_21_11_18_17899894872026_09_21_11_18_17899894882026_09_21_11_18_17899894892026_09_21_11_18_17899894902026_09_21_11_18_17899894902026_09_21_11_18_17899894902026_09_21_11_18_17899894912026_09_21_11_18_17899894902026_09_21_11_18_1789989490
+executing输出 /opt/miniconda3/bin/python: No module named pytest
+
+
+```bash-action
+cd /testbed && pip install pytest 2>&1 | tail -2
+```2026_09_21_11_18_17899894892026_09_21_11_18_17899894902026_09_21_11_18_17899894902026_09_21_11_18_17899894902026_09_21_11_18_17899894902026_09_21_11_18_17899894892026_09_21_11_18_17899894892026_09_21_11_18_1789989489
+executing输出 Successfully installed iniconfig-2.3.0 pluggy-1.6.0 pygments-2.21.0 pytest-9.1.1
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python -m pytest sympy/physics/units/tests/ -q 2>&1 | tail -25
+```2026_09_21_11_18_17899894942026_09_21_11_18_17899894952026_09_21_11_18_17899894962026_09_21_11_18_17899894972026_09_21_11_18_17899894962026_09_21_11_18_17899894972026_09_21_11_18_17899894962026_09_21_11_18_17899894962026_09_21_11_18_17899894962026_09_21_11_18_17899894942026_09_21_11_18_17899894962026_09_21_11_18_17899894972026_09_21_11_18_1789989495
+executing输出 .....................................x.................................. [100%]
+=============================== warnings summary ===============================
+../opt/miniconda3/lib/python3.11/site-packages/mpmath/ctx_mp.py:35
+
+../opt/miniconda3/lib/python3.11/site-packages/mpmath/rational.py:4
+../opt/miniconda3/lib/python3.11/site-packages/mpmath/rational.py:4
+../opt/miniconda3/lib/python3.11/site-packages/mpmath/rational.py:4
+    warnings.warn("the rational private module is deprecated",
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+71 passed, 1 xfailed, 4 warnings in 1.11s
+
+
+全部通过。确认 git diff。
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_11_18_17899894972026_09_21_11_18_17899894982026_09_21_11_18_17899894992026_09_21_11_18_17899895002026_09_21_11_18_17899895002026_09_21_11_18_17899895002026_09_21_11_18_17899895002026_09_21_11_18_17899894982026_09_21_11_18_17899894992026_09_21_11_18_17899894992026_09_21_11_18_17899895002026_09_21_11_18_17899894982026_09_21_11_18_17899894992026_09_21_11_18_17899894992026_09_21_11_18_17899894992026_09_21_11_18_1789989499
+executing输出 diff --git a/sympy/physics/units/unitsystem.py b/sympy/physics/units/unitsystem.py
+index a436880c4b..5705c821c2 100755
+--- a/sympy/physics/units/unitsystem.py
++++ b/sympy/physics/units/unitsystem.py
+@@ -175,7 +175,7 @@ def _collect_factor_and_dimension(self, expr):
+             for addend in expr.args[1:]:
+                 addend_factor, addend_dim = \
+                     self._collect_factor_and_dimension(addend)
+-                if dim != addend_dim:
++                if not self.get_dimension_system().equivalent_dims(dim, addend_dim):
+                     raise ValueError(
+                         'Dimension of "{}" is {}, '
+                         'but it should be {}'.format(
+
+
+改动正是所需的：加法分支改用 `equivalent_dims` 进行维度等价性判断，其余逻辑和调用签名（仍返回 `dim`）保持不变，未触碰测试文件。
+
+任务完成：
+
+- 定位到 `sympy/physics/units/unitsystem.py` 的 `_collect_factor_and_dimension` 加法分支。
+- 根因：直接比较 `Dimension` 符号，无法识别 `velocity` 与 `acceleration*time` 的等价性。
+- 修复：使用 `self.get_dimension_system().equivalent_dims(dim, addend_dim)` 判断等价。
+- 复现脚本修复后输出 `(-47.0000000000000, Dimension(acceleration*time))`。
+- 相关测试全部通过。
+
+```bash-action
+exit
+```2026_09_21_11_18_1789989499
