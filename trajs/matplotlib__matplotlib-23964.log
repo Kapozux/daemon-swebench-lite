@@ -1,0 +1,314 @@
+plan-unwanted
+I'll start by examining the relevant source code in the PostScript backend.
+
+```bash-action
+cd /testbed && sed -n '620,700p' lib/matplotlib/backends/backend_ps.py
+```
+executing输出         if self._is_transparent(gc.get_rgb()):
+            return  # Special handling for fully transparent.
+
+        if ismath == 'TeX':
+            return self.draw_tex(gc, x, y, s, prop, angle)
+
+        if ismath:
+            return self.draw_mathtext(gc, x, y, s, prop, angle)
+
+        if mpl.rcParams['ps.useafm']:
+            font = self._get_font_afm(prop)
+            scale = 0.001 * prop.get_size_in_points()
+            stream = []
+            thisx = 0
+            last_name = None  # kerns returns 0 for None.
+            xs_names = []
+            for c in s:
+                name = uni2type1.get(ord(c), f"uni{ord(c):04X}")
+                try:
+                    width = font.get_width_from_char_name(name)
+                except KeyError:
+                    name = 'question'
+                    width = font.get_width_char('?')
+                kern = font.get_kern_dist_from_name(last_name, name)
+                last_name = name
+                thisx += kern * scale
+                xs_names.append((thisx, name))
+                thisx += width * scale
+            ps_name = (font.postscript_name
+                       .encode("ascii", "replace").decode("ascii"))
+            stream.append((ps_name, xs_names))
+
+        else:
+            font = self._get_font_ttf(prop)
+            self._character_tracker.track(font, s)
+            stream = []
+            prev_font = curr_stream = None
+            for item in _text_helpers.layout(s, font):
+                ps_name = (item.ft_object.postscript_name
+                           .encode("ascii", "replace").decode("ascii"))
+                if item.ft_object is not prev_font:
+                    if curr_stream:
+                        stream.append(curr_stream)
+                    prev_font = item.ft_object
+                    curr_stream = [ps_name, []]
+                curr_stream[1].append(
+                    (item.x, item.ft_object.get_glyph_name(item.glyph_idx))
+                )
+            # append the last entry
+            stream.append(curr_stream)
+
+        self.set_color(*gc.get_rgb())
+
+        for ps_name, xs_names in stream:
+            self.set_font(ps_name, prop.get_size_in_points(), False)
+            thetext = "\n".join(f"{x:g} 0 m /{name:s} glyphshow"
+                                for x, name in xs_names)
+            self._pswriter.write(f"""\
+gsave
+{self._get_clip_cmd(gc)}
+{x:g} {y:g} translate
+{angle:g} rotate
+{thetext}
+grestore
+""")
+
+    @_log_if_debug_on
+    def draw_mathtext(self, gc, x, y, s, prop, angle):
+        """Draw the math text using matplotlib.mathtext."""
+        width, height, descent, glyphs, rects = \
+            self._text2path.mathtext_parser.parse(s, 72, prop)
+        self.set_color(*gc.get_rgb())
+        self._pswriter.write(
+            f"gsave\n"
+            f"{x:g} {y:g} translate\n"
+            f"{angle:g} rotate\n")
+        lastfont = None
+        for font, fontsize, num, ox, oy in glyphs:
+            self._character_tracker.track_glyph(font, num)
+            if (font.postscript_name, fontsize) != lastfont:
+                lastfont = font.postscript_name, fontsize
+
+
+I found the bug. In `draw_text`, when there's an empty line, `_text_helpers.layout` yields no items for that line, so `curr_stream` stays `None`, and `stream.append(curr_stream)` appends `None`. Then the unpacking fails.
+
+Let me first create a minimal reproduction to confirm the bug.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+from matplotlib.figure import Figure
+
+figure = Figure()
+ax = figure.add_subplot(111)
+ax.annotate(text='\nLower label', xy=(0, 0))
+figure.savefig('/tmp/figure.eps')
+print("OK")
+EOF
+python /tmp/repro.py
+```2026_09_21_10_10_1789985442
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    from matplotlib.figure import Figure
+ModuleNotFoundError: No module named 'matplotlib'
+
+
+Let me find the correct python environment.
+
+```bash-action
+cd /testbed && ls && which python python3 && python -c "import sys; print(sys.executable)"
+```2026_09_21_10_10_1789985442
+executing输出 CITATION.bib
+CODE_OF_CONDUCT.md
+INSTALL.rst
+LICENSE
+My_agent.py
+README.rst
+SECURITY.md
+__pycache__
+actions.py
+azure-pipelines.yml
+build
+chat_export.py
+chat_history
+ci
+doc
+environment.yml
+examples
+extern
+lib
+llm.py
+mplsetup.cfg.template
+plot_types
+pytest.ini
+requirements
+setup.cfg
+setup.py
+setupext.py
+src
+system_prompt.txt
+tests.py
+tmp
+tools
+tox.ini
+tutorials
+/opt/miniconda3/bin/python
+/opt/miniconda3/bin/python3
+/opt/miniconda3/bin/python
+
+
+```bash-action
+cd /testbed && conda env list && ls /opt/miniconda3/envs 2>/dev/null
+```2026_09_21_10_10_17899854462026_09_21_10_10_1789985446
+executing输出 # conda environments:
+#
+base                     /opt/miniconda3
+testbed                  /opt/miniconda3/envs/testbed
+
+testbed
+
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 6, in <module>
+    figure.savefig('/tmp/figure.eps')
+  File "/testbed/lib/matplotlib/figure.py", line 3275, in savefig
+    self.canvas.print_figure(fname, **kwargs)
+  File "/testbed/lib/matplotlib/backend_bases.py", line 2339, in print_figure
+    result = print_method(
+             ^^^^^^^^^^^^^
+  File "/testbed/lib/matplotlib/backend_bases.py", line 2205, in <lambda>
+    print_method = functools.wraps(meth)(lambda *args, **kwargs: meth(
+                                                                 ^^^^^
+  File "/testbed/lib/matplotlib/_api/deprecation.py", line 410, in wrapper
+    return func(*inner_args, **inner_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/lib/matplotlib/backends/backend_ps.py", line 869, in _print_ps
+    printer(fmt, outfile, dpi=dpi, dsc_comments=dsc_comments,
+  File "/testbed/lib/matplotlib/backends/backend_ps.py", line 927, in _print_figure
+    self.figure.draw(renderer)
+  File "/testbed/lib/matplotlib/artist.py", line 74, in draw_wrapper
+    result = draw(artist, renderer, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/lib/matplotlib/artist.py", line 51, in draw_wrapper
+    return draw(artist, renderer)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/lib/matplotlib/figure.py", line 3072, in draw
+    mimage._draw_list_compositing_images(
+  File "/testbed/lib/matplotlib/image.py", line 131, in _draw_list_compositing_images
+    a.draw(renderer)
+  File "/testbed/lib/matplotlib/artist.py", line 51, in draw_wrapper
+    return draw(artist, renderer)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/lib/matplotlib/axes/_base.py", line 3107, in draw
+    mimage._draw_list_compositing_images(
+  File "/testbed/lib/matplotlib/image.py", line 131, in _draw_list_compositing_images
+    a.draw(renderer)
+  File "/testbed/lib/matplotlib/artist.py", line 51, in draw_wrapper
+    return draw(artist, renderer)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/lib/matplotlib/text.py", line 2027, in draw
+    Text.draw(self, renderer)
+  File "/testbed/lib/matplotlib/artist.py", line 51, in draw_wrapper
+    return draw(artist, renderer)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/lib/matplotlib/text.py", line 768, in draw
+    textrenderer.draw_text(gc, x, y, clean_line,
+  File "/testbed/lib/matplotlib/backends/backend_ps.py", line 248, in wrapper
+    return meth(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/lib/matplotlib/backends/backend_ps.py", line 673, in draw_text
+    for ps_name, xs_names in stream:
+        ^^^^^^^^^^^^^^^^^
+TypeError: cannot unpack non-iterable NoneType object
+
+
+Bug confirmed. The empty line produces no layout items, leaving `curr_stream = None`, which gets appended to `stream`. Let me fix it by guarding the final append.
+
+```bash-action
+cd /testbed && python - << 'EOF'
+import re
+p = "lib/matplotlib/backends/backend_ps.py"
+s = open(p).read()
+old = "            # append the last entry\n            stream.append(curr_stream)\n"
+new = "            # append the last entry\n            if curr_stream:\n                stream.append(curr_stream)\n"
+assert s.count(old) == 1, s.count(old)
+open(p, "w").write(s.replace(old, new))
+print("patched")
+EOF
+```
+executing输出 patched
+
+
+Now let me rerun the reproduction script to confirm the fix.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_10_10_1789985452
+executing输出 OK
+
+
+The fix works. Now let me check the git diff and find the existing test files covering this module.
+
+```bash-action
+cd /testbed && git diff && ls lib/matplotlib/tests/test_backend_ps.py
+```2026_09_21_10_10_1789985453
+executing输出 diff --git a/lib/matplotlib/backends/backend_ps.py b/lib/matplotlib/backends/backend_ps.py
+index f209e811f1..bd996b7509 100755
+--- a/lib/matplotlib/backends/backend_ps.py
++++ b/lib/matplotlib/backends/backend_ps.py
+@@ -666,7 +666,8 @@ grestore
+                     (item.x, item.ft_object.get_glyph_name(item.glyph_idx))
+                 )
+             # append the last entry
+-            stream.append(curr_stream)
++            if curr_stream:
++                stream.append(curr_stream)
+ 
+         self.set_color(*gc.get_rgb())
+ 
+lib/matplotlib/tests/test_backend_ps.py
+
+
+Now let me run the existing PS backend tests to ensure nothing is broken.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest lib/matplotlib/tests/test_backend_ps.py -q 2>&1 | tail -20
+```2026_09_21_10_10_1789985455
+executing输出 ................................ss.                                      [100%]
+33 passed, 2 skipped in 56.62s
+
+
+All existing tests pass. Let me also verify the title case from the issue works too.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python - << 'EOF'
+from matplotlib.figure import Figure
+figure = Figure()
+ax = figure.add_subplot(111)
+ax.set_title('\nLower title')
+figure.savefig('/tmp/title.eps')
+print("title OK")
+EOF
+```2026_09_21_10_11_17899855122026_09_21_10_11_1789985513
+executing输出 title OK
+
+
+Both the annotation and title cases are fixed, and the existing test suite passes. Let me check whether the same buggy pattern exists elsewhere in the file, as the issue analysis pointed to line 669.
+
+```bash-action
+cd /testbed && grep -n "stream.append(curr_stream)\|curr_stream = \[" lib/matplotlib/backends/backend_ps.py
+```2026_09_21_10_11_17899855142026_09_21_10_11_1789985514
+executing输出 662:                        stream.append(curr_stream)
+664:                    curr_stream = [ps_name, []]
+670:                stream.append(curr_stream)
+
+
+Line 662 is inside `if curr_stream:` (only appends when valid), and line 670 is now guarded by my fix. So no other occurrence of the buggy pattern remains in this file.
+
+The fix is complete:
+- **Root cause**: In `backend_ps.py` `draw_text`, when a line in the text is empty, `_text_helpers.layout` yields no items, so `curr_stream` remains `None`. The unconditional `stream.append(curr_stream)` then appended `None`, causing the `TypeError` on unpacking.
+- **Fix**: Guard the final append with `if curr_stream:`.
+- **Verified**: reproduction script passes, title variant passes, and `test_backend_ps.py` passes (33 passed, 2 skipped).
+
+```bash-action
+exit
+```

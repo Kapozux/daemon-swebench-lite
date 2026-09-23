@@ -1,0 +1,555 @@
+plan-unwanted
+I'll start by examining the relevant source file to understand the issue.
+
+```bash-action
+cd /testbed && sed -n '1,120p' django/core/cache/backends/filebased.py
+```
+
+Let me look at the file's content:
+
+```bash-action
+cat django/core/cache/backends/filebased.py
+```
+executing输出 "File-based cache backend"
+import glob
+import os
+import pickle
+import random
+import tempfile
+import time
+import zlib
+
+from django.core.cache.backends.base import DEFAULT_TIMEOUT, BaseCache
+from django.core.files import locks
+from django.core.files.move import file_move_safe
+from django.utils.crypto import md5
+
+
+class FileBasedCache(BaseCache):
+    cache_suffix = ".djcache"
+    pickle_protocol = pickle.HIGHEST_PROTOCOL
+
+    def __init__(self, dir, params):
+        super().__init__(params)
+        self._dir = os.path.abspath(dir)
+        self._createdir()
+
+    def add(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
+        if self.has_key(key, version):
+            return False
+        self.set(key, value, timeout, version)
+        return True
+
+    def get(self, key, default=None, version=None):
+        fname = self._key_to_file(key, version)
+        try:
+            with open(fname, "rb") as f:
+                if not self._is_expired(f):
+                    return pickle.loads(zlib.decompress(f.read()))
+        except FileNotFoundError:
+            pass
+        return default
+
+    def _write_content(self, file, timeout, value):
+        expiry = self.get_backend_timeout(timeout)
+        file.write(pickle.dumps(expiry, self.pickle_protocol))
+        file.write(zlib.compress(pickle.dumps(value, self.pickle_protocol)))
+
+    def set(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
+        self._createdir()  # Cache dir can be deleted at any time.
+        fname = self._key_to_file(key, version)
+        self._cull()  # make some room if necessary
+        fd, tmp_path = tempfile.mkstemp(dir=self._dir)
+        renamed = False
+        try:
+            with open(fd, "wb") as f:
+                self._write_content(f, timeout, value)
+            file_move_safe(tmp_path, fname, allow_overwrite=True)
+            renamed = True
+        finally:
+            if not renamed:
+                os.remove(tmp_path)
+
+    def touch(self, key, timeout=DEFAULT_TIMEOUT, versio
+....(省略中间部分)...
+    else:
+                        previous_value = pickle.loads(zlib.decompress(f.read()))
+                        f.seek(0)
+                        self._write_content(f, timeout, previous_value)
+                        return True
+                finally:
+                    locks.unlock(f)
+        except FileNotFoundError:
+            return False
+
+    def delete(self, key, version=None):
+        return self._delete(self._key_to_file(key, version))
+
+    def _delete(self, fname):
+        if not fname.startswith(self._dir) or not os.path.exists(fname):
+            return False
+        try:
+            os.remove(fname)
+        except FileNotFoundError:
+            # The file may have been removed by another process.
+            return False
+        return True
+
+    def has_key(self, key, version=None):
+        fname = self._key_to_file(key, version)
+        if os.path.exists(fname):
+            with open(fname, "rb") as f:
+                return not self._is_expired(f)
+        return False
+
+    def _cull(self):
+        """
+        Remove random cache entries if max_entries is reached at a ratio
+        of num_entries / cull_frequency. A value of 0 for CULL_FREQUENCY means
+        that the entire cache will be purged.
+        """
+        filelist = self._list_cache_files()
+        num_entries = len(filelist)
+        if num_entries < self._max_entries:
+            return  # return early if no culling is required
+        if self._cull_frequency == 0:
+            return self.clear()  # Clear the cache when CULL_FREQUENCY = 0
+        # Delete a random selection of entries
+        filelist = random.sample(filelist, int(num_entries / self._cull_frequency))
+        for fname in filelist:
+            self._delete(fname)
+
+    def _createdir(self):
+        # Set the umask because os.makedirs() doesn't apply the "mode" argument
+        # to intermediate-level directories.
+        old_umask = os.umask(0o077)
+        try:
+            os.makedirs(self._dir, 0o700, exist_ok=True)
+
+
+Now let me see the `get`, `_is_expired` methods and the full context. Let me view the middle part that was elided:
+
+```bash-action
+cd /testbed && grep -n "_is_expired\|def get\|def touch\|FileNotFoundError\|os.path.exists" django/core/cache/backends/filebased.py
+```
+
+Let me look at the whole file with line numbers for the key methods:
+
+```bash-action
+cd /testbed && sed -n '60,145p' django/core/cache/backends/filebased.py
+```
+
+The issue is clear in `has_key`: between `os.path.exists(fname)` and `open(fname)`, the file can be deleted, causing a `FileNotFoundError`. The fix is to remove the `os.path.exists()` check and just wrap the `open()` in a try/except `FileNotFoundError`, mirroring how `get()` already handles it.
+
+Let me confirm the exact current code:
+
+```bash-action
+cd /testbed && sed -n '83,100p' django/core/cache/backends/filebased.py
+```2026_09_21_10_03_1789984984
+executing输出 31:    def get(self, key, default=None, version=None):
+35:                if not self._is_expired(f):
+37:        except FileNotFoundError:
+61:    def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
+66:                    if self._is_expired(f):
+75:        except FileNotFoundError:
+82:        if not fname.startswith(self._dir) or not os.path.exists(fname):
+86:        except FileNotFoundError:
+93:        if os.path.exists(fname):
+95:                return not self._is_expired(f)
+147:    def _is_expired(self, f):
+
+
+```bash-action
+cd /testbed && sed -n '83,100p' django/core/cache/backends/filebased.py
+```
+executing输出             return False
+        try:
+            os.remove(fname)
+        except FileNotFoundError:
+            # The file may have been removed by another process.
+            return False
+        return True
+
+    def has_key(self, key, version=None):
+        fname = self._key_to_file(key, version)
+        if os.path.exists(fname):
+            with open(fname, "rb") as f:
+                return not self._is_expired(f)
+        return False
+
+    def _cull(self):
+        """
+        Remove random cache entries if max_entries is reached at a ratio
+
+
+Now let me see `get()` for the pattern to mirror, and `_is_expired`:
+
+```bash-action
+cd /testbed && sed -n '31,40p' django/core/cache/backends/filebased.py && echo "---" && sed -n '147,165p' django/core/cache/backends/filebased.py
+```
+
+Now I have enough context. Let me write a minimal reproduction script first to confirm the bug (race condition in `has_key`).
+
+Actually, the race condition is hard to reproduce in a single thread — but I can reproduce it deterministically by simulating what happens: expire the file and have `_is_expired` delete it, then have `has_key` try to open. The simplest deterministic reproduction is to make `os.path.exists` return True but the file gets deleted before open. I can do this with a mock/patch of `os.path.exists` to delete the file.
+
+Let me write the repro script:
+
+```bash-action
+cd /testbed && cat > /tmp/repro_has_key.py <<'EOF'
+import os
+from unittest import mock
+from django.core.cache.backends.filebased import FileBasedCache
+import tempfile
+
+d = tempfile.mkdtemp()
+c = FileBasedCache(d, {})
+c.set("foo", "bar")
+
+fname = c._key_to_file("foo")
+
+# Simulate the race: os.path.exists() returns True, but the file is
+# deleted before open() is called.
+real_exists = os.path.exists
+
+def racing_exists(path):
+    if path == fname:
+        # another thread deletes the file between exists() and open()
+        result = real_exists(path)
+        try:
+            os.remove(fname)
+        except FileNotFoundError:
+            pass
+        return result
+    return real_exists(path)
+
+with mock.patch("os.path.exists", side_effect=racing_exists):
+    try:
+        result = c.has_key("foo")
+        print("has_key returned:", result)
+        print("NO BUG (no exception)")
+    except FileNotFoundError as e:
+        print("BUG REPRODUCED: FileNotFoundError:", e)
+EOF
+python /tmp/repro_has_key.py
+```2026_09_21_10_03_1789984987
+executing输出     def get(self, key, default=None, version=None):
+        fname = self._key_to_file(key, version)
+        try:
+            with open(fname, "rb") as f:
+                if not self._is_expired(f):
+                    return pickle.loads(zlib.decompress(f.read()))
+        except FileNotFoundError:
+            pass
+        return default
+
+---
+    def _is_expired(self, f):
+        """
+        Take an open cache file `f` and delete it if it's expired.
+        """
+        try:
+            exp = pickle.load(f)
+        except EOFError:
+            exp = 0  # An empty file is considered expired.
+        if exp is not None and exp < time.time():
+            f.close()  # On Windows a file has to be closed before deleting
+            self._delete(f.name)
+            return True
+        return False
+
+    def _list_cache_files(self):
+        """
+        Get a list of paths to all the cache files. These are all the files
+        in the root cache dir that end on the cache_suffix.
+        """
+
+
+```bash-action
+cd /testbed && cat > /tmp/repro_has_key.py <<'EOF'
+import os
+from unittest import mock
+from django.core.cache.backends.filebased import FileBasedCache
+import tempfile
+
+d = tempfile.mkdtemp()
+c = FileBasedCache(d, {})
+c.set("foo", "bar")
+
+fname = c._key_to_file("foo")
+
+real_exists = os.path.exists
+
+def racing_exists(path):
+    if path == fname:
+        result = real_exists(path)
+        try:
+            os.remove(fname)
+        except FileNotFoundError:
+            pass
+        return result
+    return real_exists(path)
+
+with mock.patch("os.path.exists", side_effect=racing_exists):
+    try:
+        result = c.has_key("foo")
+        print("has_key returned:", result)
+        print("NO BUG (no exception)")
+    except FileNotFoundError as e:
+        print("BUG REPRODUCED: FileNotFoundError:", e)
+EOF
+python /tmp/repro_has_key.py
+```
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro_has_key.py", line 3, in <module>
+    from django.core.cache.backends.filebased import FileBasedCache
+ModuleNotFoundError: No module named 'django'
+
+
+The module isn't importable from `/tmp`. Let me run with the repo on the path:
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro_has_key.py
+```
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro_has_key.py", line 3, in <module>
+    from django.core.cache.backends.filebased import FileBasedCache
+  File "/testbed/django/core/cache/__init__.py", line 16, in <module>
+    from django.core.cache.backends.base import (
+  File "/testbed/django/core/cache/backends/base.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+The current shell's python isn't the configured test env. Let me find the right python:
+
+```bash-action
+cd /testbed && which python python3; ls; pip --version 2>/dev/null; find / -name "asgiref" -maxdepth 8 -type d 2>/dev/null | head
+```2026_09_21_10_03_1789984991
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python3
+AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+django
+docs
+extras
+js_tests
+llm.py
+package.json
+pyproject.toml
+scripts
+setup.cfg
+setup.py
+system_prompt.txt
+tests
+tox.ini
+pip 23.3.1 from /opt/miniconda3/lib/python3.11/site-packages/pip (python 3.11)
+/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/asgiref
+
+
+There's a conda env `testbed`. Let me use that python:
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro_has_key.py
+```2026_09_21_10_03_1789984992
+executing输出 BUG REPRODUCED: FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmpp92lrxpd/9fe685f2d059d8a11303e9e64be4cc7b.djcache'
+
+
+Bug reproduced. Now let me apply the fix to `has_key`, mirroring `get()`:
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = "django/core/cache/backends/filebased.py"
+s = open(p).read()
+old = '''    def has_key(self, key, version=None):
+        fname = self._key_to_file(key, version)
+        if os.path.exists(fname):
+            with open(fname, "rb") as f:
+                return not self._is_expired(f)
+        return False
+'''
+new = '''    def has_key(self, key, version=None):
+        fname = self._key_to_file(key, version)
+        try:
+            with open(fname, "rb") as f:
+                return not self._is_expired(f)
+        except FileNotFoundError:
+            # The file may have been removed by another process.
+            return False
+'''
+assert old in s
+s = s.replace(old, new)
+open(p, "w").write(s)
+print("patched")
+EOF
+```
+
+Wait — the shell's `python` lacks django deps, but this patch script only does string ops, so it's fine. Let me verify:
+
+```bash-action
+cd /testbed && git diff django/core/cache/backends/filebased.py
+```2026_09_21_10_03_17899849942026_09_21_10_03_1789984994
+executing输出 patched
+
+
+The diff didn't print. Let me check:
+
+```bash-action
+cd /testbed && git --no-pager diff django/core/cache/backends/filebased.py
+```2026_09_21_10_03_1789984995
+executing输出 diff --git a/django/core/cache/backends/filebased.py b/django/core/cache/backends/filebased.py
+index 631da49444..0538c11fea 100755
+--- a/django/core/cache/backends/filebased.py
++++ b/django/core/cache/backends/filebased.py
+@@ -90,10 +90,12 @@ class FileBasedCache(BaseCache):
+ 
+     def has_key(self, key, version=None):
+         fname = self._key_to_file(key, version)
+-        if os.path.exists(fname):
++        try:
+             with open(fname, "rb") as f:
+                 return not self._is_expired(f)
+-        return False
++        except FileNotFoundError:
++            # The file may have been removed by another process.
++            return False
+ 
+     def _cull(self):
+         """
+
+
+The fix is exactly as intended. Now let me re-run the repro to confirm it's fixed:
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro_has_key.py
+```2026_09_21_10_03_17899849962026_09_21_10_03_1789984996
+executing输出 has_key returned: True
+NO BUG (no exception)
+
+
+Fixed — no more exception. Now let me find and run the existing test file covering this module:
+
+```bash-action
+cd /testbed && ls tests/cache/ | grep -i file
+```2026_09_21_10_03_1789984997
+executing输出 
+
+```bash-action
+cd /testbed && ls tests/cache/
+```2026_09_21_10_03_17899849982026_09_21_10_03_1789984998
+executing输出 __init__.py
+closeable_cache.py
+liberal_backend.py
+models.py
+tests.py
+tests_async.py
+
+
+The `tests.py` contains the FileBasedCache tests. Note: I must not modify test files, but I can run them. Let me grep for the FileBasedCache test class and run it:
+
+```bash-action
+cd /testbed && grep -n "class FileBasedCacheTests\|has_key" tests/cache/tests.py | head -40
+```
+executing输出 138:    def test_has_key(self):
+139:        "The has_key method doesn't ever return True for the dummy cache backend"
+141:        self.assertIs(cache.has_key("hello1"), False)
+142:        self.assertIs(cache.has_key("goodbye1"), False)
+202:        self.assertIs(cache.has_key("expire3"), False)
+333:        self.assertIs(caches["prefix"].has_key("somekey"), False)
+367:    def test_has_key(self):
+370:        self.assertIs(cache.has_key("hello1"), True)
+371:        self.assertIs(cache.has_key("goodbye1"), False)
+373:        self.assertIs(cache.has_key("no_expiry"), True)
+375:        self.assertIs(cache.has_key("null"), True)
+490:        self.assertIs(cache.has_key("expire3"), False)
+497:        self.assertIs(cache.has_key("expire1"), True)
+499:        self.assertIs(cache.has_key("expire1"), False)
+504:        self.assertIs(cache.has_key("expire1"), True)
+676:            if cull_cache.has_key("cull%d" % i):
+696:            self.assertIs(cull_cache.has_key("force_cull_delete"), True)
+845:    def test_cache_versioning_has_key(self):
+848:        # has_key
+849:        self.assertIs(cache.has_key("answer1"), True)
+850:        self.assertIs(cache.has_key("answer1", version=1), True)
+851:        self.assertIs(cache.has_key("answer1", version=2), False)
+853:        self.assertIs(caches["v2"].has_key("answer1"), False)
+854:        self.assertIs(caches["v2"].has_key("answer1", version=1), True)
+855:        self.assertIs(caches["v2"].has_key("answer1", version=2), False)
+1267:    def test_has_key_query_columns_quoted(self):
+1269:            cache.has_key("key")
+1681:class FileBasedCacheTests(BaseCacheTests, TestCase):
+
+
+Let me run the `FileBasedCacheTests` class:
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py cache.tests.FileBasedCacheTests -v1 2>&1 | tail -30
+```2026_09_21_10_03_17899850002026_09_21_10_03_1789985000
+executing输出 Creating test database for alias 'default'...
+Testing against Django installed in '/testbed/django' with up to 16 processes
+Found 61 test(s).
+System check identified no issues (0 silenced).
+.............................................................
+----------------------------------------------------------------------
+Ran 61 tests in 13.125s
+
+OK
+Destroying test database for alias 'default'...
+
+
+All 61 `FileBasedCacheTests` pass. Now let me check whether there are similar `os.path.exists` + `open` patterns elsewhere in this file that could have the same race. I already saw `get()` and `touch()` use try/except properly. Let me double-check `_delete` (line 82) — it uses `os.path.exists` then `os.remove` but already wraps the remove in `FileNotFoundError`. So the only unguarded spot was `has_key`, now fixed.
+
+Let me verify the diff one final time:
+
+```bash-action
+cd /testbed && git --no-pager diff
+```2026_09_21_10_03_17899850142026_09_21_10_03_1789985014
+executing输出 diff --git a/django/core/cache/backends/filebased.py b/django/core/cache/backends/filebased.py
+index 631da49444..0538c11fea 100755
+--- a/django/core/cache/backends/filebased.py
++++ b/django/core/cache/backends/filebased.py
+@@ -90,10 +90,12 @@ class FileBasedCache(BaseCache):
+ 
+     def has_key(self, key, version=None):
+         fname = self._key_to_file(key, version)
+-        if os.path.exists(fname):
++        try:
+             with open(fname, "rb") as f:
+                 return not self._is_expired(f)
+-        return False
++        except FileNotFoundError:
++            # The file may have been removed by another process.
++            return False
+ 
+     def _cull(self):
+         """
+
+
+The fix is complete and verified:
+
+1. **Root cause**: `has_key()` checked `os.path.exists(fname)` then called `open(fname)` separately. Between those two operations, another thread/process could delete the file (e.g., `_is_expired` deleting an expired file, or concurrent culling), raising `FileNotFoundError`.
+
+2. **Fix**: Removed the TOCTOU-prone `os.path.exists()` check and wrapped the `open()`/`_is_expired()` call in a `try/except FileNotFoundError`, returning `False` — mirroring the existing pattern in `get()` and `touch()`.
+
+3. **Verification**:
+   - Minimal reproduction confirmed the bug before the fix (`FileNotFoundError` raised) and confirmed it's gone after the fix.
+   - Existing test suite `cache.tests.FileBasedCacheTests` (61 tests) passes.
+   - The diff is minimal and only touches the necessary source.
+
+No other locations in the file had the same unguarded pattern (`get`, `touch`, and `_delete` already handle `FileNotFoundError`).
+
+```bash-action
+exit
+```

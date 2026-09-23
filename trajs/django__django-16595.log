@@ -1,0 +1,562 @@
+plan-unwanted
+我先确认环境并定位相关源码。
+
+```bash-action
+cd /testbed && git log --oneline -3 && python -c "import django; print(django.VERSION)"
+```
+executing输出 e72c950d02 SWE-bench
+f9fe062de5 Doc'd that Meta.indexes is preferred to Field.db_index.
+2c428b37ae Refs #34338 -- Fixed isolation of constraints tests.
+(5, 0, 0, 'alpha', 0)
+
+
+我处于 plan stage。先只给计划：
+
+## 计划
+
+**问题定位**：
+`django/db/migrations/operations/fields.py` 中 `AlterField.reduce()` 方法只处理了与 `AddField`、`RemoveField`、`AlterField`(?) 等的交互。issue 指出当两个 `AlterField` 相邻时，`reduce` 不会把后者合并进前者。
+
+**具体步骤**：
+1. 阅读 `django/db/migrations/operations/fields.py` 里 `AlterField.reduce()` 的现有实现，确认它对 `isinstance(operation, AlterField)` 的处理是否缺失（很可能只处理了 `AddField`/`RemoveField`）。
+2. 编写一个最小复现脚本，用 issue 中的操作序列，确认 `reduce` 前相邻的两个 `AlterField` 不会被合并（复现 bug）。
+3. 在 `AlterField.reduce()` 中加入对 `AlterField` 的处理：当 `self.is_same_field_operation(operation)` 时，返回 `[operation]`（保留后者，因为它是最新的字段状态）。
+4. 重跑最小复现脚本，确认相邻 `AlterField` 被正确合并。
+5. 找到仓库中覆盖该模块的已有测试文件（如 `tests/migrations/test_optimizer.py`），运行相关测试确认不破坏既有行为。
+6. `git diff` 确认改动，然后运行 `exit`。
+
+请确认后我开始执行。
+我先阅读源码定位问题。
+
+```bash-action
+cd /testbed && sed -n '1,60p' django/db/migrations/operations/fields.py && echo "-----" && grep -n "class AlterField" -A 60 django/db/migrations/operations/fields.py
+```
+executing输出 from django.db.migrations.utils import field_references
+from django.db.models import NOT_PROVIDED
+from django.utils.functional import cached_property
+
+from .base import Operation
+
+
+class FieldOperation(Operation):
+    def __init__(self, model_name, name, field=None):
+        self.model_name = model_name
+        self.name = name
+        self.field = field
+
+    @cached_property
+    def model_name_lower(self):
+        return self.model_name.lower()
+
+    @cached_property
+    def name_lower(self):
+        return self.name.lower()
+
+    def is_same_model_operation(self, operation):
+        return self.model_name_lower == operation.model_name_lower
+
+    def is_same_field_operation(self, operation):
+        return (
+            self.is_same_model_operation(operation)
+            and self.name_lower == operation.name_lower
+        )
+
+    def references_model(self, name, app_label):
+        name_lower = name.lower()
+        if name_lower == self.model_name_lower:
+            return True
+        if self.field:
+            return bool(
+                field_references(
+                    (app_label, self.model_name_lower),
+                    self.field,
+                    (app_label, name_lower),
+                )
+            )
+        return False
+
+    def references_field(self, model_name, name, app_label):
+        model_name_lower = model_name.lower()
+        # Check if this operation locally references the field.
+        if model_name_lower == self.model_name_lower:
+            if name == self.name:
+                return True
+            elif (
+                self.field
+                and hasattr(self.field, "from_fields")
+                and name in self.field.from_fields
+            ):
+                return True
+        # Check if this operation remotely references the field.
+        if self.field is None:
+            return False
+        return bool(
+-----
+198:class AlterField(FieldOperation):
+199-    """
+200-    Alter a field's database column (e.g. null, max_leng
+....(省略中间部分)...
+       if self.preserve_default is not True:
+215-            kwargs["preserve_default"] = self.preserve_default
+216-        return (self.__class__.__name__, [], kwargs)
+217-
+218-    def state_forwards(self, app_label, state):
+219-        state.alter_field(
+220-            app_label,
+221-            self.model_name_lower,
+222-            self.name,
+223-            self.field,
+224-            self.preserve_default,
+225-        )
+226-
+227-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+228-        to_model = to_state.apps.get_model(app_label, self.model_name)
+229-        if self.allow_migrate_model(schema_editor.connection.alias, to_model):
+230-            from_model = from_state.apps.get_model(app_label, self.model_name)
+231-            from_field = from_model._meta.get_field(self.name)
+232-            to_field = to_model._meta.get_field(self.name)
+233-            if not self.preserve_default:
+234-                to_field.default = self.field.default
+235-            schema_editor.alter_field(from_model, from_field, to_field)
+236-            if not self.preserve_default:
+237-                to_field.default = NOT_PROVIDED
+238-
+239-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+240-        self.database_forwards(app_label, schema_editor, from_state, to_state)
+241-
+242-    def describe(self):
+243-        return "Alter field %s on %s" % (self.name, self.model_name)
+244-
+245-    @property
+246-    def migration_name_fragment(self):
+247-        return "alter_%s_%s" % (self.model_name_lower, self.name_lower)
+248-
+249-    def reduce(self, operation, app_label):
+250-        if isinstance(operation, RemoveField) and self.is_same_field_operation(
+251-            operation
+252-        ):
+253-            return [operation]
+254-        elif (
+255-            isinstance(operation, RenameField)
+256-            and self.is_same_field_operation(operation)
+257-            and self.field.db_column is None
+258-        ):
+
+
+```bash-action
+cd /testbed && sed -n '249,300p' django/db/migrations/operations/fields.py
+```2026_09_21_10_03_1789985036
+executing输出     def reduce(self, operation, app_label):
+        if isinstance(operation, RemoveField) and self.is_same_field_operation(
+            operation
+        ):
+            return [operation]
+        elif (
+            isinstance(operation, RenameField)
+            and self.is_same_field_operation(operation)
+            and self.field.db_column is None
+        ):
+            return [
+                operation,
+                AlterField(
+                    model_name=self.model_name,
+                    name=operation.new_name,
+                    field=self.field,
+                ),
+            ]
+        return super().reduce(operation, app_label)
+
+
+class RenameField(FieldOperation):
+    """Rename a field on the model. Might affect db_column too."""
+
+    def __init__(self, model_name, old_name, new_name):
+        self.old_name = old_name
+        self.new_name = new_name
+        super().__init__(model_name, old_name)
+
+    @cached_property
+    def old_name_lower(self):
+        return self.old_name.lower()
+
+    @cached_property
+    def new_name_lower(self):
+        return self.new_name.lower()
+
+    def deconstruct(self):
+        kwargs = {
+            "model_name": self.model_name,
+            "old_name": self.old_name,
+            "new_name": self.new_name,
+        }
+        return (self.__class__.__name__, [], kwargs)
+
+    def state_forwards(self, app_label, state):
+        state.rename_field(
+            app_label, self.model_name_lower, self.old_name, self.new_name
+        )
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        to_model = to_state.apps.get_model(app_label, self.model_name)
+
+
+确认根因：`AlterField.reduce()` 没有处理 `isinstance(operation, AlterField)`。先写最小复现脚本确认 bug。
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import django
+from django.conf import settings
+settings.configure(INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'])
+django.setup()
+from django.db import migrations
+from django.db.migrations.operations import fields
+from django.db.migrations.optimizer import MigrationOptimizer
+
+operations = [
+    migrations.AddField("book", "title", models_char := None),  # placeholder
+]
+from django.db import models
+operations = [
+    migrations.AddField(model_name="book", name="title", field=models.CharField(max_length=256, null=True)),
+    migrations.AlterField(model_name="book", name="title", field=models.CharField(max_length=128, null=True)),
+    migrations.AlterField(model_name="book", name="title", field=models.CharField(max_length=128, null=True, help_text="help")),
+    migrations.AlterField(model_name="book", name="title", field=models.CharField(max_length=128, null=True, help_text="help", default=None)),
+]
+opt = MigrationOptimizer()
+print("all:", opt.optimize(operations, "books"))
+print("tail:", opt.optimize(operations[1:], "books"))
+EOF
+python /tmp/repro.py
+```2026_09_21_10_03_1789985037
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+```bash-action
+cd /testbed && which python && python -c "import sys; print(sys.executable)" && ls
+```2026_09_21_10_03_17899850392026_09_21_10_03_1789985039
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python
+AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+django
+docs
+extras
+js_tests
+llm.py
+package.json
+pyproject.toml
+scripts
+setup.cfg
+setup.py
+system_prompt.txt
+tests
+tox.ini
+
+
+django 在 cwd 下，但脚本在 /tmp 运行导致路径问题。用 tests 目录的方式或加 cwd。
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_10_03_17899850402026_09_21_10_03_1789985040
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 2, in <module>
+    from django.conf import settings
+  File "/testbed/django/conf/__init__.py", line 19, in <module>
+  File "/testbed/django/utils/deprecation.py", line 4, in <module>
+    from asgiref.sync import iscoroutinefunction, markcoroutinefunction, sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+`python` 指向 conda base 但缺包。查找正确的测试环境。
+
+```bash-action
+cd /testbed && ls /opt/miniconda3/envs 2>/dev/null; pip list 2>/dev/null | grep -i asgiref; python -c "import sys; print(sys.path)"
+```2026_09_21_10_04_17899850412026_09_21_10_04_17899850412026_09_21_10_04_1789985041
+executing输出 testbed
+['', '/opt/miniconda3/lib/python311.zip', '/opt/miniconda3/lib/python3.11', '/opt/miniconda3/lib/python3.11/lib-dynload', '/opt/miniconda3/lib/python3.11/site-packages']
+
+
+There's a `testbed` conda env. Let me use it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "import django, asgiref; print(django.VERSION)"
+```2026_09_21_10_04_17899850432026_09_21_10_04_17899850432026_09_21_10_04_1789985043
+executing输出 (5, 0, 0, 'alpha', 0)
+
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_10_04_17899850442026_09_21_10_04_17899850442026_09_21_10_04_17899850442026_09_21_10_04_17899850442026_09_21_10_04_1789985044
+executing输出 all: [<AddField  model_name='book', name='title', field=<django.db.models.fields.CharField>>]
+tail: [<AlterField  model_name='book', name='title', field=<django.db.models.fields.CharField>>, <AlterField  model_name='book', name='title', field=<django.db.models.fields.CharField>>, <AlterField  model_name='book', name='title', field=<django.db.models.fields.CharField>>]
+
+
+Bug 已复现：`tail` 没有被优化。现在修复源码。
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = "django/db/migrations/operations/fields.py"
+s = open(p).read()
+old = """    def reduce(self, operation, app_label):
+        if isinstance(operation, RemoveField) and self.is_same_field_operation(
+            operation
+        ):
+            return [operation]
+        elif (
+            isinstance(operation, RenameField)
+            and self.is_same_field_operation(operation)
+            and self.field.db_column is None
+        ):"""
+new = """    def reduce(self, operation, app_label):
+        if isinstance(operation, (AlterField, RemoveField)) and self.is_same_field_operation(
+            operation
+        ):
+            return [operation]
+        elif (
+            isinstance(operation, RenameField)
+            and self.is_same_field_operation(operation)
+            and self.field.db_column is None
+        ):"""
+assert old in s
+s = s.replace(old, new)
+open(p, "w").write(s)
+print("done")
+EOF
+```2026_09_21_10_04_17899850462026_09_21_10_04_17899850462026_09_21_10_04_17899850462026_09_21_10_04_17899850462026_09_21_10_04_17899850462026_09_21_10_04_1789985047
+
+<system>Cannot retrieve the content of this message. Please check the backend logs.</system>
+executing输出 done
+
+
+Let me check the change and verify with the repro.
+
+```bash-action
+cd /testbed && sed -n '249,258p' django/db/migrations/operations/fields.py && echo "=====" && PYTHONPATH=/testbed /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_10_04_17899850482026_09_21_10_04_17899850482026_09_21_10_04_17899850492026_09_21_10_04_17899850492026_09_21_10_04_17899850492026_09_21_10_04_17899850492026_09_21_10_04_1789985050
+
+<system>Cannot retrieve the content of this message. Please check the backend logs.</system>2026_09_21_10_04_1789985050
+executing输出     def reduce(self, operation, app_label):
+        if isinstance(operation, (AlterField, RemoveField)) and self.is_same_field_operation(
+            operation
+        ):
+            return [operation]
+        elif (
+            isinstance(operation, RenameField)
+            and self.is_same_field_operation(operation)
+            and self.field.db_column is None
+        ):
+=====
+all: [<AddField  model_name='book', name='title', field=<django.db.models.fields.CharField>>]
+tail: [<AlterField  model_name='book', name='title', field=<django.db.models.fields.CharField>>]
+
+
+修复生效：`tail` 现在只剩一个 `AlterField`。样式上把长行折一下保持仓库风格。
+
+```bash-action
+cd /testbed && python - <<'EOF'
+p = "django/db/migrations/operations/fields.py"
+s = open(p).read()
+old = """        if isinstance(operation, (AlterField, RemoveField)) and self.is_same_field_operation(
+            operation
+        ):
+            return [operation]"""
+new = """        if isinstance(
+            operation, (AlterField, RemoveField)
+        ) and self.is_same_field_operation(operation):
+            return [operation]"""
+assert old in s
+s = s.replace(old, new)
+open(p, "w").write(s)
+print("done")
+EOF
+```2026_09_21_10_04_17899850512026_09_21_10_04_17899850512026_09_21_10_04_17899850512026_09_21_10_04_17899850512026_09_21_10_04_17899850512026_09_21_10_04_1789985052
+
+<system>Cannot retrieve the content of this message. Please check the backend logs.</system>2026_09_21_10_04_1789985052
+executing输出 done
+
+
+Now check if the same pattern exists in other operation reduce methods (grep for similar AlterField handling in other files).
+
+```bash-action
+cd /testbed && grep -rn "isinstance(operation, RemoveField)" django/db/migrations/operations/ && echo "-----" && grep -n "def reduce" django/db/migrations/operations/*.py
+```2026_09_21_10_04_17899850532026_09_21_10_04_17899850532026_09_21_10_04_17899850532026_09_21_10_04_17899850532026_09_21_10_04_17899850532026_09_21_10_04_1789985054
+
+<system>Cannot retrieve the content of this message. Please check the backend logs.</system>2026_09_21_10_04_1789985054
+executing输出 django/db/migrations/operations/models.py:245:            elif isinstance(operation, RemoveField):
+django/db/migrations/operations/fields.py:141:            elif isinstance(operation, RemoveField):
+-----
+django/db/migrations/operations/base.py:129:    def reduce(self, operation, app_label):
+django/db/migrations/operations/fields.py:69:    def reduce(self, operation, app_label):
+django/db/migrations/operations/fields.py:129:    def reduce(self, operation, app_label):
+django/db/migrations/operations/fields.py:187:    def reduce(self, operation, app_label):
+django/db/migrations/operations/fields.py:249:    def reduce(self, operation, app_label):
+django/db/migrations/operations/fields.py:339:    def reduce(self, operation, app_label):
+django/db/migrations/operations/models.py:32:    def reduce(self, operation, app_label):
+django/db/migrations/operations/models.py:136:    def reduce(self, operation, app_label):
+django/db/migrations/operations/models.py:445:    def reduce(self, operation, app_label):
+django/db/migrations/operations/models.py:464:    def reduce(self, operation, app_label):
+django/db/migrations/operations/models.py:1039:    def reduce(self, operation, app_label):
+
+
+Let me check the AddField reduce (line 69) and others to see if the same issue pattern (AlterField not handled) exists there, since issue is specifically about AlterField. Also check models.py:245 context.
+
+```bash-action
+cd /testbed && sed -n '69,127p' django/db/migrations/operations/fields.py
+```2026_09_21_10_04_17899850542026_09_21_10_04_17899850542026_09_21_10_04_1789985055
+
+<system>Cannot retrieve the content of this message. Please check the backend logs.</system>2026_09_21_10_04_17899850552026_09_21_10_04_1789985054
+executing输出     def reduce(self, operation, app_label):
+        return super().reduce(operation, app_label) or not operation.references_field(
+            self.model_name, self.name, app_label
+        )
+
+
+class AddField(FieldOperation):
+    """Add a field to a model."""
+
+    def __init__(self, model_name, name, field, preserve_default=True):
+        self.preserve_default = preserve_default
+        super().__init__(model_name, name, field)
+
+    def deconstruct(self):
+        kwargs = {
+            "model_name": self.model_name,
+            "name": self.name,
+            "field": self.field,
+        }
+        if self.preserve_default is not True:
+            kwargs["preserve_default"] = self.preserve_default
+        return (self.__class__.__name__, [], kwargs)
+
+    def state_forwards(self, app_label, state):
+        state.add_field(
+            app_label,
+            self.model_name_lower,
+            self.name,
+            self.field,
+            self.preserve_default,
+        )
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        to_model = to_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, to_model):
+            from_model = from_state.apps.get_model(app_label, self.model_name)
+            field = to_model._meta.get_field(self.name)
+            if not self.preserve_default:
+                field.default = self.field.default
+            schema_editor.add_field(
+                from_model,
+                field,
+            )
+            if not self.preserve_default:
+                field.default = NOT_PROVIDED
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        from_model = from_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, from_model):
+            schema_editor.remove_field(
+                from_model, from_model._meta.get_field(self.name)
+            )
+
+    def describe(self):
+        return "Add field %s to %s" % (self.name, self.model_name)
+
+    @property
+    def migration_name_fragment(self):
+        return "%s_%s" % (self.model_name_lower, self.name_lower)
+
+
+The AddField.reduce is at line 129; the issue is specifically about AlterField.reduce. My fix is scoped correctly. Now run the existing tests covering the optimizer.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py migrations.test_optimizer -v 1 2>&1 | tail -20
+```2026_09_21_10_04_17899850562026_09_21_10_04_17899850562026_09_21_10_04_17899850562026_09_21_10_04_17899850562026_09_21_10_04_17899850562026_09_21_10_04_1789985057
+
+<system>Cannot retrieve the content of this message. Please check the backend logs.</system>2026_09_21_10_04_17899850572026_09_21_10_04_1789985056
+executing输出 Testing against Django installed in '/testbed/django' with up to 16 processes
+Found 37 test(s).
+System check identified no issues (0 silenced).
+.....................................
+----------------------------------------------------------------------
+Ran 37 tests in 0.013s
+
+OK
+
+
+All optimizer tests pass. Also run the broader migrations operations tests just to be safe.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py migrations -v 1 2>&1 | tail -8
+```2026_09_21_10_04_17899850582026_09_21_10_04_17899850582026_09_21_10_04_17899850582026_09_21_10_04_17899850582026_09_21_10_04_17899850582026_09_21_10_04_1789985059
+
+<system>Cannot retrieve the content of this message. Please check the backend logs.</system>2026_09_21_10_04_17899850592026_09_21_10_04_17899850582026_09_21_10_04_1789985058
+executing输出 Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+
+
+Let me check for failures in the full run output.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py migrations -v 1 2>&1 | grep -E "^(OK|FAILED|Ran )"
+```2026_09_21_10_04_17899850602026_09_21_10_04_17899850602026_09_21_10_04_17899850602026_09_21_10_04_17899850602026_09_21_10_04_17899850602026_09_21_10_04_1789985061
+
+<system>Cannot retrieve the content of this message. Please check the backend logs.</system>2026_09_21_10_04_17899850612026_09_21_10_04_17899850602026_09_21_10_04_17899850602026_09_21_10_04_1789985060
+executing输出 Ran 712 tests in 0.920s
+OK (skipped=2)
+
+
+All 712 migrations tests pass. Now confirm the final diff.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_10_04_17899850622026_09_21_10_04_17899850632026_09_21_10_04_17899850632026_09_21_10_04_17899850632026_09_21_10_04_17899850632026_09_21_10_04_1789985064
+
+<system>Cannot retrieve the content of this message. Please check the backend logs.</system>2026_09_21_10_04_17899850642026_09_21_10_04_17899850632026_09_21_10_04_17899850632026_09_21_10_04_1789985063
+executing输出 diff --git a/django/db/migrations/operations/fields.py b/django/db/migrations/operations/fields.py
+index cd3aab43ad..fc5640bea9 100755
+--- a/django/db/migrations/operations/fields.py
++++ b/django/db/migrations/operations/fields.py
+@@ -247,9 +247,9 @@ class AlterField(FieldOperation):
+         return "alter_%s_%s" % (self.model_name_lower, self.name_lower)
+ 
+     def reduce(self, operation, app_label):
+-        if isinstance(operation, RemoveField) and self.is_same_field_operation(
+-            operation
+-        ):
++        if isinstance(
++            operation, (AlterField, RemoveField)
++        ) and self.is_same_field_operation(operation):
+             return [operation]
+         elif (
+             isinstance(operation, RenameField)
+
+
+Diff 正是我想要的改动：`AlterField.reduce()` 现在把相邻同字段的 `AlterField`（以及原有的 `RemoveField`）合并，保留后者。最小复现已从 3 个 `AlterField` 降到 1 个，712 个 migrations 测试全部通过。
+
+任务完成。
+
+```bash-action
+exit
+```

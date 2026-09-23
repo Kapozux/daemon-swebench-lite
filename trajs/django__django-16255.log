@@ -1,0 +1,302 @@
+plan-unwanted
+I'll start by examining the relevant source file.
+
+```bash-action
+cd /testbed && sed -n '140,190p' django/contrib/sitemaps/__init__.py
+```
+executing输出         # with 'https'.
+        return self.protocol or protocol or "http"
+
+    def get_domain(self, site=None):
+        # Determine domain
+        if site is None:
+            if django_apps.is_installed("django.contrib.sites"):
+                Site = django_apps.get_model("sites.Site")
+                try:
+                    site = Site.objects.get_current()
+                except Site.DoesNotExist:
+                    pass
+            if site is None:
+                raise ImproperlyConfigured(
+                    "To use sitemaps, either enable the sites framework or pass "
+                    "a Site/RequestSite object in your view."
+                )
+        return site.domain
+
+    def get_urls(self, page=1, site=None, protocol=None):
+        protocol = self.get_protocol(protocol)
+        domain = self.get_domain(site)
+        return self._urls(page, protocol, domain)
+
+    def get_latest_lastmod(self):
+        if not hasattr(self, "lastmod"):
+            return None
+        if callable(self.lastmod):
+            try:
+                return max([self.lastmod(item) for item in self.items()])
+            except TypeError:
+                return None
+        else:
+            return self.lastmod
+
+    def _urls(self, page, protocol, domain):
+        urls = []
+        latest_lastmod = None
+        all_items_lastmod = True  # track if all items have a lastmod
+
+        paginator_page = self.paginator.page(page)
+        for item in paginator_page.object_list:
+            loc = f"{protocol}://{domain}{self._location(item)}"
+            priority = self._get("priority", item)
+            lastmod = self._get("lastmod", item)
+
+            if all_items_lastmod:
+                all_items_lastmod = lastmod is not None
+                if all_items_lastmod and (
+                    latest_lastmod is None or lastmod > latest_lastmod
+
+
+I found the source. The bug is that `max([])` raises `ValueError`, but only `TypeError` is caught. Let me first write a minimal reproduction script to confirm.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(DEBUG=True)
+django.setup()
+
+from django.contrib.sitemaps import Sitemap
+
+class EmptySitemap(Sitemap):
+    def items(self):
+        return []
+    def lastmod(self, item):
+        return None
+
+s = EmptySitemap()
+print("latest lastmod:", s.get_latest_lastmod())
+EOF
+python /tmp/repro.py
+```2026_09_21_10_02_1789984979
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+Need to run from the testbed with the right path.
+
+```bash-action
+cd /testbed && python -c "import sys; sys.path.insert(0, '/testbed'); import django; print(django.__file__)"
+```2026_09_21_10_02_1789984980
+executing输出 /testbed/django/__init__.py
+
+
+Good, the module is there. The issue was the `/tmp` script's working dir. Let me put the repro inside testbed.
+
+```bash-action
+cd /testbed && cat > repro_tmp.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(DEBUG=True)
+django.setup()
+
+from django.contrib.sitemaps import Sitemap
+
+class EmptySitemap(Sitemap):
+    def items(self):
+        return []
+    def lastmod(self, item):
+        return None
+
+s = EmptySitemap()
+print("latest lastmod:", s.get_latest_lastmod())
+EOF
+python repro_tmp.py
+```2026_09_21_10_03_17899849812026_09_21_10_03_1789984981
+executing输出 Traceback (most recent call last):
+  File "/testbed/repro_tmp.py", line 2, in <module>
+    from django.conf import settings
+  File "/testbed/django/conf/__init__.py", line 19, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+The environment may use a specific python. Let me check available pythons.
+
+```bash-action
+cd /testbed && which -a python python3 && ls /usr/bin/python* 2>/dev/null; python -c "import sys; print(sys.executable)"
+```2026_09_21_10_03_17899849832026_09_21_10_03_1789984983
+executing输出 /opt/miniconda3/bin/python
+/usr/bin/python
+/bin/python
+/opt/miniconda3/bin/python3
+/usr/bin/python3
+/bin/python3
+/usr/bin/python
+/usr/bin/python3
+/usr/bin/python3-config
+/usr/bin/python3.10
+/usr/bin/python3.10-config
+/opt/miniconda3/bin/python
+
+
+The `python` on PATH is miniconda's but lacks deps. Let me check if there's a test env elsewhere.
+
+```bash-action
+cd /testbed && pip list 2>/dev/null | grep -i -E "asgiref|django" ; echo "---"; ls /opt/miniconda3/envs 2>/dev/null; find / -name "asgiref" -maxdepth 6 -type d 2>/dev/null | head
+```2026_09_21_10_03_17899849842026_09_21_10_03_1789984984
+executing输出 ---
+testbed
+
+
+There's a `testbed` conda env. Let me use it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python repro_tmp.py
+```
+executing输出 Traceback (most recent call last):
+  File "/testbed/repro_tmp.py", line 15, in <module>
+    print("latest lastmod:", s.get_latest_lastmod())
+  File "/testbed/django/contrib/sitemaps/__init__.py", line 170, in get_latest_lastmod
+    return max([self.lastmod(item) for item in self.items()])
+ValueError: max() arg is an empty sequence
+
+
+Bug confirmed: `ValueError` on empty items. Now let me fix the source, and also check for the same pattern elsewhere in the file/repo.
+
+```bash-action
+cd /testbed && grep -rn "except TypeError" django/contrib/sitemaps/ && grep -rn "max(\[self.lastmod" django/
+```2026_09_21_10_03_1789984987
+executing输出 django/contrib/sitemaps/__init__.py:171:            except TypeError:
+django/contrib/sitemaps/__init__.py:170:                return max([self.lastmod(item) for item in self.items()])
+
+
+Only one place. Now apply the fix.
+
+```bash-action
+cd /testbed && python - << 'EOF'
+p = "django/contrib/sitemaps/__init__.py"
+s = open(p).read()
+old = """            try:
+                return max([self.lastmod(item) for item in self.items()])
+            except TypeError:
+                return None"""
+new = """            try:
+                return max([self.lastmod(item) for item in self.items()])
+            except (TypeError, ValueError):
+                return None"""
+assert old in s
+open(p, "w").write(s.replace(old, new))
+print("patched")
+EOF
+```2026_09_21_10_03_17899849882026_09_21_10_03_1789984988
+executing输出 patched
+
+
+Now re-run the repro to confirm the fix.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python repro_tmp.py
+```2026_09_21_10_03_17899849892026_09_21_10_03_1789984989
+executing输出 latest lastmod: None
+
+
+Fixed. Now run the existing sitemaps test suite.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py sitemaps --verbosity=1 2>&1 | tail -20
+```2026_09_21_10_03_17899849902026_09_21_10_03_17899849902026_09_21_10_03_1789984990
+executing输出 E
+======================================================================
+ERROR: sitemaps (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: sitemaps
+Traceback (most recent call last):
+  File "/opt/miniconda3/envs/testbed/lib/python3.9/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+ModuleNotFoundError: No module named 'sitemaps'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+Testing against Django installed in '/testbed/django' with up to 16 processes
+Found 1 test(s).
+System check identified no issues (0 silenced).
+
+
+Let me find the correct test module path.
+
+```bash-action
+cd /testbed && find tests -type d -iname "*sitemap*" && ls tests/ | grep -i sitemap
+```2026_09_21_10_03_17899849912026_09_21_10_03_17899849912026_09_21_10_03_1789984991
+executing输出 tests/sitemaps_tests
+sitemaps_tests
+
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py sitemaps_tests --verbosity=1 2>&1 | tail -20
+```2026_09_21_10_03_17899849922026_09_21_10_03_17899849932026_09_21_10_03_1789984993
+executing输出 Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+System check identified no issues (0 silenced).
+............................................................
+----------------------------------------------------------------------
+Ran 60 tests in 0.115s
+
+OK
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+All 60 tests pass. Now clean up the repro file and confirm the diff.
+
+```bash-action
+cd /testbed && rm -f repro_tmp.py && git status --short && echo "---DIFF---" && git diff
+```2026_09_21_10_03_17899849942026_09_21_10_03_17899849942026_09_21_10_03_1789984995
+executing输出  M django/contrib/sitemaps/__init__.py
+?? My_agent.py
+?? actions.py
+?? chat_export.py
+?? chat_history/
+?? llm.py
+?? system_prompt.txt
+---DIFF---
+diff --git a/django/contrib/sitemaps/__init__.py b/django/contrib/sitemaps/__init__.py
+index 27756d9d96..b40ad806ed 100755
+--- a/django/contrib/sitemaps/__init__.py
++++ b/django/contrib/sitemaps/__init__.py
+@@ -168,7 +168,7 @@ class Sitemap:
+         if callable(self.lastmod):
+             try:
+                 return max([self.lastmod(item) for item in self.items()])
+-            except TypeError:
++            except (TypeError, ValueError):
+                 return None
+         else:
+             return self.lastmod
+
+
+The diff is exactly the intended minimal change. The untracked files are pre-existing agent files, not mine. Task complete.
+
+Summary:
+- **Root cause**: In `Sitemap.get_latest_lastmod()` (`django/contrib/sitemaps/__init__.py:170`), `max([])` raises `ValueError` when a sitemap has no items and a callable `lastmod`. Only `TypeError` was caught, so the `ValueError` propagated and produced a 500 error on `/sitemap.xml`.
+- **Fix**: Catch `(TypeError, ValueError)` and return `None`, matching the issue's suggested solution.
+- **Verification**: Minimal repro confirmed the bug before and `None` after; the existing `sitemaps_tests` suite (60 tests) passes.
+
+```bash-action
+exit
+```

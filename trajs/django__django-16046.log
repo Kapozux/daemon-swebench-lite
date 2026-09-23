@@ -1,0 +1,293 @@
+plan-unwanted
+我先定位 `numberformat.py` 中出错的源码。
+
+```bash-action
+cd /testbed && cat django/utils/numberformat.py
+```
+executing输出 from decimal import Decimal
+
+from django.conf import settings
+from django.utils.safestring import mark_safe
+
+
+def format(
+    number,
+    decimal_sep,
+    decimal_pos=None,
+    grouping=0,
+    thousand_sep="",
+    force_grouping=False,
+    use_l10n=None,
+):
+    """
+    Get a number (as a number or string), and return it as a string,
+    using formats defined as arguments:
+
+    * decimal_sep: Decimal separator symbol (for example ".")
+    * decimal_pos: Number of decimal positions
+    * grouping: Number of digits in every group limited by thousand separator.
+        For non-uniform digit grouping, it can be a sequence with the number
+        of digit group sizes following the format used by the Python locale
+        module in locale.localeconv() LC_NUMERIC grouping (e.g. (3, 2, 0)).
+    * thousand_sep: Thousand separator symbol (for example ",")
+    """
+    use_grouping = (
+        use_l10n or (use_l10n is None and settings.USE_L10N)
+    ) and settings.USE_THOUSAND_SEPARATOR
+    use_grouping = use_grouping or force_grouping
+    use_grouping = use_grouping and grouping != 0
+    # Make the common case fast
+    if isinstance(number, int) and not use_grouping and not decimal_pos:
+        return mark_safe(number)
+    # sign
+    sign = ""
+    # Treat potentially very large/small floats as Decimals.
+    if isinstance(number, float) and "e" in str(number).lower():
+        number = Decimal(str(number))
+    if isinstance(number, Decimal):
+
+        if decimal_pos is not None:
+            # If the provided number is too small to affect any of the visible
+            # decimal places, consider it equal to '0'.
+            cutoff = Decimal("0." + "1".rjust(decimal_pos, "0"))
+            if abs(number) < cutoff:
+                number = Decimal("0")
+
+        # Format values with more than 200 digits (an arbitrary cutoff) using
+        # scientific notation to avoid high memory usage in {:f}'.format().
+        _, digits, exponent = number.as_tuple()
+        if abs(exponent) + len(digits) > 200:
+            number = "{:e}".format(number)
+            coefficient, exponent = number.split("e")
+            # Format the coefficient.
+            coefficient = format(
+                coefficient,
+                decimal_sep,
+                decimal_pos,
+                grouping,
+                thousand_sep,
+                force_grouping,
+                use_l10n,
+            )
+            return "{}e{}".format(coefficient, exponent)
+        else:
+            str_number = "{:f}".format(number)
+    else:
+        str_number = str(number)
+    if str_number[0] == "-":
+        sign = "-"
+        str_number = str_number[1:]
+    # decimal part
+    if "." in str_number:
+        int_part, dec_part = str_number.split(".")
+        if decimal_pos is not None:
+            dec_part = dec_part[:decimal_pos]
+    else:
+        int_part, dec_part = str_number, ""
+    if decimal_pos is not None:
+        dec_part = dec_part + ("0" * (decimal_pos - len(dec_part)))
+    dec_part = dec_part and decimal_sep + dec_part
+    # grouping
+    if use_grouping:
+        try:
+            # if grouping is a sequence
+            intervals = list(grouping)
+        except TypeError:
+            # grouping is a single value
+            intervals = [grouping, 0]
+        active_interval = intervals.pop(0)
+        int_part_gd = ""
+        cnt = 0
+        for digit in int_part[::-1]:
+            if cnt and cnt == active_interval:
+                if intervals:
+                    active_interval = intervals.pop(0) or active_interval
+                int_part_gd += thousand_sep[::-1]
+                cnt = 0
+            int_part_gd += digit
+            cnt += 1
+        int_part = int_part_gd[::-1]
+    return sign + int_part + dec_part
+
+
+问题很清楚：当 `number` 是空字符串 `""` 时，`str_number = str(number)` 得到 `""`，然后 `str_number[0]` 触发 `IndexError`。
+
+我注意到下一步的逻辑是分组。如果 `int_part` 为空也仍会走分组逻辑。我需要先看下传入处理的边界情况。修复方式：在 `str_number[0]` 之前判断空字符串，空串直接返回空串（或 `mark_safe("")`）。
+
+```bash-action
+cd /testbed && git log --oneline -3
+```2026_09_21_10_02_1789984945
+executing输出 6f788b3d13 SWE-bench
+ec13e801b8 Refs #31335 -- Added SchemaEditor._create_missing_fk_index() on MySQL.
+f3cd252cfc Fixed #33995 -- Fixed FormSet.empty_form crash when empty_permitted is passed to form_kwargs.
+
+
+我先写一个最小复现脚本确认 bug 存在，然后修复。
+
+```bash-action
+cd /testbed && python -c "from django.utils.numberformat import format; print(repr(format('', '.', None, 0, '', False, False)))"
+```2026_09_21_10_02_1789984946
+executing输出 Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/testbed/django/utils/numberformat.py", line 3, in <module>
+    from django.conf import settings
+  File "/testbed/django/conf/__init__.py", line 19, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+环境缺少 asgiref。检查是否有其他 python 环境或需要设置。
+
+```bash-action
+cd /testbed && pip install asgiref 2>&1 | tail -3
+```
+executing输出 Installing collected packages: asgiref
+Successfully installed asgiref-3.12.1
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /testbed && python -c "from django.utils.numberformat import format; print(repr(format('', '.', None, 0, '', False, False)))"
+```
+executing输出 Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/testbed/django/utils/numberformat.py", line 71, in format
+    if str_number[0] == "-":
+       ~~~~~~~~~~^^^
+IndexError: string index out of range
+
+
+Bug 已复现。现在修复：处理 `str_number` 为空字符串的情况。
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = "django/utils/numberformat.py"
+s = open(p).read()
+old = '''    else:
+        str_number = str(number)
+    if str_number[0] == "-":'''
+new = '''    else:
+        str_number = str(number)
+    if str_number == "":
+        return mark_safe("")
+    if str_number[0] == "-":'''
+assert old in s
+s = s.replace(old, new)
+open(p, "w").write(s)
+print("done")
+EOF
+```2026_09_21_10_02_1789984951
+executing输出 done
+
+
+现在重跑复现脚本确认修好。注意 issue 场景是 admin list_display 中 null 值，通常 `number` 为 `None` 也可能出现。我先确认空字符串情况，再看 None。
+
+```bash-action
+cd /testbed && python -c "from django.utils.numberformat import format; print(repr(format('', '.', None, 0, '', False, False))); print(repr(format(None, '.', None, 0, '', False, False)))"
+```2026_09_21_10_02_1789984952
+executing输出 ''
+'None'
+
+
+空字符串已修复返回 `''`。`None` 变成字符串 `'None'`，这是既有行为（`str(None)`），不属于本 issue 的 crash 范畴，issue 明确是空串导致 `str_number[0]` 崩溃。
+
+现在跑覆盖该模块的已有测试。
+
+```bash-action
+cd /testbed && python -m pytest tests/utils_tests/test_numberformat.py -q 2>&1 | tail -20
+```2026_09_21_10_02_1789984954
+executing输出 /opt/miniconda3/bin/python: No module named pytest
+
+
+```bash-action
+cd /testbed && python tests/runtests.py utils_tests.test_numberformat -v 1 2>&1 | tail -20
+```
+executing输出 Traceback (most recent call last):
+  File "/testbed/tests/runtests.py", line 17, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/testbed/tests/runtests.py", line 19, in <module>
+    raise RuntimeError(
+RuntimeError: Django module not found, reference tests/README.rst for instructions.
+
+
+需要设置 PYTHONPATH。
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python tests/runtests.py utils_tests.test_numberformat -v 1 2>&1 | tail -20
+```2026_09_21_10_02_1789984956
+executing输出   File "/testbed/django/utils/connection.py", line 15, in __getattr__
+    return getattr(self._connections[self._alias], item)
+                   ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/testbed/django/utils/connection.py", line 62, in __getitem__
+    conn = self.create_connection(alias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/utils.py", line 193, in create_connection
+    backend = load_backend(db["ENGINE"])
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/utils.py", line 113, in load_backend
+    return import_module("%s.base" % backend_name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/miniconda3/lib/python3.11/importlib/__init__.py", line 126, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/backends/sqlite3/base.py", line 21, in <module>
+    from .introspection import DatabaseIntrospection
+  File "/testbed/django/db/backends/sqlite3/introspection.py", line 3, in <module>
+    import sqlparse
+ModuleNotFoundError: No module named 'sqlparse'
+
+
+缺少测试依赖，安装它们。
+
+```bash-action
+cd /testbed && pip install sqlparse pytz 2>&1 | tail -2
+```2026_09_21_10_02_17899849582026_09_21_10_02_1789984958
+executing输出 Successfully installed pytz-2026.3.post1 sqlparse-0.6.0
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python tests/runtests.py utils_tests.test_numberformat -v 1 2>&1 | tail -20
+```2026_09_21_10_02_1789984962
+executing输出 Testing against Django installed in '/testbed/django' with up to 16 processes
+Found 6 test(s).
+System check identified no issues (0 silenced).
+......
+----------------------------------------------------------------------
+Ran 6 tests in 0.010s
+
+OK
+
+
+测试全部通过。现在用 git diff 确认改动。
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_10_02_17899849632026_09_21_10_02_1789984963
+executing输出 diff --git a/django/utils/numberformat.py b/django/utils/numberformat.py
+index 488d6a77cd..7c1b005f9b 100755
+--- a/django/utils/numberformat.py
++++ b/django/utils/numberformat.py
+@@ -68,6 +68,8 @@ def format(
+             str_number = "{:f}".format(number)
+     else:
+         str_number = str(number)
++    if str_number == "":
++        return mark_safe("")
+     if str_number[0] == "-":
+         sign = "-"
+         str_number = str_number[1:]
+
+
+改动符合预期：在访问 `str_number[0]` 前增加空字符串判断，直接返回空安全字符串，修复了 `IndexError: string index out of range`。测试通过。
+
+```bash-action
+exit
+```
