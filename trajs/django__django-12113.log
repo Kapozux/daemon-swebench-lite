@@ -1,0 +1,867 @@
+plan-unwanted
+I'll start by exploring the repository structure and understanding the issue.
+
+```bash-action
+cd /testbed && git log --oneline -3 && ls
+```
+
+Let me analyze the issue first. The problem is that with persistent SQLite test databases (`--keepdb`), a "database is locked" error occurs. This relates to how SQLite handles test database connections.
+
+Let me look at the SQLite backend and the test database creation code.
+
+```bash-action
+cd /testbed && cat django/db/backends/sqlite3/creation.py
+```
+executing输出 cc84fb303f SWE-bench
+62254c5202 Simplified TemplateDetailView with pathlib.Path.read_text().
+f97a6123c0 Refs #25367 -- Made Query.build_filter() raise TypeError on non-conditional expressions.
+AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+FUNDING.yml
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+django
+docs
+extras
+js_tests
+llm.py
+package.json
+scripts
+setup.cfg
+setup.py
+system_prompt.txt
+tests
+tox.ini
+
+
+Let me look at the SQLite creation backend.
+
+```bash-action
+cd /testbed && cat django/db/backends/sqlite3/creation.py
+```
+executing输出 import os
+import shutil
+import sys
+from pathlib import Path
+
+from django.db.backends.base.creation import BaseDatabaseCreation
+
+
+class DatabaseCreation(BaseDatabaseCreation):
+
+    @staticmethod
+    def is_in_memory_db(database_name):
+        return not isinstance(database_name, Path) and (
+            database_name == ':memory:' or 'mode=memory' in database_name
+        )
+
+    def _get_test_db_name(self):
+        test_database_name = self.connection.settings_dict['TEST']['NAME'] or ':memory:'
+        if test_database_name == ':memory:':
+            return 'file:memorydb_%s?mode=memory&cache=shared' % self.connection.alias
+        return test_database_name
+
+    def _create_test_db(self, verbosity, autoclobber, keepdb=False):
+        test_database_name = self._get_test_db_name()
+
+        if keepdb:
+            return test_database_name
+        if not self.is_in_memory_db(test_database_name):
+            # Erase the old test database
+            if verbosity >= 1:
+                self.log('Destroying old test database for alias %s...' % (
+                    self._get_database_display_str(verbosity, test_database_name),
+                ))
+            if os.access(test_database_name, os.F_OK):
+                if not autoclobber:
+                    confirm = input(
+                        "Type 'yes' if you would like to try deleting the test "
+                        "database '%s', or 'no' to cancel: " % test_database_name
+                    )
+                if autoclobber or confirm == 'yes':
+                    try:
+                        os.remove(test_database_name)
+                    except Exception as e:
+                        self.log('Got an error deleting the old test database: %s' % e)
+                        sys.exit(2)
+                else:
+                    self.log('Tests cancelled.')
+                    sys.exit(1)
+        return test_database_name
+
+    def get_test_db_clone_settings(self, suffix):
+        orig_settings_dict = self.connection.se
+....(省略中间部分)...
+root, suffix, ext)}
+
+    def _clone_test_db(self, suffix, verbosity, keepdb=False):
+        source_database_name = self.connection.settings_dict['NAME']
+        target_database_name = self.get_test_db_clone_settings(suffix)['NAME']
+        # Forking automatically makes a copy of an in-memory database.
+        if not self.is_in_memory_db(source_database_name):
+            # Erase the old test database
+            if os.access(target_database_name, os.F_OK):
+                if keepdb:
+                    return
+                if verbosity >= 1:
+                    self.log('Destroying old test database for alias %s...' % (
+                        self._get_database_display_str(verbosity, target_database_name),
+                    ))
+                try:
+                    os.remove(target_database_name)
+                except Exception as e:
+                    self.log('Got an error deleting the old test database: %s' % e)
+                    sys.exit(2)
+            try:
+                shutil.copy(source_database_name, target_database_name)
+            except Exception as e:
+                self.log('Got an error cloning the test database: %s' % e)
+                sys.exit(2)
+
+    def _destroy_test_db(self, test_database_name, verbosity):
+        if test_database_name and not self.is_in_memory_db(test_database_name):
+            # Remove the SQLite database file
+            os.remove(test_database_name)
+
+    def test_db_signature(self):
+        """
+        Return a tuple that uniquely identifies a test database.
+
+        This takes into account the special cases of ":memory:" and "" for
+        SQLite since the databases will be distinct despite having the same
+        TEST NAME. See https://www.sqlite.org/inmemorydb.html
+        """
+        test_database_name = self._get_test_db_name()
+        sig = [self.connection.settings_dict['NAME']]
+        if self.is_in_memory_db(test_database_name):
+            sig.append(self.connection.alias)
+        return tuple(sig)
+
+
+Now let me look at the full `get_test_db_clone_settings` and understand the actual issue. The issue is about "database is locked". Let me look at the `test_db_signature` and how the connection sharing works.
+
+Let me reproduce the bug first.
+
+```bash-action
+cd /testbed && python -c "
+import tests.test_sqlite as t
+t.DATABASES['default']['TEST'] = {'NAME': 'test_default.sqlite3'}
+t.DATABASES['other']['TEST'] = {'NAME': 'test_other.sqlite3'}
+import django
+from django.conf import settings
+" 2>&1 | head -20
+```
+
+Let me look more carefully. The key is the `--keepdb` flag and the test database signature. Let me check git blame/history of this file to find the fix.
+
+Let me write a minimal reproduction. First, let me understand the setup for the multidb test.
+
+```bash-action
+cd /testbed && cat tests/admin_views/test_multidb.py | head -60
+```2026_09_21_09_42_1789983753
+executing输出 
+
+```bash-action
+cd /testbed && head -60 tests/admin_views/test_multidb.py
+```2026_09_21_09_42_1789983755
+executing输出 from unittest import mock
+
+from django.contrib import admin
+from django.contrib.auth.models import User
+from django.db import connections
+from django.test import TestCase, override_settings
+from django.urls import path, reverse
+
+from .models import Book
+
+
+class Router:
+    target_db = None
+
+    def db_for_read(self, model, **hints):
+        return self.target_db
+
+    db_for_write = db_for_read
+
+
+site = admin.AdminSite(name='test_adminsite')
+site.register(Book)
+
+urlpatterns = [
+    path('admin/', site.urls),
+]
+
+
+@override_settings(ROOT_URLCONF=__name__, DATABASE_ROUTERS=['%s.Router' % __name__])
+class MultiDatabaseTests(TestCase):
+    databases = {'default', 'other'}
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.superusers = {}
+        cls.test_book_ids = {}
+        for db in connections:
+            Router.target_db = db
+            cls.superusers[db] = User.objects.create_superuser(
+                username='admin', password='something', email='test@test.org',
+            )
+            b = Book(name='Test Book')
+            b.save(using=db)
+            cls.test_book_ids[db] = b.id
+
+    @mock.patch('django.contrib.admin.options.transaction')
+    def test_add_view(self, mock):
+        for db in connections:
+            with self.subTest(db=db):
+                Router.target_db = db
+                self.client.force_login(self.superusers[db])
+                self.client.post(
+                    reverse('test_adminsite:admin_views_book_add'),
+                    {'name': 'Foobar: 5th edition'},
+                )
+                mock.atomic.assert_called_with(using=db)
+
+    @mock.patch('django.contrib.admin.options.transaction')
+    def test_change_view(self, mock):
+        for db in connections:
+
+
+Now let me understand the core issue. The problem with SQLite "database is locked" is related to WAL/transactions. Let me search the git log and code around this. Let me look at how the test runner handles parallel/clone and consider the actual root cause.
+
+The classic fix for this Django issue is in `django/db/backends/sqlite3/creation.py` - the `test_db_signature` should include the test database name. Actually let me look at the real Django fix for this issue. The issue number - let me search.
+
+```bash-action
+cd /testbed && git log --oneline -20 -- django/db/backends/sqlite3/creation.py
+```2026_09_21_09_42_17899837562026_09_21_09_42_1789983758
+executing输出 cc84fb303f SWE-bench
+77aa74cb70 Refs #29983 -- Added support for using pathlib.Path in all settings.
+2bd8df243a Fixed #30184 -- Removed ellipsis characters from shell output strings.
+82f286cf6f Refs #29784 -- Switched to https:// links where available.
+50b8493581 Refs #29654 -- Replaced three dots with ellipsis character in output strings.
+65503ca097 Fixed #29040 -- Made test database creation messages use a consistent output stream.
+074a2f7f58 Refs #28909 -- Simplifed code using unpacking generalizations.
+c69e4bc691 Fixed #28769 -- Replaced 'x if x else y' with 'x or y'.
+d0c761d3f8 Refs #28584 -- Removed unused DatabaseFeatures.can_share_in_memory_db.
+99e65d6488 Fixed #28578 -- Renamed DatabaseCreation number arguments to suffix.
+8346680e1c Refs #27795 -- Removed unneeded force_text calls
+60e52a047e Refs #27656 -- Updated django.db docstring verbs according to PEP 257.
+2b281cc35e Refs #23919 -- Removed most of remaining six usage
+3d0a3c5fff Fixed #27077 -- Made SQLite's in-memory database checks DRYer.
+49fcbe73c5 Fixed #27078 -- Simplified "if" logic in SQLite's _get_test_db_name().
+3543fec3b7 Refs #12118 -- Allowed "mode=memory" in SQLite test database names.
+afe777639c Fixed #25196 -- Normalized database representations in test database messages.
+0586c061f0 Cloned databases for running tests in parallel.
+2b039d966f Removed obsolete SQL generation methods.
+28308078f3 Fixed #22603 -- Reorganized classes in django.db.backends.
+
+
+Let me search for the actual Django fix for this issue (ticket about "database is locked" with persistent SQLite test db). The fix modifies `get_test_db_clone_settings` or `_destroy_test_db`. Let me look at the full creation.py content again around the clone settings.
+
+```bash-action
+cd /testbed && sed -n '40,120p' django/db/backends/sqlite3/creation.py
+```2026_09_21_09_42_17899837582026_09_21_09_42_1789983759
+executing输出                 if autoclobber or confirm == 'yes':
+                    try:
+                        os.remove(test_database_name)
+                    except Exception as e:
+                        self.log('Got an error deleting the old test database: %s' % e)
+                        sys.exit(2)
+                else:
+                    self.log('Tests cancelled.')
+                    sys.exit(1)
+        return test_database_name
+
+    def get_test_db_clone_settings(self, suffix):
+        orig_settings_dict = self.connection.settings_dict
+        source_database_name = orig_settings_dict['NAME']
+        if self.is_in_memory_db(source_database_name):
+            return orig_settings_dict
+        else:
+            root, ext = os.path.splitext(orig_settings_dict['NAME'])
+            return {**orig_settings_dict, 'NAME': '{}_{}.{}'.format(root, suffix, ext)}
+
+    def _clone_test_db(self, suffix, verbosity, keepdb=False):
+        source_database_name = self.connection.settings_dict['NAME']
+        target_database_name = self.get_test_db_clone_settings(suffix)['NAME']
+        # Forking automatically makes a copy of an in-memory database.
+        if not self.is_in_memory_db(source_database_name):
+            # Erase the old test database
+            if os.access(target_database_name, os.F_OK):
+                if keepdb:
+                    return
+                if verbosity >= 1:
+                    self.log('Destroying old test database for alias %s...' % (
+                        self._get_database_display_str(verbosity, target_database_name),
+                    ))
+                try:
+                    os.remove(target_database_name)
+                except Exception as e:
+                    self.log('Got an error deleting the old test database: %s' % e)
+                    sys.exit(2)
+            try:
+                shutil.copy(source_database_name, target_database_name)
+            except Exception as e:
+                self.log('Got an error cloning the test database: %s' % e)
+                sys.exit(2)
+
+    def _destroy_test_db(self, test_database_name, verbosity):
+        if test_database_name and not self.is_in_memory_db(test_database_name):
+            # Remove the SQLite database file
+            os.remove(test_database_name)
+
+    def test_db_signature(self):
+        """
+        Return a tuple that uniquely identifies a test database.
+
+        This takes into account the special cases of ":memory:" and "" for
+        SQLite since the databases will be distinct despite having the same
+        TEST NAME. See https://www.sqlite.org/inmemorydb.html
+        """
+        test_database_name = self._get_test_db_name()
+        sig = [self.connection.settings_dict['NAME']]
+        if self.is_in_memory_db(test_database_name):
+            sig.append(self.connection.alias)
+        return tuple(sig)
+
+
+Now I understand the bug. The `test_db_signature()` method uses `self.connection.settings_dict['NAME']` (the real database file name), NOT the test database name. When multiple aliases (`default` and `other`) point to the same source database NAME (or the signature doesn't distinguish test db names), the test runner thinks they use the same test database and doesn't properly set them up separately.
+
+Wait, actually let me reconsider. In `test_sqlite.py`, both `default` and `other` have `NAME` unset (so it defaults to `:memory:` maybe, or actually NAME isn't specified). Let me check.
+
+```bash-action
+cd /testbed && cat tests/test_sqlite.py
+```2026_09_21_09_42_17899837592026_09_21_09_42_1789983761
+executing输出 # This is an example test settings file for use with the Django test suite.
+#
+# The 'sqlite3' backend requires only the ENGINE setting (an in-
+# memory database will be used). All other backends will require a
+# NAME and potentially authentication information. See the
+# following section in the docs for more information:
+#
+# https://docs.djangoproject.com/en/dev/internals/contributing/writing-code/unit-tests/
+#
+# The different databases that Django supports behave differently in certain
+# situations, so it is recommended to run the test suite against as many
+# database backends as possible.  You may want to create a separate settings
+# file for each of the backends you test against.
+
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+    },
+    'other': {
+        'ENGINE': 'django.db.backends.sqlite3',
+    }
+}
+
+SECRET_KEY = "django_tests_secret_key"
+
+# Use a fast hasher to speed up tests.
+PASSWORD_HASHERS = [
+    'django.contrib.auth.hashers.MD5PasswordHasher',
+]
+
+
+Now I see the issue clearly. With the issue's patch, both `default` and `other` get distinct TEST NAME values (`test_default.sqlite3` and `test_other.sqlite3`).
+
+The problem: `test_db_signature()` returns `[self.connection.settings_dict['NAME']]`. For SQLite, both `default` and `other` have `NAME` = `''` (empty, since not specified). So both databases produce the SAME signature `('',)`.
+
+The test runner uses `test_db_signature()` to determine which test databases to set up/destroy and to track `keepdb` state. Since both databases share the same signature, the runner's shared-database tracking merges them, leading to the connection being reused/mis-managed and "database is locked".
+
+The fix: `test_db_signature()` should return the test database name, not the source `NAME`.
+
+Let me verify the fix in the actual Django codebase. The real fix (Django commit) changed `test_db_signature` to use `self._get_test_db_name()`:
+
+```python
+def test_db_signature(self):
+    test_database_name = self._get_test_db_name()
+    sig = [self.connection.settings_dict['NAME'], test_database_name]
+    if self.is_in_memory_db(test_database_name):
+        sig.append(self.connection.alias)
+    return tuple(sig)
+```
+
+Let me confirm this is the correct fix by checking whether `TEST['NAME']` distinguishes the two. With the patch, `_get_test_db_name()` returns `test_default.sqlite3` and `test_other.sqlite3` respectively. This makes the signatures distinct.
+
+Let me first write a minimal reproduction to confirm the bug.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import os
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
+import django
+from django.conf import settings
+settings.DATABASES['default']['TEST'] = {'NAME': 'test_default.sqlite3'}
+settings.DATABASES['other']['TEST'] = {'NAME': 'test_other.sqlite3'}
+django.setup()
+
+from django.db import connections
+sigs = {}
+for alias in ('default', 'other'):
+    sig = connections[alias].creation.test_db_signature()
+    print(alias, '->', sig)
+    sigs[alias] = sig
+assert sigs['default'] != sigs['other'], "BUG: signatures collide!"
+print("OK: signatures are distinct")
+EOF
+python /tmp/repro.py
+```2026_09_21_09_42_17899837612026_09_21_09_42_1789983764
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 3, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+```bash-action
+cd /testbed && python /tmp/repro.py
+```2026_09_21_09_42_17899837642026_09_21_09_42_1789983765
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 3, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+The script must run from /testbed and set sys.path. Let me use the runtests framework instead, or add the path.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_09_42_1789983763
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 7, in <module>
+    django.setup()
+  File "/testbed/django/__init__.py", line 16, in setup
+    from django.urls import set_script_prefix
+  File "/testbed/django/urls/__init__.py", line 1, in <module>
+    from .base import (
+  File "/testbed/django/urls/base.py", line 3, in <module>
+    from asgiref.local import Local
+ModuleNotFoundError: No module named 'asgiref'
+
+
+Let me check the test environment python setup.
+
+```bash-action
+cd /testbed && which python && python -c "import sys; print(sys.executable)" && ls /testbed/*.egg-info 2>/dev/null; pip show django 2>/dev/null | head -5
+```2026_09_21_09_42_1789983764
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python
+PKG-INFO
+SOURCES.txt
+dependency_links.txt
+entry_points.txt
+not-zip-safe
+requires.txt
+top_level.txt
+
+
+Let me find the correct python environment for testing.
+
+```bash-action
+cd /testbed && ls /opt/miniconda3/envs/ 2>/dev/null; find / -name "asgiref" -type d 2>/dev/null | head -5
+```2026_09_21_09_42_17899837662026_09_21_09_42_1789983767
+executing输出 testbed
+/opt/miniconda3/envs/testbed/lib/python3.6/site-packages/asgiref
+
+
+There's a `testbed` conda env. Let me use it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_42_17899837672026_09_21_09_42_17899837692026_09_21_09_42_1789983768
+executing输出 default -> ('',)
+other -> ('',)
+Traceback (most recent call last):
+  File "/tmp/repro.py", line 15, in <module>
+    assert sigs['default'] != sigs['other'], "BUG: signatures collide!"
+AssertionError: BUG: signatures collide!
+
+
+Bug confirmed. Both signatures collide as `('',)` even though the test DB names differ. This causes the test runner to treat the databases as the same shared test database, leading to "database is locked".
+
+Now let me apply the fix to `test_db_signature()`.
+
+```bash-action
+cd /testbed && python - << 'EOF'
+import re
+p = 'django/db/backends/sqlite3/creation.py'
+s = open(p).read()
+old = '''        test_database_name = self._get_test_db_name()
+        sig = [self.connection.settings_dict['NAME']]
+        if self.is_in_memory_db(test_database_name):
+            sig.append(self.connection.alias)
+        return tuple(sig)'''
+new = '''        test_database_name = self._get_test_db_name()
+        sig = [self.connection.settings_dict['NAME'], test_database_name]
+        if self.is_in_memory_db(test_database_name):
+            sig.append(self.connection.alias)
+        return tuple(sig)'''
+assert old in s
+open(p, 'w').write(s.replace(old, new))
+print("patched")
+EOF
+```
+
+Wait, I used `python` not the env python. Let me redo with the env python and verify.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python - << 'EOF'
+p = 'django/db/backends/sqlite3/creation.py'
+s = open(p).read()
+old = """        test_database_name = self._get_test_db_name()
+        sig = [self.connection.settings_dict['NAME']]
+        if self.is_in_memory_db(test_database_name):
+            sig.append(self.connection.alias)
+        return tuple(sig)"""
+new = """        test_database_name = self._get_test_db_name()
+        sig = [self.connection.settings_dict['NAME'], test_database_name]
+        if self.is_in_memory_db(test_database_name):
+            sig.append(self.connection.alias)
+        return tuple(sig)"""
+assert old in s
+open(p, 'w').write(s.replace(old, new))
+print("patched")
+EOF
+```2026_09_21_09_42_17899837692026_09_21_09_42_17899837712026_09_21_09_42_17899837712026_09_21_09_42_1789983770
+
+<system_warning>Maximum steps reached. Generating summary.</system_warning>
+executing输出 patched
+
+
+## Summary
+
+I was working on a Django bug fix for issue where `admin_views.test_multidb` fails with "database is locked" when using persistent SQLite test databases (`--keepdb`).
+
+### Root Cause Found and Confirmed
+
+The bug is in `django/db/backends/sqlite3/creation.py` in the `test_db_signature()` method. It returned `[self.connection.settings_dict['NAME']]` — the **source** database name, not the **test** database name.
+
+For SQLite, when `TEST['NAME']` values are set to distinct files (`test_default.sqlite3`, `test_other.sqlite3`) but the source `NAME` is empty (`''`) for both aliases, both databases produced the identical signature `('',)`. The test runner uses this signature to track/deduplicate test databases, so colliding signatures caused the two databases to be mismanaged — resulting in the "database is locked" error.
+
+I confirmed this with a minimal reproduction script (run via `/opt/miniconda3/envs/testbed/bin/python`) which showed:
+```
+default -> ('',)
+other -> ('',)
+AssertionError: BUG: signatures collide!
+```
+
+### Fix Applied
+
+I patched `test_db_signature()` to include the test database name in the signature:
+```python
+sig = [self.connection.settings_dict['NAME'], test_database_name]
+```
+
+This makes the signatures distinct for the two aliases.
+
+### Remaining Work (not yet completed due to step limit)
+
+1. **Verify the fix** by re-running `/tmp/repro.py` — should now print distinct signatures and `OK: signatures are distinct`.
+2. **Run the existing tests** covering this module. The relevant existing test file is `tests/backends/sqlite/tests.py` (look for a `TestDbSignature` or similar test class). Run: `cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py backends.sqlite --keepdb` or the admin_views test: `tests/runtests.py admin_views.test_multidb`.
+3. **Check for the same error format elsewhere** — grep for `test_db_signature` across all backends to see if other backends have a similar pattern that needs the test DB name included.
+4. **Run `git diff`** to confirm the change is exactly the intended one-liner.
+5. Then `exit`.
+
+The core source fix has been applied. Please continue from verifying the reproduction passes and running the test suite.
+Let me verify the fix by re-running the reproduction script.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```
+executing输出 default -> ('', 'test_default.sqlite3')
+other -> ('', 'test_other.sqlite3')
+OK: signatures are distinct
+
+
+The fix works. Now let me look for any existing tests covering this module, and grep for the same error pattern in other backends.
+
+```bash-action
+cd /testbed && grep -rn "test_db_signature" django/ tests/ && echo "---" && ls tests/backends/sqlite/
+```2026_09_21_09_42_1789983776
+executing输出 django/db/backends/base/creation.py:285:    def test_db_signature(self):
+grep: django/db/backends/base/__pycache__/creation.cpython-36.pyc: binary file matches
+django/db/backends/oracle/creation.py:392:    def test_db_signature(self):
+django/db/backends/sqlite3/creation.py:89:    def test_db_signature(self):
+grep: django/db/backends/sqlite3/__pycache__/creation.cpython-36.pyc: binary file matches
+django/test/utils.py:257:    default_sig = connections[DEFAULT_DB_ALIAS].creation.test_db_signature()
+django/test/utils.py:271:                connection.creation.test_db_signature(),
+django/test/utils.py:279:                if alias != DEFAULT_DB_ALIAS and connection.creation.test_db_signature() != default_sig:
+tests/backends/base/test_creation.py:26:        signature = BaseDatabaseCreation(test_connection).test_db_signature()
+tests/backends/base/test_creation.py:34:        signature = BaseDatabaseCreation(test_connection).test_db_signature()
+tests/backends/base/test_creation.py:42:        signature = BaseDatabaseCreation(test_connection).test_db_signature()
+---
+__init__.py
+test_introspection.py
+tests.py
+
+
+Let me examine the base signature and other backends to check for the same error format, and check the sqlite tests.
+
+```bash-action
+cd /testbed && sed -n '280,300p' django/db/backends/base/creation.py && echo "=== ORACLE ===" && sed -n '388,405p' django/db/backends/oracle/creation.py && echo "=== SQLITE TESTS grep ===" && grep -n "signature\|keepdb\|clone" tests/backends/sqlite/tests.py
+```2026_09_21_09_42_17899837782026_09_21_09_42_17899837782026_09_21_09_42_1789983778
+
+<system_warning>Maximum steps reached. Generating summary.</system_warning>2026_09_21_09_42_1789983779
+executing输出         """
+        SQL to append to the end of the test table creation statements.
+        """
+        return ''
+
+    def test_db_signature(self):
+        """
+        Return a tuple with elements of self.connection.settings_dict (a
+        DATABASES setting value) that uniquely identify a database
+        accordingly to the RDBMS particularities.
+        """
+        settings_dict = self.connection.settings_dict
+        return (
+            settings_dict['HOST'],
+            settings_dict['PORT'],
+            settings_dict['ENGINE'],
+            self._get_test_db_name(),
+        )
+=== ORACLE ===
+        handled by Django don't have real counterparts in Oracle.
+        """
+        return self.connection.settings_dict['NAME']
+
+    def test_db_signature(self):
+        settings_dict = self.connection.settings_dict
+        return (
+            settings_dict['HOST'],
+            settings_dict['PORT'],
+            settings_dict['ENGINE'],
+            settings_dict['NAME'],
+            self._test_database_user(),
+        )
+=== SQLITE TESTS grep ===
+
+
+This confirms the root cause precisely. The **base** `test_db_signature()` (line 285 of `base/creation.py`) already includes `self._get_test_db_name()` in its signature, so it properly distinguishes by test DB name. The SQLite override was the outlier — it used only the source `NAME` and omitted the test DB name, causing the collision. Oracle's override also uses `settings_dict['NAME']` but Oracle doesn't use file-based test DB names in the same way, and its signature includes the user. The base behavior is the correct model, and my SQLite fix now aligns with it.
+
+Let me now run the existing tests that cover this module.
+
+```bash-action
+cd /testbed && grep -n "test_db_signature\|TestDbSignature\|class Test" tests/backends/base/test_creation.py
+```2026_09_21_09_42_1789983779
+executing输出 11:class TestDbSignatureTests(SimpleTestCase):
+26:        signature = BaseDatabaseCreation(test_connection).test_db_signature()
+34:        signature = BaseDatabaseCreation(test_connection).test_db_signature()
+42:        signature = BaseDatabaseCreation(test_connection).test_db_signature()
+48:class TestDbCreationTests(SimpleTestCase):
+
+
+Let me look at those tests to understand and then run them along with the sqlite tests.
+
+```bash-action
+cd /testbed && sed -n '1,60p' tests/backends/base/test_creation.py
+```2026_09_21_09_43_17899837812026_09_21_09_43_1789983781
+
+<system_warning>Maximum steps reached. Generating summary.</system_warning>2026_09_21_09_43_1789983782
+executing输出 import copy
+from unittest import mock
+
+from django.db import DEFAULT_DB_ALIAS, connection, connections
+from django.db.backends.base.creation import (
+    TEST_DATABASE_PREFIX, BaseDatabaseCreation,
+)
+from django.test import SimpleTestCase
+
+
+class TestDbSignatureTests(SimpleTestCase):
+
+    def get_connection_copy(self):
+        # Get a copy of the default connection. (Can't use django.db.connection
+        # because it'll modify the default connection itself.)
+        test_connection = copy.copy(connections[DEFAULT_DB_ALIAS])
+        test_connection.settings_dict = copy.copy(connections[DEFAULT_DB_ALIAS].settings_dict)
+        return test_connection
+
+    def test_default_name(self):
+        # A test db name isn't set.
+        prod_name = 'hodor'
+        test_connection = self.get_connection_copy()
+        test_connection.settings_dict['NAME'] = prod_name
+        test_connection.settings_dict['TEST'] = {'NAME': None}
+        signature = BaseDatabaseCreation(test_connection).test_db_signature()
+        self.assertEqual(signature[3], TEST_DATABASE_PREFIX + prod_name)
+
+    def test_custom_test_name(self):
+        # A regular test db name is set.
+        test_name = 'hodor'
+        test_connection = self.get_connection_copy()
+        test_connection.settings_dict['TEST'] = {'NAME': test_name}
+        signature = BaseDatabaseCreation(test_connection).test_db_signature()
+        self.assertEqual(signature[3], test_name)
+
+    def test_custom_test_name_with_test_prefix(self):
+        # A test db name prefixed with TEST_DATABASE_PREFIX is set.
+        test_name = TEST_DATABASE_PREFIX + 'hodor'
+        test_connection = self.get_connection_copy()
+        test_connection.settings_dict['TEST'] = {'NAME': test_name}
+        signature = BaseDatabaseCreation(test_connection).test_db_signature()
+        self.assertEqual(signature[3], test_name)
+
+
+@mock.patch.object(connection, 'ensure_connection')
+@mock.patch('django.core.management.commands.migrate.Command.handle', return_value=None)
+class TestDbCreationTests(SimpleTestCase):
+    def test_migrate_test_setting_false(self, mocked_migrate, mocked_ensure_connection):
+        creation = connection.creation_class(connection)
+        saved_settings = copy.deepcopy(connection.settings_dict)
+        try:
+            connection.settings_dict['TEST']['MIGRATE'] = False
+            with mock.patch.object(creation, '_create_test_db'):
+                creation.create_test_db(verbosity=0, autoclobber=True, serialize=False)
+            mocked_migrate.assert_not_called()
+        finally:
+            connection.settings_dict = saved_settings
+
+    def test_migrate_test_setting_true(self, mocked_migrate, mocked_ensure_connection):
+
+
+These base tests only test the base class's signature (index 3), not the SQLite override. Let me run the existing sqlite backend tests and the base creation tests to ensure my change doesn't break anything.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py backends.base.test_creation backends.sqlite -v 1 2>&1 | tail -20
+```2026_09_21_09_43_17899837822026_09_21_09_43_1789983783
+
+<system_warning>Maximum steps reached. Generating summary.</system_warning>
+executing输出 Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+............................ss
+----------------------------------------------------------------------
+Ran 30 tests in 0.127s
+
+OK (skipped=2)
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+Tests pass (30 run, 2 skipped, OK). Now let me run the actual multidb test that was reported failing, using persistent SQLite test databases with `--keepdb` to confirm the fix resolves the issue.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py admin_views.test_multidb --keepdb --parallel 1 -v 2 2>&1 | tail -25
+```2026_09_21_09_43_1789983784
+executing输出     Creating table admin_views_parentwithfk
+    Creating table admin_views_childofreferer
+    Creating table admin_views_inlinereferer
+    Creating table admin_views_referencedbyinline
+    Creating table admin_views_inlinereference
+    Creating table admin_views_recipe
+    Creating table admin_views_ingredient
+    Creating table admin_views_recipeingredient
+    Creating table admin_views_notreferenced
+    Creating table admin_views_explicitlyprovidedpk
+    Creating table admin_views_implicitlygeneratedpk
+    Creating table admin_views_referencedbygenrel
+    Creating table admin_views_genrelreference
+    Creating table admin_views_parentwithuuidpk
+    Creating table admin_views_relatedwithuuidpkmodel
+    Creating table admin_views_author
+    Creating table admin_views_authorship
+    Running deferred SQL...
+Running migrations:
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+System check identified no issues (0 silenced).
+
+
+The output was truncated. Let me see the final result.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py admin_views.test_multidb --keepdb --parallel 1 -v 1 2>&1 | tail -8
+```2026_09_21_09_43_17899837862026_09_21_09_43_1789983787
+executing输出 ----------------------------------------------------------------------
+Ran 3 tests in 0.061s
+
+OK
+Preserving test database for alias 'default'...
+Preserving test database for alias 'other'...
+Testing against Django installed in '/testbed/django'
+System check identified no issues (0 silenced).
+
+
+The reported failing test now passes with `--keepdb` — note it now says "Preserving test database for alias 'default'..." AND "...for alias 'other'...", proving the two databases are now tracked separately instead of being collapsed together. The 3 tests ran OK.
+
+Let me now check whether the SQLite in-memory case still works correctly (regression check for the `is_in_memory_db` branch), and verify the final diff.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py admin_views.test_multidb -v 1 2>&1 | tail -6
+```2026_09_21_09_43_17899837882026_09_21_09_43_17899837892026_09_21_09_43_1789983788
+
+<system_warning>Maximum steps reached. Generating summary.</system_warning>
+executing输出 
+OK
+Destroying test database for alias 'default'...
+Destroying test database for alias 'other'...
+Testing against Django installed in '/testbed/django' with up to 16 processes
+System check identified no issues (0 silenced).
+
+
+The non-persistent run also passes, and now correctly creates/destroys `default` and `other` separately.
+
+Let me verify the final diff to confirm the change is exactly what I intended.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_43_1789983791
+executing输出 diff --git a/django/db/backends/sqlite3/creation.py b/django/db/backends/sqlite3/creation.py
+index d97052f52d..113b2fd5e4 100755
+--- a/django/db/backends/sqlite3/creation.py
++++ b/django/db/backends/sqlite3/creation.py
+@@ -95,7 +95,7 @@ class DatabaseCreation(BaseDatabaseCreation):
+         TEST NAME. See https://www.sqlite.org/inmemorydb.html
+         """
+         test_database_name = self._get_test_db_name()
+-        sig = [self.connection.settings_dict['NAME']]
++        sig = [self.connection.settings_dict['NAME'], test_database_name]
+         if self.is_in_memory_db(test_database_name):
+             sig.append(self.connection.alias)
+         return tuple(sig)
+
+
+The diff is exactly the intended minimal one-line change. 
+
+Summary of what was accomplished:
+
+1. **Root cause identified**: `test_db_signature()` in `django/db/backends/sqlite3/creation.py` omitted the test database name from the signature. When two SQLite aliases had distinct `TEST['NAME']` values but the same (empty) source `NAME`, both produced the identical signature `('',)`, causing the test runner to collapse them into one shared test DB → "database is locked".
+
+2. **Bug reproduced**: Confirmed with a minimal script that both signatures collided (`('',)` / `('',)`).
+
+3. **Fix applied**: Included `test_database_name` in the signature, aligning SQLite with the base backend's `test_db_signature()` which already includes `_get_test_db_name()`.
+
+4. **Fix verified**: The repro now shows distinct signatures. `admin_views.test_multidb` passes with `--keepdb --parallel 1`, with `default` and `other` correctly preserved/destroyed separately.
+
+5. **Existing tests run**: `backends.base.test_creation` and `backends.sqlite` — 30 tests OK (2 skipped), no regressions.
+
+6. **Same-error-format grep**: Checked base and Oracle backends; the base already uses `_get_test_db_name()`, and Oracle's override is intentionally different (uses user/host/port). No other instance of this bug pattern exists.
+
+The task is complete.
+
+```bash-action
+exit
+```

@@ -1,0 +1,709 @@
+plan-unwanted
+我来定位这个 issue 的根因。这是 Django 3.0 中 URL 解析对可选 URL 参数的处理问题。
+
+先看复现和定位：
+
+```bash-action
+cd /testbed && git log --oneline -1 && python -c "
+import django
+print(django.get_version())
+"
+```
+executing输出 16f31bf6db SWE-bench
+3.1
+
+
+让我先写个最小复现脚本确认 bug：
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(DEBUG=True, ALLOWED_HOSTS=['*'], ROOT_URLCONF=__name__)
+django.setup()
+
+from django.urls import re_path
+from django.http import HttpResponse
+from django.test import Client
+
+def modules(request, format='html'):
+    return HttpResponse('ok:%s' % format)
+
+urlpatterns = [
+    re_path(r'^module/(?P<format>(html|json|xml))?/?$', modules, name='modules'),
+]
+
+from django.test import Client
+c = Client()
+try:
+    r = c.get('/module/')
+    print("STATUS", r.status_code, r.content)
+except Exception as e:
+    print("ERROR:", type(e).__name__, e)
+EOF
+python /tmp/repro.py
+```2026_09_21_09_43_1789983796
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+环境问题，需要设置 PYTHONPATH 或用测试环境：
+
+```bash-action
+cd /testbed && python -c "import sys; print(sys.path)" && which python && pip show django 2>/dev/null | head -5
+```2026_09_21_09_43_1789983797
+executing输出 ['', '/opt/miniconda3/lib/python311.zip', '/opt/miniconda3/lib/python3.11', '/opt/miniconda3/lib/python3.11/lib-dynload', '/opt/miniconda3/lib/python3.11/site-packages']
+/opt/miniconda3/bin/python
+
+
+Django 还没安装到环境，需要安装到可编辑模式：
+
+```bash-action
+cd /testbed && pip install -e . -q 2>&1 | tail -3
+```
+executing输出 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+现在重跑复现脚本：
+
+```bash-action
+cd /testbed && python /tmp/repro.py
+```2026_09_21_09_43_1789983805
+executing输出 Internal Server Error: /module/
+Traceback (most recent call last):
+  File "/testbed/django/core/handlers/exception.py", line 34, in inner
+    response = get_response(request)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
+    response = self.process_exception_by_middleware(e, request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
+    response = wrapped_callback(request, *callback_args, **callback_kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: modules() takes from 1 to 2 positional arguments but 3 were given
+ERROR: TypeError modules() takes from 1 to 2 positional arguments but 3 were given
+
+
+Bug 复现成功。现在定位根因。问题在于可选的命名组 `(?P<format>...)?` 未匹配时，应该返回空字符串（或不传参），但 Django 3.0 后 regex 匹配返回了 `None` 作为位置参数传入。
+
+来看 `django/urls/resolvers.py` 中 RegexPattern 的 match 处理：
+
+```bash-action
+cd /testbed && grep -n "def match" django/urls/resolvers.py
+```2026_09_21_09_43_1789983807
+executing输出 155:    def match(self, path):
+255:    def match(self, path):
+306:    def match(self, path):
+
+
+```bash-action
+cd /testbed && sed -n '140,180p' django/urls/resolvers.py
+```2026_09_21_09_43_17899838082026_09_21_09_43_1789983806
+executing输出             return [warning]
+        else:
+            return []
+
+
+class RegexPattern(CheckURLMixin):
+    regex = LocaleRegexDescriptor('_regex')
+
+    def __init__(self, regex, name=None, is_endpoint=False):
+        self._regex = regex
+        self._regex_dict = {}
+        self._is_endpoint = is_endpoint
+        self.name = name
+        self.converters = {}
+
+    def match(self, path):
+        match = self.regex.search(path)
+        if match:
+            # If there are any named groups, use those as kwargs, ignoring
+            # non-named groups. Otherwise, pass all non-named arguments as
+            # positional arguments.
+            kwargs = {k: v for k, v in match.groupdict().items() if v is not None}
+            args = () if kwargs else match.groups()
+            return path[match.end():], args, kwargs
+        return None
+
+    def check(self):
+        warnings = []
+        warnings.extend(self._check_pattern_startswith_slash())
+        if not self._is_endpoint:
+            warnings.extend(self._check_include_trailing_dollar())
+        return warnings
+
+    def _check_include_trailing_dollar(self):
+        regex_pattern = self.regex.pattern
+        if regex_pattern.endswith('$') and not regex_pattern.endswith(r'\$'):
+                "Your URL pattern {} uses include with a route ending with a '$'. "
+                "Remove the dollar from the route to avoid problems including "
+                "URLs.".format(self.describe()),
+                id='urls.W001',
+
+
+Found it. Root cause:
+
+```python
+kwargs = {k: v for k, v in match.groupdict().items() if v is not None}
+args = () if kwargs else match.groups()
+```
+
+The regex `^module/(?P<format>(html|json|xml))?/?$` has:
+- 1 named group `format`
+- 1 non-named group `(html|json|xml)` (the inner one)
+
+When `/module/` is requested, the optional named group matches nothing, so `groupdict() = {'format': None}`. After filtering `None`, `kwargs = {}`. Then `args = match.groups()` returns a tuple containing the non-named groups. 
+
+But there's a subtlety: when a group is optional and didn't participate, `match.groups()` returns `None` for that group. Actually here the group `(html|json|xml)` also didn't match. Let me verify what `match.groups()` returns.
+
+Actually the issue: since `format` is a named group that's wrapped around `(html|json|xml)`, when it doesn't match, both groups are `None`. So `match.groups()` = `(None,)` — a 1-tuple containing None. This gets passed as positional arg → `modules(request, None)` but the extra None is treated... wait error says "3 were given" meaning request + 2 more.
+
+Let me actually check the groups:
+
+```bash-action
+cd /testbed && python -c "
+import re
+rx = re.compile(r'^module/(?P<format>(html|json|xml))?/?\$')
+m = rx.search('/module/')
+print('groups:', m.groups())
+print('groupdict:', m.groupdict())
+"
+```2026_09_21_09_43_17899838092026_09_21_09_43_1789983807
+executing输出 Traceback (most recent call last):
+  File "<string>", line 5, in <module>
+AttributeError: 'NoneType' object has no attribute 'groups'
+
+
+The shell escaping ate the `$`. Let me use a file:
+
+```bash-action
+cd /testbed && cat > /tmp/grp.py << 'EOF'
+import re
+rx = re.compile(r'^module/(?P<format>(html|json|xml))?/?$')
+m = rx.search('/module/')
+print('match:', m)
+if m:
+    print('groups:', m.groups())
+    print('groupdict:', m.groupdict())
+    print('end:', m.end())
+EOF
+python /tmp/grp.py
+```
+executing输出 match: None
+
+
+The path passed to match doesn't include the leading `/`. Let me check how the path is passed:
+
+```bash-action
+cd /testbed && cat > /tmp/grp.py << 'EOF'
+import re
+rx = re.compile(r'^module/(?P<format>(html|json|xml))?/?$')
+for p in ['module/', 'module']:
+    m = rx.search(p)
+    print(p, '->', m, m.groups() if m else None, m.groupdict() if m else None)
+EOF
+python /tmp/grp.py
+```2026_09_21_09_43_17899838102026_09_21_09_43_17899838092026_09_21_09_43_1789983810
+executing输出 module/ -> <re.Match object; span=(0, 7), match='module/'> (None, None) {'format': None}
+module -> None None None
+
+
+Confirmed. With `module/`:
+- `groupdict()` = `{'format': None}` → after filtering None → `kwargs = {}`
+- `match.groups()` = `(None, None)` → `args = (None, None)`
+
+So the callback gets `modules(request, None, None)` → 3 args → TypeError.
+
+The fix: when there ARE named groups, non-named groups should be ignored (they're part of the named group's pattern or auxiliary). The original intent is "if named groups exist, use them as kwargs; otherwise use positional args". The bug is that the condition `() if kwargs else match.groups()` uses the *filtered* kwargs, which is empty when the only named group matched None.
+
+The correct check should be based on whether the regex *has* named groups, not whether the filtered kwargs dict is non-empty.
+
+Let me look at how other parts of Django / the git history handles this. Let me check the compile/match flow and whether there's a way to know if the pattern has named groups. Let me check `LocaleRegexDescriptor`:
+
+```bash-action
+cd /testbed && sed -n '100,140p' django/urls/resolvers.py
+```2026_09_21_09_43_17899838112026_09_21_09_43_17899838102026_09_21_09_43_1789983811
+executing输出         # string (not a lazily-translated string proxy), compile it once and
+        # avoid per-language compilation.
+        pattern = getattr(instance, self.attr)
+        if isinstance(pattern, str):
+            instance.__dict__['regex'] = instance._compile(pattern)
+            return instance.__dict__['regex']
+        language_code = get_language()
+        if language_code not in instance._regex_dict:
+            instance._regex_dict[language_code] = instance._compile(str(pattern))
+        return instance._regex_dict[language_code]
+
+
+class CheckURLMixin:
+    def describe(self):
+        """
+        Format the URL pattern for display in warning messages.
+        """
+        description = "'{}'".format(self)
+        if self.name:
+            description += " [name='{}']".format(self.name)
+        return description
+
+    def _check_pattern_startswith_slash(self):
+        """
+        Check that the pattern does not begin with a forward slash.
+        """
+        regex_pattern = self.regex.pattern
+        if not settings.APPEND_SLASH:
+            # Skip check as it can be useful to start a URL pattern with a slash
+            # when APPEND_SLASH=False.
+            return []
+        if regex_pattern.startswith(('/', '^/', '^\\/')) and not regex_pattern.endswith('/'):
+                "Your URL pattern {} has a route beginning with a '/'. Remove this "
+                "slash as it is unnecessary. If this pattern is targeted in an "
+                "include(), ensure the include() pattern has a trailing '/'.".format(
+                    self.describe()
+                ),
+                id="urls.W002",
+            )
+            return [warning]
+
+
+Now let me fix. The check should be whether the regex contains named groups, not whether the filtered dict is empty. We can precompute this at compile time, or check `match.re.groupindex` (regex group index of named groups).
+
+`match.re.groupindex` is a dict mapping group name → group number. If it's non-empty, the pattern has named groups.
+
+Let me apply the fix:
+
+```bash-action
+cd /testbed && python -c "print(open('django/urls/resolvers.py').read().count('groupdict()'))"
+```2026_09_21_09_43_17899838132026_09_21_09_43_17899838122026_09_21_09_43_1789983813
+executing输出 2
+
+
+Hmm, `groupdict()` appears twice — there may be a similar pattern elsewhere (in `URLPattern.match` or `LocalePrefixPattern`). Let me find both:
+
+```bash-action
+cd /testbed && grep -n "groupdict()" django/urls/resolvers.py
+```2026_09_21_09_43_17899838142026_09_21_09_43_17899838132026_09_21_09_43_17899838142026_09_21_09_43_1789983814
+executing输出 161:            kwargs = {k: v for k, v in match.groupdict().items() if v is not None}
+259:            kwargs = match.groupdict()
+
+
+Line 259 is `LocalePrefixPattern.match`:
+```python
+kwargs = match.groupdict()
+```
+
+Let me look at it to see if it has the same bug (same error format):
+
+```bash-action
+cd /testbed && sed -n '250,270p' django/urls/resolvers.py
+```2026_09_21_09_43_17899838152026_09_21_09_43_17899838142026_09_21_09_43_1789983814
+executing输出         self._regex_dict = {}
+        self._is_endpoint = is_endpoint
+        self.name = name
+        self.converters = _route_to_regex(str(route), is_endpoint)[1]
+
+    def match(self, path):
+        match = self.regex.search(path)
+        if match:
+            # RoutePattern doesn't allow non-named groups so args are ignored.
+            kwargs = match.groupdict()
+            for key, value in kwargs.items():
+                converter = self.converters[key]
+                try:
+                    kwargs[key] = converter.to_python(value)
+                except ValueError:
+                    return None
+            return path[match.end():], (), kwargs
+        return None
+
+    def check(self):
+        warnings = self._check_pattern_startswith_slash()
+
+
+That's `RoutePattern.match` (new-style path), which doesn't allow non-named groups — not the same bug. So only line 161 needs fixing.
+
+The proper fix: determine if there are named groups using `match.re.groupindex`. If the pattern has named groups, use the (possibly empty) filtered kwargs and ignore positional args. Otherwise use `match.groups()` filtered for `None` (dropping non-participating optional groups).
+
+Let me apply the fix:
+
+```bash-action
+cd /testbed && python - << 'EOF'
+import re
+path = 'django/urls/resolvers.py'
+s = open(path).read()
+old = """            kwargs = {k: v for k, v in match.groupdict().items() if v is not None}
+            args = () if kwargs else match.groups()"""
+new = """            kwargs = {k: v for k, v in match.groupdict().items() if v is not None}
+            args = () if match.re.groupindex else match.groups()"""
+assert old in s
+s = s.replace(old, new)
+open(path, 'w').write(s)
+print('done')
+EOF
+```2026_09_21_09_43_1789983816
+executing输出 done
+
+
+Now rerun the repro:
+
+```bash-action
+cd /testbed && python /tmp/repro.py
+```2026_09_21_09_43_17899838172026_09_21_09_43_17899838172026_09_21_09_43_1789983817
+executing输出 module/ -> <re.Match object; span=(0, 7), match='module/'> (None, None) {'format': None}
+module -> None None None
+STATUS 200 b'ok:html'
+
+
+Fix works — `/module/` now returns 200 with the default `format='html'`.
+
+Let me verify the fix doesn't break non-named-only patterns (positional args case). The line `args = () if match.re.groupindex else match.groups()` — when there are named groups, args=(). When no named groups, args=match.groups(). Good.
+
+Let me also test the existing full-regex positional case to be safe, and check the git diff:
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_43_17899838192026_09_21_09_43_17899838182026_09_21_09_43_1789983818
+executing输出 diff --git a/django/urls/resolvers.py b/django/urls/resolvers.py
+index 2d4610aac4..b317cad65c 100755
+--- a/django/urls/resolvers.py
++++ b/django/urls/resolvers.py
+@@ -159,7 +159,7 @@ class RegexPattern(CheckURLMixin):
+             # non-named groups. Otherwise, pass all non-named arguments as
+             # positional arguments.
+             kwargs = {k: v for k, v in match.groupdict().items() if v is not None}
+-            args = () if kwargs else match.groups()
++            args = () if match.re.groupindex else match.groups()
+             return path[match.end():], args, kwargs
+         return None
+ 
+
+
+Now let me run the existing tests that cover this module (URL resolvers):
+
+```bash-action
+cd /testbed && python tests/runtests.py urlpatterns urls -v1 2>&1 | tail -20
+```2026_09_21_09_43_17899838212026_09_21_09_43_1789983820
+executing输出 Testing against Django installed in '/testbed/django' with up to 16 processes
+System check identified no issues (0 silenced).
+............................
+----------------------------------------------------------------------
+Ran 28 tests in 0.044s
+
+OK
+
+
+Let me run more relevant test modules that cover URL resolution:
+
+```bash-action
+cd /testbed && python tests/runtests.py resolve_url resolvers -v1 2>&1 | tail -20
+```2026_09_21_09_43_17899838212026_09_21_09_43_17899838212026_09_21_09_43_17899838212026_09_21_09_43_1789983821
+executing输出     raise value
+TypeError: cannot pickle 'traceback' object
+
+
+resolvers (unittest.loader._FailedTest.resolvers) failed:
+
+    ImportError('Failed to import test module: resolvers\nTraceback (most
+    recent call last):\n  File
+    "/opt/miniconda3/lib/python3.11/unittest/loader.py", line 154, in
+    loadTestsFromName\n    module = __import__(module_name)\n
+    ^^^^^^^^^^^^^^^^^^^^^^^\nModuleNotFoundError: No module named
+    \'resolvers\'\n')
+
+Unfortunately, tracebacks cannot be pickled, making it impossible for the
+parallel test runner to handle this exception cleanly.
+
+In order to see the traceback, you should install tblib:
+
+    python -m pip install tblib
+
+
+
+`resolvers` isn't a test module name. The correct one is `tests/urlpatterns`. Let me run the full URL-related test suite:
+
+```bash-action
+cd /testbed && python tests/runtests.py tests/urlpatterns tests/resolve_url -v1 2>&1 | tail -15
+```2026_09_21_09_43_17899838232026_09_21_09_43_17899838222026_09_21_09_43_17899838222026_09_21_09_43_17899838232026_09_21_09_43_1789983823
+executing输出     .models import UnimportantThing\n  File
+    "/testbed/tests/resolve_url/models.py", line 8, in <module>\n    class
+    UnimportantThing(models.Model):\n  File
+    "/testbed/django/db/models/base.py", line 113, in __new__\n    raise
+    RuntimeError(\nRuntimeError: Model class
+    resolve_url.models.UnimportantThing doesn\'t declare an explicit
+    app_label and isn\'t in an application in INSTALLED_APPS.\n')
+
+Unfortunately, tracebacks cannot be pickled, making it impossible for the
+parallel test runner to handle this exception cleanly.
+
+In order to see the traceback, you should install tblib:
+
+    python -m pip install tblib
+
+
+
+`resolve_url` needs its own settings. Let me just run the main URLpatterns test (already passed) and the `urls` test, plus the `test_client`-adjacent path. Let me run them separately:
+
+```bash-action
+cd /testbed && python tests/runtests.py urlpatterns test_client -v1 2>&1 | tail -15
+```2026_09_21_09_43_17899838252026_09_21_09_43_17899838242026_09_21_09_43_17899838242026_09_21_09_43_17899838242026_09_21_09_43_1789983824
+executing输出 OK
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+`urlpatterns` and `test_client` tests pass. Let me also confirm the specific urlpatterns test that covers this bug area passes in isolation:
+
+```bash-action
+cd /testbed && python tests/runtests.py urlpatterns -v2 2>&1 | grep -iE "ok|fail|error|optional|named" | tail -30
+```2026_09_21_09_43_17899838262026_09_21_09_43_17899838262026_09_21_09_43_17899838262026_09_21_09_43_17899838262026_09_21_09_43_1789983826
+executing输出 test_str (urlpatterns.test_resolvers.RegexPatternTests.test_str) ... ok
+test_resolver_cache_default__root_urlconf (urlpatterns.test_resolvers.ResolverCacheTests.test_resolver_cache_default__root_urlconf) ... ok
+test_str (urlpatterns.test_resolvers.RoutePatternTests.test_str) ... ok
+test_allows_non_ascii_but_valid_identifiers (urlpatterns.tests.ParameterRestrictionTests.test_allows_non_ascii_but_valid_identifiers) ... ok
+test_non_identifier_parameter_name_causes_exception (urlpatterns.tests.ParameterRestrictionTests.test_non_identifier_parameter_name_causes_exception) ... ok
+test_resolve_type_error_propagates (urlpatterns.tests.ConversionExceptionTests.test_resolve_type_error_propagates) ... ok
+test_resolve_value_error_means_no_match (urlpatterns.tests.ConversionExceptionTests.test_resolve_value_error_means_no_match) ... ok
+test_reverse_value_error_propagates (urlpatterns.tests.ConversionExceptionTests.test_reverse_value_error_propagates) ... ok
+test_matching_urls (urlpatterns.tests.ConverterTests.test_matching_urls) ... ok
+test_nonmatching_urls (urlpatterns.tests.ConverterTests.test_nonmatching_urls) ... ok
+test_converter_resolve (urlpatterns.tests.SimplifiedURLTests.test_converter_resolve) ... ok
+test_converter_reverse (urlpatterns.tests.SimplifiedURLTests.test_converter_reverse) ... ok
+test_converter_reverse_with_second_layer_instance_namespace (urlpatterns.tests.SimplifiedURLTests.test_converter_reverse_with_second_layer_instance_namespace) ... ok
+test_invalid_converter (urlpatterns.tests.SimplifiedURLTests.test_invalid_converter) ... ok
+test_path_inclusion_is_matchable (urlpatterns.tests.SimplifiedURLTests.test_path_inclusion_is_matchable) ... ok
+test_path_inclusion_is_reversible (urlpatterns.tests.SimplifiedURLTests.test_path_inclusion_is_reversible) ... ok
+test_path_lookup_with_double_inclusion (urlpatterns.tests.SimplifiedURLTests.test_path_lookup_with_double_inclusion) ... ok
+test_path_lookup_with_empty_string_inclusion (urlpatterns.tests.SimplifiedURLTests.test_path_lookup_with_empty_string_inclusion) ... ok
+test_path_lookup_with_inclusion (urlpatterns.tests.SimplifiedURLTests.test_path_lookup_with_inclusion) ... ok
+test_path_lookup_with_multiple_parameters (urlpatterns.tests.SimplifiedURLTests.test_path_lookup_with_multiple_parameters) ... ok
+test_path_lookup_with_typed_parameters (urlpatterns.tests.SimplifiedURLTests.test_path_lookup_with_typed_parameters) ... ok
+test_path_lookup_without_parameters (urlpatterns.tests.SimplifiedURLTests.test_path_lookup_without_parameters) ... ok
+test_path_reverse_with_parameter (urlpatterns.tests.SimplifiedURLTests.test_path_reverse_with_parameter) ... ok
+test_path_reverse_without_parameter (urlpatterns.tests.SimplifiedURLTests.test_path_reverse_without_parameter) ... ok
+test_re_path (urlpatterns.tests.SimplifiedURLTests.test_re_path) ... ok
+test_re_path_with_optional_parameter (urlpatterns.tests.SimplifiedURLTests.test_re_path_with_optional_parameter) ... ok
+test_space_in_route (urlpatterns.tests.SimplifiedURLTests.test_space_in_route) ... ok
+test_two_variable_at_start_of_path_pattern (urlpatterns.tests.SimplifiedURLTests.test_two_variable_at_start_of_path_pattern) ... ok
+OK
+
+
+There's already a test `test_re_path_with_optional_parameter` in `urlpatterns.tests.SimplifiedURLTests`. Let me check whether it's the case that was previously failing/being handled — and confirm it now passes (it does, "ok"). Let me inspect that test to see if it's exactly our case:
+
+```bash-action
+cd /testbed && grep -n "test_re_path_with_optional_parameter" -A 15 tests/urlpatterns/tests.py
+```2026_09_21_09_43_17899838282026_09_21_09_43_17899838282026_09_21_09_43_17899838282026_09_21_09_43_17899838282026_09_21_09_43_17899838282026_09_21_09_43_1789983828
+executing输出 57:    def test_re_path_with_optional_parameter(self):
+58-        for url, kwargs in (
+59-            ('/regex_optional/1/2/', {'arg1': '1', 'arg2': '2'}),
+60-            ('/regex_optional/1/', {'arg1': '1'}),
+61-        ):
+62-            with self.subTest(url=url):
+63-                match = resolve(url)
+64-                self.assertEqual(match.url_name, 'regex_optional')
+65-                self.assertEqual(match.kwargs, kwargs)
+66-                self.assertEqual(
+67-                    match.route,
+68-                    r'^regex_optional/(?P<arg1>\d+)/(?:(?P<arg2>\d+)/)?',
+69-                )
+70-
+71-    def test_path_lookup_with_inclusion(self):
+72-        match = resolve('/included_urls/extra/something/')
+
+
+This existing test covers the case with named groups only (no non-named group), and it passes. My repro script specifically covers the issue's scenario — a named group containing a non-named subgroup.
+
+Let me verify once more with the exact issue pattern including `re_path` name, and also test that a plain positional-only regex still works (no named groups):
+
+```bash-action
+cd /testbed && cat > /tmp/repro2.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(DEBUG=True, ALLOWED_HOSTS=['*'], ROOT_URLCONF=__name__)
+django.setup()
+
+from django.urls import re_path, resolve, reverse_dummy = None
+from django.http import HttpResponse
+from django.test import Client
+import django.urls
+
+def modules(request, format='html'):
+    return HttpResponse('m:%s' % format)
+
+def posonly(request, *args):
+    return HttpResponse('p:%s' % (args,))
+
+urlpatterns = [
+    re_path(r'^module/(?P<format>(html|json|xml))?/?$', modules, name='modules'),
+    re_path(r'^pos/(\d+)/(\d+)/$', posonly),
+]
+
+c = Client()
+print("module/ ->", c.get('/module/').status_code, c.get('/module/').content)
+print("module/json/ ->", c.get('/module/json/').content)
+print("pos/1/2/ ->", c.get('/pos/1/2/').content)
+
+# reverse
+print("reverse modules html ->", django.urls.reverse('modules'))
+print("resolve /module/ args, kwargs ->",
+      resolve('/module/').args, resolve('/module/').kwargs)
+EOF
+python /tmp/repro2.py
+```2026_09_21_09_43_17899838302026_09_21_09_43_17899838292026_09_21_09_43_17899838292026_09_21_09_43_17899838292026_09_21_09_43_17899838292026_09_21_09_43_17899838292026_09_21_09_43_17899838302026_09_21_09_43_1789983830
+executing输出   File "/tmp/repro2.py", line 6
+    from django.urls import re_path, resolve, reverse_dummy = None
+                                                            ^
+SyntaxError: invalid syntax
+
+
+Typo in my script. Let me fix:
+
+```bash-action
+cd /testbed && cat > /tmp/repro2.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(DEBUG=True, ALLOWED_HOSTS=['*'], ROOT_URLCONF=__name__)
+django.setup()
+
+from django.urls import re_path, resolve, reverse
+from django.http import HttpResponse
+from django.test import Client
+
+def modules(request, format='html'):
+    return HttpResponse('m:%s' % format)
+
+def posonly(request, *args):
+    return HttpResponse('p:%s' % (args,))
+
+urlpatterns = [
+    re_path(r'^module/(?P<format>(html|json|xml))?/?$', modules, name='modules'),
+    re_path(r'^pos/(\d+)/(\d+)/$', posonly),
+]
+
+c = Client()
+print("module/ ->", c.get('/module/').status_code, c.get('/module/').content)
+print("module/json/ ->", c.get('/module/json/').content)
+print("pos/1/2/ ->", c.get('/pos/1/2/').content)
+print("reverse modules html ->", reverse('modules'))
+print("resolve /module/ args,kwargs ->",
+      resolve('/module/').args, resolve('/module/').kwargs)
+EOF
+python /tmp/repro2.py
+```2026_09_21_09_43_17899838322026_09_21_09_43_17899838312026_09_21_09_43_17899838312026_09_21_09_43_17899838312026_09_21_09_43_17899838312026_09_21_09_43_17899838312026_09_21_09_43_17899838312026_09_21_09_43_17899838322026_09_21_09_43_1789983832
+executing输出 module/ -> <re.Match object; span=(0, 7), match='module/'> (None, None) {'format': None}
+module -> None None None
+module/ -> 200 b'm:html'
+module/json/ -> b'm:json'
+pos/1/2/ -> b"p:('1', '2')"
+reverse modules html -> /module/
+resolve /module/ args,kwargs -> () {}
+
+
+All cases work correctly:
+- `/module/` → 200, default `format='html'` (no crash)
+- `/module/json/` → `m:json`
+- `/pos/1/2/` → positional args still work `('1', '2')` (no named groups case)
+- reverse works
+- resolve returns empty args/kwargs for `/module/`
+
+Now let me run the broader URL-related test suite once more to confirm nothing regressed, along with the middleware and generic_views which use URL resolving:
+
+```bash-action
+cd /testbed && python tests/runtests.py urlpatterns test_client middleware -v1 2>&1 | tail -5
+```2026_09_21_09_43_17899838342026_09_21_09_43_17899838332026_09_21_09_43_17899838332026_09_21_09_43_17899838332026_09_21_09_43_17899838332026_09_21_09_43_17899838332026_09_21_09_43_17899838332026_09_21_09_43_17899838342026_09_21_09_43_17899838342026_09_21_09_43_1789983834
+
+<system>Tool ran without output or errors</system>
+executing输出 Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+Let me see the test result summary explicitly:
+
+```bash-action
+cd /testbed && python tests/runtests.py urlpatterns test_client middleware -v0 2>&1 | grep -E "^(OK|FAILED|Ran|ERROR|FAIL)" | head
+```2026_09_21_09_43_17899838372026_09_21_09_43_17899838362026_09_21_09_43_17899838362026_09_21_09_43_17899838362026_09_21_09_43_17899838362026_09_21_09_43_17899838362026_09_21_09_43_17899838362026_09_21_09_43_17899838372026_09_21_09_43_17899838372026_09_21_09_43_1789983837
+
+<system>Tool ran without output or errors</system>2026_09_21_09_43_1789983838
+
+用户W
+
+I need to see the test summary. The verbose output is being suppressed. Let me run without the parallel option to get clearer output.
+
+```bash-action
+cd /testbed && python tests/runtests.py urlpatterns test_client middleware -v1 --parallel=1 2>&1 | grep -E "^(OK|FAILED|Ran|ERROR|FAIL|test_)" | tail -20
+```
+executing输出 Ran 216 tests in 0.228s
+OK
+
+
+All 216 tests pass. The fix is confirmed:
+
+**Root cause:** In `django/urls/resolvers.py`, `RegexPattern.match()` decided between positional args and kwargs based on whether the *filtered* `kwargs` dict was non-empty:
+
+```python
+kwargs = {k: v for k, v in match.groupdict().items() if v is not None}
+args = () if kwargs else match.groups()
+```
+
+For a pattern like `^module/(?P<format>(html|json|xml))?/?$` where the only named group is optional and didn't participate, `groupdict()` = `{'format': None}`, so after filtering `kwargs = {}`. This made the condition fall through to `args = match.groups()`, which returned the non-participating groups `(None, None)` as positional arguments → `modules(request, None, None)` → `TypeError`.
+
+**Fix:** Decide based on whether the pattern *has* any named groups (`match.re.groupindex`), not on whether the filtered kwargs happen to be empty:
+
+```python
+args = () if match.re.groupindex else match.groups()
+```
+
+This preserves the original intent (named groups → kwargs, otherwise → positional args) and correctly handles optional named groups.
+
+Verified:
+- Original repro now returns `200` with default `format='html'`.
+- Positional-only regex patterns still receive positional args.
+- Named-group URL reversing still works.
+- `urlpatterns`, `test_client`, `middleware` suites pass (216 tests OK).
+
+Task complete.
+
+```bash-action
+cd /testbed && git diff
+```
+
+exit
+
+```bash-action
+exit
+```
+executing输出 diff --git a/django/urls/resolvers.py b/django/urls/resolvers.py
+index 2d4610aac4..b317cad65c 100755
+--- a/django/urls/resolvers.py
++++ b/django/urls/resolvers.py
+@@ -159,7 +159,7 @@ class RegexPattern(CheckURLMixin):
+             # non-named groups. Otherwise, pass all non-named arguments as
+             # positional arguments.
+             kwargs = {k: v for k, v in match.groupdict().items() if v is not None}
+-            args = () if kwargs else match.groups()
++            args = () if match.re.groupindex else match.groups()
+             return path[match.end():], args, kwargs
+         return None
+ 
+
+
+The修好了 fix is confirmed. The change matches the intent exactly.
+
+```bash-action
+exit
+```

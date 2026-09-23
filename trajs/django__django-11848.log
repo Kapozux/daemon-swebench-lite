@@ -1,0 +1,451 @@
+计划不需要
+理一下步骤：
+
+1. 查看 `/testbed/django/utils/http.py` 里的 `parse_http_date` 实现。
+2. 找到涉及两位年份判断的逻辑。
+3. 构造最小复现，确认当前 bug。
+4. 按 RFC 7231 语义修改：两位年份应相对于当前年份计算——若解析出的年份比当前年份多超过 50 年，则取更近的过去同末两位年份。
+5. 跑现有覆盖测试（`tests/utils_tests/test_http.py`）。
+6. `git diff` 确认。
+7. exit。
+
+先看源码：
+
+```bash-action
+sed -n '1,80p' /testbed/django/utils/http.py | grep -n "parse_http_date" -A 40
+```
+executing输出 
+
+```bash-action
+grep -n "parse_http_date" -A 45 /testbed/django/utils/http.py
+```
+executing输出 158:def parse_http_date(date):
+159-    """
+160-    Parse a date format as specified by HTTP RFC7231 section 7.1.1.1.
+161-
+162-    The three formats allowed by the RFC are accepted, even if only the first
+163-    one is still in widespread use.
+164-
+165-    Return an integer expressed in seconds since the epoch, in UTC.
+166-    """
+167-    # email.utils.parsedate() does the job for RFC1123 dates; unfortunately
+168-    # RFC7231 makes it mandatory to support RFC850 dates too. So we roll
+169-    # our own RFC-compliant parsing.
+170-    for regex in RFC1123_DATE, RFC850_DATE, ASCTIME_DATE:
+171-        m = regex.match(date)
+172-        if m is not None:
+173-            break
+174-    else:
+175-        raise ValueError("%r is not in a valid HTTP date format" % date)
+176-    try:
+177-        year = int(m.group('year'))
+178-        if year < 100:
+179-            if year < 70:
+180-                year += 2000
+181-            else:
+182-                year += 1900
+183-        month = MONTHS.index(m.group('mon').lower()) + 1
+184-        day = int(m.group('day'))
+185-        hour = int(m.group('hour'))
+186-        min = int(m.group('min'))
+187-        sec = int(m.group('sec'))
+188-        result = datetime.datetime(year, month, day, hour, min, sec)
+189-        return calendar.timegm(result.utctimetuple())
+190-    except Exception as exc:
+191-        raise ValueError("%r is not a valid date" % date) from exc
+192-
+193-
+194:def parse_http_date_safe(date):
+195-    """
+196:    Same as parse_http_date, but return None if the input is invalid.
+197-    """
+198-    try:
+199:        return parse_http_date(date)
+200-    except Exception:
+201-        pass
+202-
+203-
+204-# Base 36 functions: useful for generating compact URLs
+205-
+206-def base36_to_int(s):
+207-    """
+208-    Convert a base 36 string to an int. Raise ValueError if the input won't fit
+209-    into an int.
+210-    """
+211-    # To prevent overconsumption of server resources, reject any
+212-    # base36 string that is longer than 13 base36 digits (13 digits
+213-    # is sufficient to base36-encode any 64-bit integer)
+214-    if len(s) > 13:
+215-        raise ValueError("Base36 input too large")
+216-    return int(s, 36)
+217-
+218-
+219-def int_to_base36(i):
+220-    """Convert an integer to a base36 string."""
+221-    char_set = '0123456789abcdefghijklmnopqrstuvwxyz'
+222-    if i < 0:
+223-        raise ValueError("Negative base36 conversion input.")
+224-    if i < 36:
+225-        return char_set[i]
+226-    b36 = ''
+227-    while i != 0:
+228-        i, n = divmod(i, 36)
+229-        b36 = char_set[n] + b36
+230-    return b36
+231-
+232-
+233-def urlsafe_base64_encode(s):
+234-    """
+235-    Encode a bytestring to a base64 string for use in URLs. Strip any trailing
+236-    equal signs.
+237-    """
+238-    return base64.urlsafe_b64encode(s).rstrip(b'\n=').decode('ascii')
+239-
+240-
+241-def urlsafe_base64_decode(s):
+242-    """
+243-    Decode a base64 encoded string. Add back any trailing equal signs that
+244-    might have been stripped.
+
+
+找到根因：`year < 70` 是硬编码的 pivot，应改为相对于当前年份。
+
+写个最小复现脚本确认 bug：
+
+```bash-action
+cd /testbed && python -c "
+import datetime
+from django.utils.http import parse_http_date
+# RFC850 两位年份格式示例
+d = parse_http_date('Sunday, 06-Nov-94 08:49:37 GMT')
+print('94 ->', datetime.datetime.utcfromtimestamp(d).year)
+d = parse_http_date('Sunday, 06-Nov-69 08:49:37 GMT')
+print('69 ->', datetime.datetime.utcfromtimestamp(d).year)
+# 当前年 2026，'77' 应为 1977（过去），但当前逻辑给 1977 也对
+# 关键用例：两位年份使解析年 - 当前年 > 50 时，应回退到过去
+d = parse_http_date('Sunday, 06-Nov-27 08:49:37 GMT')
+print('27 ->', datetime.datetime.utcfromtimestamp(d).year)
+"
+```2026_09_21_09_41_1789983718
+executing输出 94 -> 1994
+69 -> 2069
+27 -> 2027
+
+
+复现确认：`69` 被解释为 2069（距当前年 2026 有 43 年，<50，其实是符合规则的），但核心 bug 是硬编码 pivot 而非按当前年份动态计算。例如当某年实际是 2050 时，`69` 表示 2069 距当前仅 19 年，合理；但若现在是 2020，`69` 表示 2069 距当前 49 年也合理。真正越界的情形是硬编码的 70 分界。
+
+按 RFC 7231 语义修改：先按当前世纪/上个世纪给出候选年份，若超过当前年 50 年以上则减 100。
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'django/utils/http.py'
+s = open(p).read()
+old = """        year = int(m.group('year'))
+        if year < 100:
+            if year < 70:
+                year += 2000
+            else:
+                year += 1900
+"""
+new = """        year = int(m.group('year'))
+        if year < 100:
+            year += 2000
+            if year - datetime.datetime.now().year > 50:
+                year -= 100
+"""
+assert old in s
+s = s.replace(old, new)
+open(p, 'w').write(s)
+print('patched')
+EOF
+```2026_09_21_09_41_1789983719
+executing输出 patched
+
+
+现在验证：`94` 应为 1994（2094-2026=68>50 → 减100），`27` 为 2027，`69` 为 2069，`77` 为 1977。
+
+```bash-action
+cd /testbed && python -c "
+import datetime
+from django.utils.http import parse_http_date
+for y in ('94','69','27','77','76','75'):
+    d = parse_http_date('Sunday, 06-Nov-%s 08:49:37 GMT' % y)
+    print(y, '->', datetime.datetime.utcfromtimestamp(d).year)
+"
+```2026_09_21_09_42_17899837212026_09_21_09_42_1789983721
+executing输出 94 -> 1994
+69 -> 2069
+27 -> 2027
+77 -> 1977
+76 -> 2076
+75 -> 2075
+
+
+结果符合 RFC 7231：2076-2026=50，不大于 50，保持 2076；2077-2026=51>50 回退到 1977。
+
+现在跑仓库里覆盖该模块的现有测试：
+
+```bash-action
+cd /testbed && python -m pytest tests/utils_tests/test_http.py -q 2>&1 | tail -20
+```2026_09_21_09_42_17899837222026_09_21_09_42_1789983722
+executing输出 /opt/miniconda3/bin/python: No module named pytest
+
+
+```bash-action
+cd /testbed && python -m unittest tests.utils_tests.test_http -v 2>&1 | tail -30
+```2026_09_21_09_42_17899837232026_09_21_09_42_17899837232026_09_21_09_42_1789983723
+executing输出 test_http (unittest.loader._FailedTest.test_http) ... ERROR
+
+======================================================================
+ERROR: test_http (unittest.loader._FailedTest.test_http)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_http
+Traceback (most recent call last):
+  File "/opt/miniconda3/lib/python3.11/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/tests/utils_tests/test_http.py", line 4, in <module>
+    from django.test import SimpleTestCase, ignore_warnings
+  File "/testbed/django/test/__init__.py", line 3, in <module>
+    from django.test.client import Client, RequestFactory
+  File "/testbed/django/test/client.py", line 14, in <module>
+    from django.core.handlers.base import BaseHandler
+  File "/testbed/django/core/handlers/base.py", line 7, in <module>
+    from django.db import connections, transaction
+  File "/testbed/django/db/__init__.py", line 2, in <module>
+    from django.db.utils import (
+  File "/testbed/django/db/utils.py", line 5, in <module>
+    from asgiref.local import Local
+ModuleNotFoundError: No module named 'asgiref'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+FAILED (errors=1)
+
+
+asgiref 没装。看下是否有可用的运行环境配置：
+
+```bash-action
+cd /testbed && ls tests/ | head && cat tox.ini 2>/dev/null | head -20; python -c "import django; print(django.__version__)"
+```2026_09_21_09_42_17899837252026_09_21_09_42_17899837252026_09_21_09_42_17899837252026_09_21_09_42_17899837252026_09_21_09_42_1789983725
+executing输出 README.rst
+absolute_url_overrides
+admin_autodiscover
+admin_changelist
+admin_checks
+admin_custom_urls
+admin_default_site
+admin_docs
+admin_filters
+admin_inlines
+# Tox (https://tox.readthedocs.io/) is a tool for running tests in multiple
+# virtualenvs. This configuration file helps to run the test suite on all
+# supported Python versions. To use it, "python -m pip install tox" and
+# then run "tox" from this directory.
+
+[tox]
+skipsdist = true
+envlist =
+    py3
+    flake8
+    docs
+    isort
+
+# Add environment to use the default python3 installation
+[testenv:py3]
+basepython = python3
+
+[testenv]
+usedevelop = true
+passenv = DJANGO_SETTINGS_MODULE PYTHONPATH HOME DISPLAY
+3.1
+
+
+Django 3.1，需要 asgiref。尝试安装依赖：
+
+```bash-action
+cd /testbed && pip install asgiref -q 2>&1 | tail -3
+```2026_09_21_09_42_17899837262026_09_21_09_42_1789983726
+executing输出 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /testbed && python -m unittest tests.utils_tests.test_http -v 2>&1 | tail -40
+```2026_09_21_09_42_17899837282026_09_21_09_42_17899837282026_09_21_09_42_17899837282026_09_21_09_42_17899837282026_09_21_09_42_1789983728
+executing输出     from django.urls import get_resolver, set_urlconf
+  File "/testbed/django/urls/__init__.py", line 1, in <module>
+    from .base import (
+  File "/testbed/django/urls/base.py", line 9, in <module>
+    from .exceptions import NoReverseMatch, Resolver404
+  File "/testbed/django/urls/exceptions.py", line 1, in <module>
+    from django.http import Http404
+  File "/testbed/django/http/__init__.py", line 5, in <module>
+    from django.http.response import (
+  File "/testbed/django/http/response.py", line 15, in <module>
+    from django.core.serializers.json import DjangoJSONEncoder
+  File "/testbed/django/core/serializers/__init__.py", line 23, in <module>
+    from django.core.serializers.base import SerializerDoesNotExist
+  File "/testbed/django/core/serializers/base.py", line 7, in <module>
+    from django.db import models
+  File "/testbed/django/db/models/__init__.py", line 3, in <module>
+    from django.db.models.aggregates import *  # NOQA
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/models/aggregates.py", line 5, in <module>
+    from django.db.models.expressions import Case, Func, Star, When
+  File "/testbed/django/db/models/expressions.py", line 8, in <module>
+    from django.db.models import fields
+  File "/testbed/django/db/models/fields/__init__.py", line 11, in <module>
+    from django import forms
+  File "/testbed/django/forms/__init__.py", line 6, in <module>
+    from django.forms.boundfield import *  # NOQA
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/forms/boundfield.py", line 3, in <module>
+    from django.forms.utils import flatatt, pretty_name
+  File "/testbed/django/forms/utils.py", line 6, in <module>
+    from django.utils import timezone
+  File "/testbed/django/utils/timezone.py", line 9, in <module>
+    import pytz
+ModuleNotFoundError: No module named 'pytz'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+
+
+```bash-action
+cd /testbed && pip install pytz sqlparse -q 2>&1 | tail -2
+```2026_09_21_09_42_17899837302026_09_21_09_42_17899837302026_09_21_09_42_1789983730
+executing输出 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /testbed && python -m unittest tests.utils_tests.test_http -v 2>&1 | tail -40
+```2026_09_21_09_42_17899837322026_09_21_09_42_17899837332026_09_21_09_42_17899837332026_09_21_09_42_17899837332026_09_21_09_42_17899837332026_09_21_09_42_1789983732
+
+user[Request interrupted by user]
+executing输出                 ^^^^^^^^^^^^^^
+  File "/testbed/django/utils/functional.py", line 48, in __get__
+    res = instance.__dict__[self.name] = self.func(instance)
+                                         ^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/utils.py", line 153, in databases
+    self._databases = settings.DATABASES
+                      ^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/conf/__init__.py", line 77, in __getattr__
+    self._setup(name)
+  File "/testbed/django/conf/__init__.py", line 58, in _setup
+    raise ImproperlyConfigured(
+django.core.exceptions.ImproperlyConfigured: Requested setting DATABASES, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.
+
+======================================================================
+ERROR: setUpClass (tests.utils_tests.test_http.URLEncodeTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/testbed/django/test/testcases.py", line 176, in setUpClass
+    cls._add_databases_failures()
+  File "/testbed/django/test/testcases.py", line 198, in _add_databases_failures
+    for alias in connections:
+  File "/testbed/django/db/utils.py", line 219, in __iter__
+    return iter(self.databases)
+                ^^^^^^^^^^^^^^
+  File "/testbed/django/utils/functional.py", line 48, in __get__
+    res = instance.__dict__[self.name] = self.func(instance)
+                                         ^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/utils.py", line 153, in databases
+    self._databases = settings.DATABASES
+                      ^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/conf/__init__.py", line 77, in __getattr__
+    self._setup(name)
+  File "/testbed/django/conf/__init__.py", line 58, in _setup
+    raise ImproperlyConfigured(
+django.core.exceptions.ImproperlyConfigured: Requested setting DATABASES, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.
+
+----------------------------------------------------------------------
+Ran 15 tests in 0.005s
+
+FAILED (errors=3)
+
+
+需要配置 settings。用 Django 自带的测试运行器：
+
+```bash-action
+cd /testbed && python tests/runtests.py utils_tests.test_http -v 1 2>&1 | tail -30
+```2026_09_21_09_42_1789983735
+executing输出 Traceback (most recent call last):
+  File "/testbed/tests/runtests.py", line 14, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/testbed/tests/runtests.py", line 16, in <module>
+    raise RuntimeError(
+RuntimeError: Django module not found, reference tests/README.rst for instructions.
+
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python tests/runtests.py utils_tests.test_http -v 1 2>&1 | tail -30
+```2026_09_21_09_42_17899837362026_09_21_09_42_17899837362026_09_21_09_42_17899837362026_09_21_09_42_1789983736
+
+user[Request interrupted by user]2026_09_21_09_42_1789983736
+executing输出 Testing against Django installed in '/testbed/django' with up to 16 processes
+System check identified no issues (0 silenced).
+.............................................
+----------------------------------------------------------------------
+Ran 45 tests in 0.039s
+
+OK
+
+
+45 个测试全部通过。
+
+现在 grep 一下同文件里有没有类似硬编码年份的问题，并确认 diff：
+
+```bash-action
+cd /testbed && grep -n "1900\|2000\|< 70\|year" django/utils/http.py
+```2026_09_21_09_42_17899837372026_09_21_09_42_17899837372026_09_21_09_42_17899837372026_09_21_09_42_1789983737
+executing输出 34:__Y = r'(?P<year>\d{4})'
+35:__Y2 = r'(?P<year>\d{2})'
+177:        year = int(m.group('year'))
+178:        if year < 100:
+179:            year += 2000
+180:            if year - datetime.datetime.now().year > 50:
+181:                year -= 100
+187:        result = datetime.datetime(year, month, day, hour, min, sec)
+
+
+没有其它类似硬编码问题。查看最终 diff：
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_42_17899837372026_09_21_09_42_1789983737
+executing输出 diff --git a/django/utils/http.py b/django/utils/http.py
+index 572cfb4347..5e707ccaef 100755
+--- a/django/utils/http.py
++++ b/django/utils/http.py
+@@ -176,10 +176,9 @@ def parse_http_date(date):
+     try:
+         year = int(m.group('year'))
+         if year < 100:
+-            if year < 70:
+-                year += 2000
+-            else:
+-                year += 1900
++            year += 2000
++            if year - datetime.datetime.now().year > 50:
++                year -= 100
+         month = MONTHS.index(m.group('mon').lower()) + 1
+         day = int(m.group('day'))
+         hour = int(m.group('hour'))
+
+
+改动正确，符合 RFC 7231 语义，且现有 45 个测试全部通过。
+
+```bash-action
+exit
+```

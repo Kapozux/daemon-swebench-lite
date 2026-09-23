@@ -1,0 +1,617 @@
+plan-unwanted
+## Plan
+
+1. **定位问题**: 阅读 `django/http/response.py` 中 `HttpResponse.__init__` 和 `content` setter，找到内容转换逻辑。
+2. **确认根因**: `content` 处理时对 `bytes` 和 `str` 有分支，但 `memoryview` 会走到 `str()` 转换路径，导致变成 `"<memory at ...>"`。
+3. **最小复现**: 写一个临时脚本确认 `HttpResponse(memoryview(b"My Content")).content` 输出错误。
+4. **修复**: 在内容处理逻辑中把 `memoryview` 用 `bytes()` 转换。
+5. **验证**: 重跑复现脚本，并找到覆盖该模块的已有测试文件跑一遍。
+6. **git diff 确认** 后 exit。
+
+请确认后我开始执行。
+我先查看相关源码。
+
+```bash-action
+sed -n '1,80p' /testbed/django/http/response.py
+```
+executing输出 import datetime
+import json
+import mimetypes
+import os
+import re
+import sys
+import time
+from email.header import Header
+from http.client import responses
+from urllib.parse import quote, urlparse
+
+from django.conf import settings
+from django.core import signals, signing
+from django.core.exceptions import DisallowedRedirect
+from django.core.serializers.json import DjangoJSONEncoder
+from django.http.cookie import SimpleCookie
+from django.utils import timezone
+from django.utils.encoding import iri_to_uri
+from django.utils.http import http_date
+
+_charset_from_content_type_re = re.compile(r';\s*charset=(?P<charset>[^\s;]+)', re.I)
+
+
+class BadHeaderError(ValueError):
+    pass
+
+
+class HttpResponseBase:
+    """
+    An HTTP response base class with dictionary-accessed headers.
+
+    This class doesn't handle content. It should not be used directly.
+    Use the HttpResponse and StreamingHttpResponse subclasses instead.
+    """
+
+    status_code = 200
+
+    def __init__(self, content_type=None, status=None, reason=None, charset=None):
+        # _headers is a mapping of the lowercase name to the original case of
+        # the header (required for working with legacy systems) and the header
+        # value. Both the name of the header and its value are ASCII strings.
+        self._headers = {}
+        self._closable_objects = []
+        # This parameter is set by the handler. It's necessary to preserve the
+        # historical behavior of request_finished.
+        self._handler_class = None
+        self.cookies = SimpleCookie()
+        self.closed = False
+        if status is not None:
+            try:
+                self.status_code = int(status)
+            except (ValueError, TypeError):
+                raise TypeError('HTTP status code must be an integer.')
+
+            if not 100 <= self.status_code <= 599:
+                raise ValueError('HTTP status code must be an integer from 100 to 599.')
+        self._reason_phrase = reason
+        self._charset = charset
+        if content_type is None:
+            content_type = 'text/html; charset=%s' % self.charset
+        self['Content-Type'] = content_type
+
+    @property
+    def reason_phrase(self):
+        if self._reason_phrase is not None:
+            return self._reason_phrase
+        # Leave self._reason_phrase unset in order to use the default
+        # reason phrase for status code.
+        return responses.get(self.status_code, 'Unknown Status Code')
+
+    @reason_phrase.setter
+    def reason_phrase(self, value):
+        self._reason_phrase = value
+
+    @property
+    def charset(self):
+        if self._charset is not None:
+            return self._charset
+        content_type = self.get('Content-Type', '')
+        matched = _charset_from_content_type_re.search(content_type)
+
+
+```bash-action
+grep -n "content" /testbed/django/http/response.py | head -60
+```
+executing输出 21:_charset_from_content_type_re = re.compile(r';\s*charset=(?P<charset>[^\s;]+)', re.I)
+32:    This class doesn't handle content. It should not be used directly.
+38:    def __init__(self, content_type=None, status=None, reason=None, charset=None):
+59:        if content_type is None:
+60:            content_type = 'text/html; charset=%s' % self.charset
+61:        self['Content-Type'] = content_type
+79:        content_type = self.get('Content-Type', '')
+80:        matched = _charset_from_content_type_re.search(content_type)
+104:    def _content_type_for_repr(self):
+231:        # - when self._charset != 'utf-8' it re-encodes the content
+253:    def write(self, content):
+280:    An HTTP response class with a string as content.
+282:    This content that can be read, appended to, or replaced.
+287:    def __init__(self, content=b'', *args, **kwargs):
+289:        # Content is a bytestring. See the `content` property methods.
+290:        self.content = content
+293:        return '<%(cls)s status_code=%(status_code)d%(content_type)s>' % {
+296:            'content_type': self._content_type_for_repr,
+301:        return self.serialize_headers() + b'\r\n\r\n' + self.content
+306:    def content(self):
+309:    @content.setter
+310:    def content(self, value):
+313:            content = b''.join(self.make_bytes(chunk) for chunk in value)
+320:            content = self.make_bytes(value)
+322:        self._container = [content]
+327:    def write(self, content):
+328:        self._container.append(self.make_bytes(content))
+331:        return len(self.content)
+334:        return self.content
+346:    A streaming HTTP response class with an iterator as content.
+350:    that wraps the original content (or yields entirely new content).
+355:    def __init__(self, streaming_content=(), *args, **kwargs):
+357:        # `streaming_content` should be an iterable of bytestrings.
+358:        # See the `streaming_content` property methods.
+359:        self.streaming_content = streaming_content
+362:    def content(self):
+364:            "This %s instance has no `content` attribute. Use "
+365:            "`streaming_content` instead." % self.__class__.__name__
+369:    def streaming_content(self):
+372:    @streaming_content.setter
+373:    def streaming_content(self, value):
+374:        self._set_streaming_content(value)
+376:    def _set_streaming_content(self, value):
+383:        return self.streaming_content
+386:        return b''.join(self.streaming_content)
+400:    def _set_streaming_content(self, value):
+403:            return super()._set_streaming_content(value)
+410:        super()._set_streaming_content(value)
+415:        Content-Disposition) based on the `filelike` response content.
+431:                content_type, encoding = mimetypes.guess_type(filename)
+434:                content_type = encoding_map.get(encoding, content_type)
+435:                self['Content-Type'] = content_type or 'application/octet-stream'
+463:        return '<%(cls)s status_code=%(status_code)d%(content_type)s, url="%(url)s">' % {
+466:            'content_type': self._content_type_for_repr,
+484:        del self['content-type']
+486:    @HttpResponse.content.setter
+487:    def content(self, value):
+489:            raise AttributeError("You cannot set content to a 304 (Not Modified) response")
+513:        return '<%(cls)s [%(methods)s] status_code=%(status_code)d%(content_type)s>' % {
+516:            'content_type': self._content_type_for_repr,
+
+
+Now let me look at the content setter and `make_bytes`.
+
+```bash-action
+sed -n '223,335p' /testbed/django/http/response.py
+```2026_09_21_09_39_1789983559
+executing输出     def make_bytes(self, value):
+        """Turn a value into a bytestring encoded in the output charset."""
+        # Per PEP 3333, this response body must be bytes. To avoid returning
+        # an instance of a subclass, this function returns `bytes(value)`.
+        # This doesn't make a copy when `value` already contains bytes.
+
+        # Handle string types -- we can't rely on force_bytes here because:
+        # - Python attempts str conversion first
+        # - when self._charset != 'utf-8' it re-encodes the content
+        if isinstance(value, bytes):
+            return bytes(value)
+        if isinstance(value, str):
+            return bytes(value.encode(self.charset))
+        # Handle non-string types.
+        return str(value).encode(self.charset)
+
+    # These methods partially implement the file-like object interface.
+    # See https://docs.python.org/library/io.html#io.IOBase
+
+    # The WSGI server must call this method upon completion of the request.
+    # See http://blog.dscpl.com.au/2012/10/obligations-for-calling-close-on.html
+    def close(self):
+        for closable in self._closable_objects:
+            try:
+                closable.close()
+            except Exception:
+                pass
+        self.closed = True
+        signals.request_finished.send(sender=self._handler_class)
+
+    def write(self, content):
+        raise OSError('This %s instance is not writable' % self.__class__.__name__)
+
+    def flush(self):
+        pass
+
+    def tell(self):
+        raise OSError('This %s instance cannot tell its position' % self.__class__.__name__)
+
+    # These methods partially implement a stream-like object interface.
+    # See https://docs.python.org/library/io.html#io.IOBase
+
+    def readable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    def writable(self):
+        return False
+
+    def writelines(self, lines):
+        raise OSError('This %s instance is not writable' % self.__class__.__name__)
+
+
+class HttpResponse(HttpResponseBase):
+    """
+    An HTTP response class with a string as content.
+
+    This content that can be read, appended to, or replaced.
+    """
+
+    streaming = False
+
+    def __init__(self, content=b'', *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Content is a bytestring. See the `content` property methods.
+        self.content = content
+
+    def __repr__(self):
+        return '<%(cls)s status_code=%(status_code)d%(content_type)s>' % {
+            'cls': self.__class__.__name__,
+            'status_code': self.status_code,
+            'content_type': self._content_type_for_repr,
+        }
+
+    def serialize(self):
+        """Full HTTP message, including headers, as a bytestring."""
+        return self.serialize_headers() + b'\r\n\r\n' + self.content
+
+    __bytes__ = serialize
+
+    @property
+    def content(self):
+        return b''.join(self._container)
+
+    @content.setter
+    def content(self, value):
+        # Consume iterators upon assignment to allow repeated iteration.
+        if hasattr(value, '__iter__') and not isinstance(value, (bytes, str)):
+            content = b''.join(self.make_bytes(chunk) for chunk in value)
+            if hasattr(value, 'close'):
+                try:
+                    value.close()
+                except Exception:
+                    pass
+        else:
+            content = self.make_bytes(value)
+        # Create a list of properly encoded bytestrings to support write().
+        self._container = [content]
+
+    def __iter__(self):
+        return iter(self._container)
+
+    def write(self, content):
+        self._container.append(self.make_bytes(content))
+
+    def tell(self):
+        return len(self.content)
+
+    def getvalue(self):
+        return self.content
+
+
+
+Found the root cause. In the `content.setter`, a `memoryview` has `__iter__` and is not `bytes`/`str`, so it goes into the iterate-and-join branch, iterating over ints and calling `make_bytes` on each int → producing `b'60 60 109 ...'` style. Actually wait, the issue output shows `b'<memory at ...>'`. That means `memoryview` does NOT have `__iter__`? Let's just confirm. Actually memoryview IS iterable. Let me write the minimal repro.
+
+Note the reported output `b'<memory at 0x...>'` comes from the non-iterable branch calling `str(value).encode()`. So in this Python, `hasattr(memoryview, '__iter__')` — it is iterable. But the bug output shows the repr. Regardless, the fix is to handle memoryview explicitly by converting to bytes.
+
+Let me reproduce.
+
+```bash-action
+cd /testbed && python -c "
+from django.http import HttpResponse
+r = HttpResponse(memoryview(b'My Content'))
+print(repr(r.content))
+"2026_09_21_09_39_1789983560
+```bash-action
+cd /testbed && python -c "
+from django.http import HttpResponse
+r = HttpResponse(memoryview(b'My Content'))
+print(repr(r.content))
+"
+```2026_09_21_09_39_1789983561
+executing输出 Traceback (most recent call last):
+  File "<string>", line 2, in <module>
+  File "/testbed/django/http/__init__.py", line 5, in <module>
+    from django.http.response import (
+  File "/testbed/django/http/response.py", line 15, in <module>
+    from django.core.serializers.json import DjangoJSONEncoder
+  File "/testbed/django/core/serializers/__init__.py", line 23, in <module>
+    from django.core.serializers.base import SerializerDoesNotExist
+  File "/testbed/django/core/serializers/base.py", line 7, in <module>
+    from django.db import models
+  File "/testbed/django/db/models/__init__.py", line 3, in <module>
+    from django.db.models.aggregates import *  # NOQA
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/models/aggregates.py", line 5, in <module>
+    from django.db.models.expressions import Case, Func, Star, When
+  File "/testbed/django/db/models/expressions.py", line 8, in <module>
+    from django.db.models import fields
+  File "/testbed/django/db/models/fields/__init__.py", line 11, in <module>
+    from django import forms
+  File "/testbed/django/forms/__init__.py", line 6, in <module>
+    from django.forms.boundfield import *  # NOQA
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/forms/boundfield.py", line 3, in <module>
+    from django.forms.utils import flatatt, pretty_name
+  File "/testbed/django/forms/utils.py", line 6, in <module>
+    from django.utils import timezone
+  File "/testbed/django/utils/timezone.py", line 11, in <module>
+    import pytz
+ModuleNotFoundError: No module named 'pytz'
+
+
+The environment needs Django settings setup. Let me use the test settings or set DJANGO_SETTINGS_MODULE. Also pytz is missing; let me check what's available.
+
+```bash-action
+cd /testbed && python -c "import django; print(django.VERSION)" && pip list 2>/dev/null | grep -i pytz
+```2026_09_21_09_39_1789983563
+executing输出 (3, 0, 0, 'alpha', 0)
+
+
+pytz is missing but this is Django 3.0. Let me check if the test runner works with a settings.configure approach avoiding pytz. Actually `django.utils.timezone` imports pytz at module top. Let me check.
+
+```bash-action
+sed -n '1,20p' /testbed/django/utils/timezone.py
+```2026_09_21_09_39_17899835632026_09_21_09_39_1789983563
+executing输出 """
+Timezone-related classes and functions.
+"""
+
+import functools
+import warnings
+from contextlib import ContextDecorator
+from datetime import datetime, timedelta, timezone, tzinfo
+from threading import local
+
+import pytz
+
+from django.conf import settings
+
+__all__ = [
+    'utc', 'get_fixed_timezone',
+    'get_default_timezone', 'get_default_timezone_name',
+    'get_current_timezone', 'get_current_timezone_name',
+    'activate', 'deactivate', 'override',
+
+
+pytz is required. Let me install it.
+
+```bash-action
+cd /testbed && pip install pytz 2>&1 | tail -3
+```2026_09_21_09_39_17899835652026_09_21_09_39_1789983565
+executing输出 Installing collected packages: pytz
+Successfully installed pytz-2026.3.post1
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+Now run the repro with settings configured.
+
+```bash-action
+cd /testbed && python -c "
+import django
+from django.conf import settings
+settings.configure()
+django.setup()
+from django.http import HttpResponse
+r = HttpResponse(memoryview(b'My Content'))
+print(repr(r.content))
+"
+```2026_09_21_09_39_17899835672026_09_21_09_39_1789983567
+executing输出 b'771213267111110116101110116'
+
+
+Bug confirmed: memoryview is iterable, so each byte int gets `make_bytes` → decimal string. Now let me fix the `make_bytes` (and/or content setter) to handle memoryview. The cleanest fix is in `make_bytes` to treat memoryview as bytes.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'django/http/response.py'
+s = open(p).read()
+old = """        if isinstance(value, bytes):
+            return bytes(value)
+        if isinstance(value, str):
+            return bytes(value.encode(self.charset))
+        # Handle non-string types.
+        return str(value).encode(self.charset)"""
+new = """        if isinstance(value, bytes):
+            return bytes(value)
+        if isinstance(value, str):
+            return bytes(value.encode(self.charset))
+        # Handle non-string types.
+        return str(value).encode(self.charset)"""
+EOF
+sed -n '310,322p' /testbed/django/http/response.py
+```2026_09_21_09_39_1789983569
+executing输出     def content(self, value):
+        # Consume iterators upon assignment to allow repeated iteration.
+        if hasattr(value, '__iter__') and not isinstance(value, (bytes, str)):
+            content = b''.join(self.make_bytes(chunk) for chunk in value)
+            if hasattr(value, 'close'):
+                try:
+                    value.close()
+                except Exception:
+                    pass
+        else:
+            content = self.make_bytes(value)
+        # Create a list of properly encoded bytestrings to support write().
+        self._container = [content]
+
+
+The best fix is in `make_bytes`: treat `memoryview` as bytes. But `make_bytes` is called per-chunk from the iterate branch (on ints), not on the memoryview itself. So I need to handle memoryview in the setter too. Let me update both: add `memoryview` to the bytes check in the setter, and handle it in `make_bytes`.
+
+Let me apply via a Python edit script.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+p = 'django/http/response.py'
+s = open(p).read()
+
+# Fix content setter: treat memoryview as non-iterable bytes-like
+old_setter = "        if hasattr(value, '__iter__') and not isinstance(value, (bytes, str)):"
+new_setter = "        if hasattr(value, '__iter__') and not isinstance(value, (bytes, str, memoryview)):"
+assert old_setter in s
+s = s.replace(old_setter, new_setter)
+
+# Fix make_bytes: handle memoryview
+old_mb = """        if isinstance(value, bytes):
+            return bytes(value)"""
+new_mb = """        if isinstance(value, memoryview):
+            return value.tobytes()
+        if isinstance(value, bytes):
+            return bytes(value)"""
+assert old_mb in s
+s = s.replace(old_mb, new_mb)
+
+open(p, 'w').write(s)
+print("done")
+EOF
+```2026_09_21_09_39_17899835702026_09_21_09_39_1789983571
+executing输出 done
+
+
+Now rerun the repro.
+
+```bash-action
+cd /testbed && python -c "
+import django
+from django.conf import settings
+settings.configure()
+django.setup()
+from django.http import HttpResponse
+print(repr(HttpResponse(memoryview(b'My Content')).content))
+print(repr(HttpResponse(memoryview(b'abc')).content))
+"
+```2026_09_21_09_39_17899835722026_09_21_09_39_1789983572
+executing输出 b'My Content'
+b'abc'
+
+
+Fixed. Now run the existing test file covering this module: `tests/httpwrappers/` or `tests/responses/`.
+
+```bash-action
+cd /testbed && ls tests/ | grep -i -E "response|http"
+```2026_09_21_09_39_17899835732026_09_21_09_39_1789983573
+executing输出 httpwrappers
+responses
+
+
+```bash-action
+cd /testbed && python tests/runtests.py responses.test_http -v1 2>&1 | tail -20
+```2026_09_21_09_39_17899835742026_09_21_09_39_17899835742026_09_21_09_39_1789983574
+executing输出 Traceback (most recent call last):
+  File "/testbed/tests/runtests.py", line 13, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python tests/runtests.py responses.test_http -v1 2>&1 | tail -20
+```2026_09_21_09_39_17899835752026_09_21_09_39_17899835752026_09_21_09_39_1789983575
+executing输出     self.db_table = truncate_name(self.db_table, connection.ops.max_name_length())
+                                                 ^^^^^^^^^^^^^^
+  File "/testbed/django/db/__init__.py", line 28, in __getattr__
+    return getattr(connections[DEFAULT_DB_ALIAS], item)
+                   ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/utils.py", line 201, in __getitem__
+    backend = load_backend(db['ENGINE'])
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/utils.py", line 110, in load_backend
+    return import_module('%s.base' % backend_name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/miniconda3/lib/python3.11/importlib/__init__.py", line 126, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/backends/sqlite3/base.py", line 29, in <module>
+    from .introspection import DatabaseIntrospection            # isort:skip
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/backends/sqlite3/introspection.py", line 4, in <module>
+    import sqlparse
+ModuleNotFoundError: No module named 'sqlparse'
+
+
+```bash-action
+cd /testbed && pip install sqlparse 2>&1 | tail -1
+```2026_09_21_09_39_17899835772026_09_21_09_39_17899835772026_09_21_09_39_1789983577
+executing输出 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python tests/runtests.py responses.test_http -v1 2>&1 | tail -20
+```2026_09_21_09_39_17899835782026_09_21_09_39_17899835782026_09_21_09_39_17899835782026_09_21_09_39_1789983578
+executing输出 E
+======================================================================
+ERROR: test_http (unittest.loader._FailedTest.test_http)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_http
+Traceback (most recent call last):
+  File "/opt/miniconda3/lib/python3.11/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'responses.test_http'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+Testing against Django installed in '/testbed/django' with up to 16 processes
+System check identified no issues (0 silenced).
+
+
+Wrong module name. Let me list the tests dir.
+
+```bash-action
+cd /testbed && ls tests/responses/ tests/httpwrappers/
+```2026_09_21_09_39_17899835802026_09_21_09_39_1789983581
+executing输出 tests/httpwrappers/:
+__init__.py
+abc.txt
+tests.py
+
+tests/responses/:
+__init__.py
+__pycache__
+test_cookie.py
+test_fileresponse.py
+tests.py
+
+
+The relevant test is `responses.tests`. Let me run it.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python tests/runtests.py responses.tests httpwrappers -v1 2>&1 | tail -20
+```2026_09_21_09_39_17899835812026_09_21_09_39_1789983581
+executing输出 Testing against Django installed in '/testbed/django' with up to 16 processes
+System check identified no issues (0 silenced).
+...............................................................................
+----------------------------------------------------------------------
+Ran 79 tests in 0.036s
+
+OK
+
+
+All 79 tests pass. Now git diff.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_39_17899835822026_09_21_09_39_17899835822026_09_21_09_39_1789983583
+executing输出 diff --git a/django/http/response.py b/django/http/response.py
+index 6a84e193ba..07273a3724 100755
+--- a/django/http/response.py
++++ b/django/http/response.py
+@@ -229,6 +229,8 @@ class HttpResponseBase:
+         # Handle string types -- we can't rely on force_bytes here because:
+         # - Python attempts str conversion first
+         # - when self._charset != 'utf-8' it re-encodes the content
++        if isinstance(value, memoryview):
++            return value.tobytes()
+         if isinstance(value, bytes):
+             return bytes(value)
+         if isinstance(value, str):
+@@ -309,7 +311,7 @@ class HttpResponse(HttpResponseBase):
+     @content.setter
+     def content(self, value):
+         # Consume iterators upon assignment to allow repeated iteration.
+-        if hasattr(value, '__iter__') and not isinstance(value, (bytes, str)):
++        if hasattr(value, '__iter__') and not isinstance(value, (bytes, str, memoryview)):
+             content = b''.join(self.make_bytes(chunk) for chunk in value)
+             if hasattr(value, 'close'):
+                 try:
+
+
+The diff is exactly what I intended: `memoryview` is now treated as bytes in `make_bytes`, and excluded from iterator consumption in the content setter. Repro confirmed fixed and all 79 existing tests pass.
+
+```bash-action
+exit
+```

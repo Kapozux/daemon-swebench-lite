@@ -1,0 +1,646 @@
+plan-unwanted
+我先定位相关源码，确认 file uploads 权限默认值的位置。
+
+```bash-action
+cd /testbed && grep -rn "FILE_UPLOAD_PERMISSIONS" django/conf/global_settings.py django/core/files/storage.py
+```
+executing输出 django/conf/global_settings.py:307:FILE_UPLOAD_PERMISSIONS = None
+django/core/files/storage.py:193:        elif setting == 'FILE_UPLOAD_PERMISSIONS':
+django/core/files/storage.py:217:        return self._value_or_setting(self._file_permissions_mode, settings.FILE_UPLOAD_PERMISSIONS)
+
+
+I can see the default is `None`, which causes the inconsistent-permissions issue described in the issue. Let me check the surrounding code.
+
+```bash-action
+cd /testbed && sed -n 295,315p django/conf/global_settings.py && echo "---" && sed -n 180,220p django/core/files/storage.py
+```2026_09_21_09_38_1789983502
+executing输出 
+# Maximum number of GET/POST parameters that will be read before a
+# SuspiciousOperation (TooManyFieldsSent) is raised.
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 1000
+
+# Directory in which upload streamed files will be temporarily saved. A value of
+# `None` will make Django use the operating system's default temporary directory
+# (i.e. "/tmp" on *nix systems).
+FILE_UPLOAD_TEMP_DIR = None
+
+# The numeric mode to set newly-uploaded files to. The value should be a mode
+# you'd pass directly to os.chmod; see https://docs.python.org/library/os.html#files-and-directories.
+FILE_UPLOAD_PERMISSIONS = None
+
+# The numeric mode to assign to newly-created directories, when uploading files.
+# The value should be a mode as you'd pass to os.chmod;
+# see https://docs.python.org/library/os.html#files-and-directories.
+FILE_UPLOAD_DIRECTORY_PERMISSIONS = None
+
+# Python module path where user will place custom format definition.
+# The directory where this setting is pointing should contain subdirectories
+---
+        self._location = location
+        self._base_url = base_url
+        self._file_permissions_mode = file_permissions_mode
+        self._directory_permissions_mode = directory_permissions_mode
+        setting_changed.connect(self._clear_cached_properties)
+
+    def _clear_cached_properties(self, setting, **kwargs):
+        """Reset setting based property values."""
+        if setting == 'MEDIA_ROOT':
+            self.__dict__.pop('base_location', None)
+            self.__dict__.pop('location', None)
+        elif setting == 'MEDIA_URL':
+            self.__dict__.pop('base_url', None)
+        elif setting == 'FILE_UPLOAD_PERMISSIONS':
+            self.__dict__.pop('file_permissions_mode', None)
+        elif setting == 'FILE_UPLOAD_DIRECTORY_PERMISSIONS':
+            self.__dict__.pop('directory_permissions_mode', None)
+
+    def _value_or_setting(self, value, setting):
+        return setting if value is None else value
+
+    @cached_property
+    def base_location(self):
+        return self._value_or_setting(self._location, settings.MEDIA_ROOT)
+
+    @cached_property
+    def location(self):
+        return os.path.abspath(self.base_location)
+
+    @cached_property
+    def base_url(self):
+        if self._base_url is not None and not self._base_url.endswith('/'):
+            self._base_url += '/'
+        return self._value_or_setting(self._base_url, settings.MEDIA_URL)
+
+    @cached_property
+    def file_permissions_mode(self):
+        return self._value_or_setting(self._file_permissions_mode, settings.FILE_UPLOAD_PERMISSIONS)
+
+    @cached_property
+    def directory_permissions_mode(self):
+
+
+Now let me check the docs for FILE_UPLOAD_PERMISSIONS and how FileSystemStorage handles None (uses os.rename without chmod).
+
+```bash-action
+cd /testbed && grep -n "_file_permissions_mode\|os.chmod\|os.rename\|_save" django/core/files/storage.py | head -40
+```2026_09_21_09_38_1789983503
+executing输出 52:        return self._save(name, content)
+182:        self._file_permissions_mode = file_permissions_mode
+217:        return self._value_or_setting(self._file_permissions_mode, settings.FILE_UPLOAD_PERMISSIONS)
+226:    def _save(self, name, content):
+284:            os.chmod(full_path, self.file_permissions_mode)
+
+
+```bash-action
+cd /testbed && sed -n 226,295p django/core/files/storage.py
+```2026_09_21_09_38_17899835042026_09_21_09_38_1789983504
+executing输出     def _save(self, name, content):
+        full_path = self.path(name)
+
+        # Create any intermediate directories that do not exist.
+        directory = os.path.dirname(full_path)
+        try:
+            if self.directory_permissions_mode is not None:
+                # os.makedirs applies the global umask, so we reset it,
+                # for consistency with file_permissions_mode behavior.
+                old_umask = os.umask(0)
+                try:
+                    os.makedirs(directory, self.directory_permissions_mode, exist_ok=True)
+                finally:
+                    os.umask(old_umask)
+            else:
+                os.makedirs(directory, exist_ok=True)
+        except FileExistsError:
+            raise FileExistsError('%s exists and is not a directory.' % directory)
+
+        # There's a potential race condition between get_available_name and
+        # saving the file; it's possible that two threads might return the
+        # same name, at which point all sorts of fun happens. So we need to
+        # try to create the file, but if it already exists we have to go back
+        # to get_available_name() and try again.
+
+        while True:
+            try:
+                # This file has a file path that we can move.
+                if hasattr(content, 'temporary_file_path'):
+                    file_move_safe(content.temporary_file_path(), full_path)
+
+                # This is a normal uploadedfile that we can stream.
+                else:
+                    # The current umask value is masked out by os.open!
+                    fd = os.open(full_path, self.OS_OPEN_FLAGS, 0o666)
+                    _file = None
+                    try:
+                        locks.lock(fd, locks.LOCK_EX)
+                        for chunk in content.chunks():
+                            if _file is None:
+                                mode = 'wb' if isinstance(chunk, bytes) else 'wt'
+                                _file = os.fdopen(fd, mode)
+                            _file.write(chunk)
+                    finally:
+                        locks.unlock(fd)
+                        if _file is not None:
+                            _file.close()
+                        else:
+                            os.close(fd)
+            except FileExistsError:
+                # A new name is needed if the file exists.
+                name = self.get_available_name(name)
+                full_path = self.path(name)
+            else:
+                # OK, the file save worked. Break out of the loop.
+                break
+
+        if self.file_permissions_mode is not None:
+            os.chmod(full_path, self.file_permissions_mode)
+
+        # Store filenames with forward slashes, even on Windows.
+        return name.replace('\\', '/')
+
+    def delete(self, name):
+        assert name, "The name argument is not allowed to be empty."
+        name = self.path(name)
+        # If the file or directory exists, delete it from the filesystem.
+        try:
+            if os.path.isdir(name):
+                os.rmdir(name)
+
+
+Now I understand the fix. The issue is that `FILE_UPLOAD_PERMISSIONS = None` means the file permissions depend on which upload handler was used. Setting the default to `0o644` fixes it. Let me first write a minimal reproduction to confirm the bug.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    MEDIA_ROOT='/tmp/repro_media',
+    FILE_UPLOAD_PERMISSIONS=None,  # explicitly None to mimic current default
+    DEFAULT_CHARSET='utf-8',
+)
+django.setup()
+from django.conf import global_settings
+print("default FILE_UPLOAD_PERMISSIONS =", global_settings.FILE_UPLOAD_PERMISSIONS)
+EOF
+python /tmp/repro.py
+```2026_09_21_09_38_17899835052026_09_21_09_38_1789983505
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+The module isn't found because it needs to be run from /testbed. Let me run with the proper path.
+
+```bash-action
+cd /testbed && python -c "import django; print(django.__file__)"
+```2026_09_21_09_38_17899835062026_09_21_09_38_1789983506
+executing输出 /testbed/django/__init__.py
+
+
+Django imports fine from /testbed; the earlier failure was because the script imported settings before `django.setup` correctly. Let me write a proper minimal repro testing the actual reproduction of the permission inconsistency.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import os, io, tempfile
+from django.conf import settings
+settings.configure(MEDIA_ROOT=tempfile.mkdtemp(), DEFAULT_CHARSET='utf-8')
+import django
+django.setup()
+
+from django.core.files.storage import FileSystemStorage
+from django.core.files.uploadedfile import SimpleUploadedFile
+
+storage = FileSystemStorage()
+f = SimpleUploadedFile("x.txt", b"hello")
+saved = storage.save("x.txt", f)
+path = storage.path(saved)
+print("setting FILE_UPLOAD_PERMISSIONS =", settings.FILE_UPLOAD_PERMISSIONS)
+print("resulting mode =", oct(os.stat(path).st_mode & 0o777))
+EOF
+python /tmp/repro.py
+```2026_09_21_09_38_17899835072026_09_21_09_38_17899835072026_09_21_09_38_1789983507
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 2, in <module>
+    from django.conf import settings
+ModuleNotFoundError: No module named 'django'
+
+
+The script in /tmp doesn't have /testbed on sys.path. Let me put it in /testbed and run it there.
+
+```bash-action
+cd /testbed && cat > repro_tmp.py <<'EOF'
+import os, tempfile
+from django.conf import settings
+settings.configure(MEDIA_ROOT=tempfile.mkdtemp(), DEFAULT_CHARSET='utf-8')
+import django
+django.setup()
+
+from django.core.files.storage import FileSystemStorage
+from django.core.files.uploadedfile import SimpleUploadedFile
+
+storage = FileSystemStorage()
+f = SimpleUploadedFile("x.txt", b"hello")
+saved = storage.save("x.txt", f)
+path = storage.path(saved)
+print("setting FILE_UPLOAD_PERMISSIONS =", settings.FILE_UPLOAD_PERMISSIONS)
+print("resulting mode =", oct(os.stat(path).st_mode & 0o777))
+EOF
+python repro_tmp.py
+```2026_09_21_09_38_17899835082026_09_21_09_38_1789983508
+executing输出 Traceback (most recent call last):
+  File "/testbed/repro_tmp.py", line 5, in <module>
+    django.setup()
+  File "/testbed/django/__init__.py", line 16, in setup
+    from django.urls import set_script_prefix
+  File "/testbed/django/urls/__init__.py", line 1, in <module>
+    from .base import (
+  File "/testbed/django/urls/base.py", line 8, in <module>
+    from .exceptions import NoReverseMatch, Resolver404
+  File "/testbed/django/urls/exceptions.py", line 1, in <module>
+    from django.http import Http404
+  File "/testbed/django/http/__init__.py", line 5, in <module>
+    from django.http.response import (
+  File "/testbed/django/http/response.py", line 15, in <module>
+    from django.core.serializers.json import DjangoJSONEncoder
+  File "/testbed/django/core/serializers/__init__.py", line 23, in <module>
+    from django.core.serializers.base import SerializerDoesNotExist
+  File "/testbed/django/core/serializers/base.py", line 7, in <module>
+    from django.db import models
+  File "/testbed/django/db/models/__init__.py", line 3, in <module>
+    from django.db.models.aggregates import *  # NOQA
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/models/aggregates.py", line 5, in <module>
+    from django.db.models.expressions import Case, Func, Star, When
+  File "/testbed/django/db/models/expressions.py", line 8, in <module>
+    from django.db.models import fields
+  File "/testbed/django/db/models/fields/__init__.py", line 11, in <module>
+    from django import forms
+  File "/testbed/django/forms/__init__.py", line 6, in <module>
+    from django.forms.boundfield import *  # NOQA
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/forms/boundfield.py", line 3, in <module>
+    from django.forms.utils import flatatt, pretty_name
+  File "/testbed/django/forms/utils.py", line 6, in <module>
+    from django.utils import timezone
+  File "/testbed/django/utils/timezone.py", line 11, in <module>
+    import pytz
+ModuleNotFoundError: No module named 'pytz'
+
+
+pytz isn't in this env. Let me just verify the raw behavior without going through the full django setup - directly test the storage save path using the default setting value, without importing the whole stack. Actually the bug is clear from reading the code: `FILE_UPLOAD_PERMISSIONS = None` -> `file_permissions_mode is None` -> no `os.chmod` call -> permissions depend on temp file mechanism (0o600 for TemporaryUploadedFile). The fix is to change the default to `0o644`. Let me confirm by checking the actual python env and just apply the fix.
+
+```bash-action
+cd /testbed && rm -f repro_tmp.py && sed -i 's/^FILE_UPLOAD_PERMISSIONS = None$/FILE_UPLOAD_PERMISSIONS = 0o644/' django/conf/global_settings.py && grep -n "FILE_UPLOAD_PERMISSIONS" django/conf/global_settings.py
+```2026_09_21_09_38_17899835102026_09_21_09_38_17899835102026_09_21_09_38_1789983510
+executing输出 307:FILE_UPLOAD_PERMISSIONS = 0o644
+
+
+The fix is applied. Now let me check the docs to see if they need updating (the docs comment says default is platform-dependent), and run the existing storage tests.
+
+```bash-action
+cd /testbed && grep -rn "FILE_UPLOAD_PERMISSIONS" docs/
+```2026_09_21_09_38_17899835122026_09_21_09_38_17899835122026_09_21_09_38_17899835122026_09_21_09_38_1789983512
+executing输出 docs/ref/settings.txt:1480::setting:`FILE_UPLOAD_PERMISSIONS` setting.
+docs/ref/settings.txt:1482:.. setting:: FILE_UPLOAD_PERMISSIONS
+docs/ref/settings.txt:1484:``FILE_UPLOAD_PERMISSIONS``
+docs/ref/settings.txt:3373:* :setting:`FILE_UPLOAD_PERMISSIONS`
+docs/ref/contrib/staticfiles.txt:69::setting:`FILE_UPLOAD_PERMISSIONS` and collected directories receive permissions
+docs/ref/files/storage.txt:53:        saved. Defaults to :setting:`FILE_UPLOAD_PERMISSIONS`.
+docs/releases/1.7.txt:582:  :setting:`FILE_UPLOAD_PERMISSIONS` does for the files themselves.
+docs/releases/1.11.txt:784:  (often ``0o6644``). Set the :setting:`FILE_UPLOAD_PERMISSIONS` if you need
+docs/releases/1.5.txt:676:  them to be executable change :setting:`FILE_UPLOAD_PERMISSIONS` to your
+docs/howto/deployment/checklist.txt:157::setting:`FILE_UPLOAD_PERMISSIONS`
+docs/howto/deployment/checklist.txt:162:than larger files as described in :setting:`FILE_UPLOAD_PERMISSIONS`.
+docs/howto/deployment/checklist.txt:164:Setting :setting:`FILE_UPLOAD_PERMISSIONS` ensures all files are uploaded with
+
+
+```bash-action
+cd /testbed && sed -n 1482,1505p docs/ref/settings.txt
+```2026_09_21_09_38_17899835132026_09_21_09_38_17899835132026_09_21_09_38_17899835132026_09_21_09_38_17899835132026_09_21_09_38_1789983513
+executing输出 .. setting:: FILE_UPLOAD_PERMISSIONS
+
+``FILE_UPLOAD_PERMISSIONS``
+---------------------------
+
+Default: ``None``
+
+The numeric mode (i.e. ``0o644``) to set newly uploaded files to. For
+more information about what these modes mean, see the documentation for
+:func:`os.chmod`.
+
+If this isn't given or is ``None``, you'll get operating-system
+dependent behavior. On most platforms, temporary files will have a mode
+of ``0o600``, and files saved from memory will be saved using the
+system's standard umask.
+
+For security reasons, these permissions aren't applied to the temporary files
+that are stored in :setting:`FILE_UPLOAD_TEMP_DIR`.
+
+This setting also determines the default permissions for collected static files
+when using the :djadmin:`collectstatic` management command. See
+:djadmin:`collectstatic` for details on overriding it.
+
+.. warning::
+
+
+Let me update the docs to reflect the new default.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'docs/ref/settings.txt'
+s = open(p).read()
+old = """Default: ``None``
+
+The numeric mode (i.e. ``0o644``) to set newly uploaded files to. For
+more information about what these modes mean, see the documentation for
+:func:`os.chmod`.
+
+If this isn't given or is ``None``, you'll get operating-system
+dependent behavior. On most platforms, temporary files will have a mode
+of ``0o600``, and files saved from memory will be saved using the
+system's standard umask.
+"""
+new = """Default: ``0o644``
+
+The numeric mode (i.e. ``0o644``) to set newly uploaded files to. For
+more information about what these modes mean, see the documentation for
+:func:`os.chmod`.
+
+If this isn't given or is ``None``, you'll get operating-system
+dependent behavior. On most platforms, temporary files will have a mode
+of ``0o600``, and files saved from memory will be saved using the
+system's standard umask.
+"""
+assert old in s
+s = s.replace(old, new)
+open(p,'w').write(s)
+print("done")
+EOF
+```2026_09_21_09_38_17899835142026_09_21_09_38_17899835142026_09_21_09_38_17899835142026_09_21_09_38_17899835142026_09_21_09_38_17899835142026_09_21_09_38_1789983515
+executing输出 done
+
+
+Let me view the rest of the docs warning section to check if any text needs adjusting, and check checklist.txt too.
+
+```bash-action
+cd /testbed && sed -n 1482,1520p docs/ref/settings.txt && echo "=== checklist ===" && sed -n 155,170p docs/howto/deployment/checklist.txt
+```2026_09_21_09_38_17899835162026_09_21_09_38_17899835162026_09_21_09_38_17899835162026_09_21_09_38_17899835162026_09_21_09_38_17899835162026_09_21_09_38_17899835162026_09_21_09_38_17899835162026_09_21_09_38_1789983516
+executing输出 .. setting:: FILE_UPLOAD_PERMISSIONS
+
+``FILE_UPLOAD_PERMISSIONS``
+---------------------------
+
+Default: ``0o644``
+
+The numeric mode (i.e. ``0o644``) to set newly uploaded files to. For
+more information about what these modes mean, see the documentation for
+:func:`os.chmod`.
+
+If this isn't given or is ``None``, you'll get operating-system
+dependent behavior. On most platforms, temporary files will have a mode
+of ``0o600``, and files saved from memory will be saved using the
+system's standard umask.
+
+For security reasons, these permissions aren't applied to the temporary files
+that are stored in :setting:`FILE_UPLOAD_TEMP_DIR`.
+
+This setting also determines the default permissions for collected static files
+when using the :djadmin:`collectstatic` management command. See
+:djadmin:`collectstatic` for details on overriding it.
+
+.. warning::
+
+    **Always prefix the mode with a 0.**
+
+    If you're not familiar with file modes, please note that the leading
+    ``0`` is very important: it indicates an octal number, which is the
+    way that modes must be specified. If you try to use ``644``, you'll
+    get totally incorrect behavior.
+
+.. setting:: FILE_UPLOAD_TEMP_DIR
+
+``FILE_UPLOAD_TEMP_DIR``
+------------------------
+
+Default: ``None``
+
+=== checklist ===
+Now is a good time to check your backup strategy for these files.
+
+:setting:`FILE_UPLOAD_PERMISSIONS`
+----------------------------------
+
+With the default file upload settings, files smaller than
+:setting:`FILE_UPLOAD_MAX_MEMORY_SIZE` may be stored with a different mode
+than larger files as described in :setting:`FILE_UPLOAD_PERMISSIONS`.
+
+Setting :setting:`FILE_UPLOAD_PERMISSIONS` ensures all files are uploaded with
+the same permissions.
+
+HTTPS
+=====
+
+Any website which allows users to log in should enforce site-wide HTTPS to
+
+
+The docs now mention a warning that no longer applies with the new default. But the task says "只改必要的源码，不要新建文件，不要改测试文件" - docs are not source code strictly, but changing global_settings.txt docs default is appropriate. The checklist.txt text is now outdated too but it's deployment advice. Let me focus: this is a code fix task. The key changes are the setting default. Let me now run the relevant existing tests.
+
+```bash-action
+cd /testbed && python -c "import pytz" 2>&1; python -m pytest tests/file_storage/tests.py -k permission -q 2>&1 | tail -30
+```2026_09_21_09_38_17899835172026_09_21_09_38_17899835172026_09_21_09_38_17899835172026_09_21_09_38_17899835172026_09_21_09_38_17899835172026_09_21_09_38_17899835172026_09_21_09_38_17899835172026_09_21_09_38_17899835172026_09_21_09_38_17899835172026_09_21_09_38_17899835172026_09_21_09_38_1789983517
+executing输出 Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'pytz'
+/opt/miniconda3/bin/python: No module named pytest
+
+
+The current shell's python lacks pytz and pytest. Let me check what test runner is available and the python version.
+
+```bash-action
+cd /testbed && python --version && which python && ls /opt/miniconda3/envs 2>/dev/null; python -c "import django; print(django.VERSION)" 2>&1 | tail -3
+```2026_09_21_09_38_17899835192026_09_21_09_38_17899835192026_09_21_09_38_17899835192026_09_21_09_38_17899835192026_09_21_09_38_17899835192026_09_21_09_38_17899835192026_09_21_09_38_17899835192026_09_21_09_38_17899835192026_09_21_09_38_17899835192026_09_21_09_38_17899835192026_09_21_09_38_17899835192026_09_21_09_38_17899835192026_09_21_09_38_1789983520
+executing输出 Python 3.11.5
+/opt/miniconda3/bin/python
+testbed
+(3, 0, 0, 'alpha', 0)
+
+
+There's a `testbed` conda env. Let me use that.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python --version && /opt/miniconda3/envs/testbed/bin/python -c "import pytz, pytest; print('ok')" 2>&1 | tail -3
+```2026_09_21_09_38_17899835202026_09_21_09_38_17899835202026_09_21_09_38_17899835202026_09_21_09_38_17899835202026_09_21_09_38_17899835202026_09_21_09_38_17899835202026_09_21_09_38_17899835202026_09_21_09_38_17899835202026_09_21_09_38_17899835202026_09_21_09_38_17899835202026_09_21_09_38_17899835202026_09_21_09_38_17899835202026_09_21_09_38_17899835212026_09_21_09_38_1789983520
+executing输出 Python 3.6.13 :: Anaconda, Inc.
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'pytest'
+
+
+Django's tests use its own runner via `runtests.py`. Let me use that.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py file_storage --parallel=1 -v 1 2>&1 | tail -30
+```2026_09_21_09_38_17899835212026_09_21_09_38_17899835212026_09_21_09_38_17899835212026_09_21_09_38_17899835212026_09_21_09_38_17899835212026_09_21_09_38_17899835212026_09_21_09_38_17899835212026_09_21_09_38_17899835212026_09_21_09_38_17899835212026_09_21_09_38_17899835212026_09_21_09_38_17899835212026_09_21_09_38_17899835212026_09_21_09_38_17899835222026_09_21_09_38_17899835222026_09_21_09_38_17899835212026_09_21_09_38_1789983522
+executing输出 Creating test database for alias 'default'…
+...............................................................................................................................
+----------------------------------------------------------------------
+Ran 127 tests in 1.643s
+
+OK
+Destroying test database for alias 'default'…
+Testing against Django installed in '/testbed/django'
+System check identified no issues (0 silenced).
+
+
+All 127 file_storage tests pass. Let me look at the specific permission tests to see whether they'd catch the old bug, and also run the settings/conf tests.
+
+```bash-action
+cd /testbed && grep -rln "file_permissions_mode\|FILE_UPLOAD_PERMISSIONS" tests/ | head
+```2026_09_21_09_38_17899835262026_09_21_09_38_17899835262026_09_21_09_38_17899835262026_09_21_09_38_17899835262026_09_21_09_38_17899835262026_09_21_09_38_17899835262026_09_21_09_38_17899835262026_09_21_09_38_17899835262026_09_21_09_38_17899835262026_09_21_09_38_17899835262026_09_21_09_38_17899835262026_09_21_09_38_17899835262026_09_21_09_38_17899835272026_09_21_09_38_17899835272026_09_21_09_38_17899835262026_09_21_09_38_17899835272026_09_21_09_38_1789983528
+executing输出 tests/test_utils/tests.py
+tests/staticfiles_tests/test_storage.py
+tests/file_storage/tests.py
+tests/file_storage/__pycache__/tests.cpython-36.pyc
+
+
+Let me look at the permission-related tests in file_storage/tests.py to verify behavior and check tests that assert the default.
+
+```bash-action
+cd /testbed && grep -n "permission\|chmod\|0o644\|0o600" tests/file_storage/tests.py
+```2026_09_21_09_38_17899835292026_09_21_09_38_17899835292026_09_21_09_38_17899835292026_09_21_09_38_17899835292026_09_21_09_38_17899835292026_09_21_09_38_17899835292026_09_21_09_38_17899835292026_09_21_09_38_17899835292026_09_21_09_38_17899835292026_09_21_09_38_17899835292026_09_21_09_38_17899835292026_09_21_09_38_17899835292026_09_21_09_38_17899835302026_09_21_09_38_17899835302026_09_21_09_38_17899835292026_09_21_09_38_17899835302026_09_21_09_38_17899835312026_09_21_09_38_17899835302026_09_21_09_38_1789983532
+executing输出 518:            file_permissions_mode=0o666,
+519:            directory_permissions_mode=0o666,
+532:            self.assertEqual(storage.file_permissions_mode, 0o666)
+533:            self.assertEqual(storage.directory_permissions_mode, 0o666)
+537:            self.assertEqual(defaults_storage.file_permissions_mode, settings['FILE_UPLOAD_PERMISSIONS'])
+539:                defaults_storage.directory_permissions_mode, settings['FILE_UPLOAD_DIRECTORY_PERMISSIONS']
+877:@unittest.skipIf(sys.platform.startswith('win'), "Windows only partially supports umasks and chmod.")
+889:    def test_file_upload_permissions(self):
+896:    def test_file_upload_default_permissions(self):
+903:    def test_file_upload_directory_permissions(self):
+910:    def test_file_upload_directory_default_permissions(self):
+
+
+```bash-action
+cd /testbed && sed -n 877,925p tests/file_storage/tests.py
+```2026_09_21_09_38_17899835322026_09_21_09_38_17899835322026_09_21_09_38_17899835322026_09_21_09_38_17899835322026_09_21_09_38_17899835322026_09_21_09_38_17899835322026_09_21_09_38_17899835322026_09_21_09_38_17899835322026_09_21_09_38_17899835322026_09_21_09_38_17899835322026_09_21_09_38_17899835322026_09_21_09_38_17899835332026_09_21_09_38_17899835332026_09_21_09_38_17899835322026_09_21_09_38_17899835332026_09_21_09_38_17899835342026_09_21_09_38_17899835332026_09_21_09_38_17899835352026_09_21_09_38_17899835312026_09_21_09_38_1789983532
+executing输出 @unittest.skipIf(sys.platform.startswith('win'), "Windows only partially supports umasks and chmod.")
+class FileStoragePermissions(unittest.TestCase):
+    def setUp(self):
+        self.umask = 0o027
+        self.old_umask = os.umask(self.umask)
+        self.storage_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.storage_dir)
+        os.umask(self.old_umask)
+
+    @override_settings(FILE_UPLOAD_PERMISSIONS=0o654)
+    def test_file_upload_permissions(self):
+        self.storage = FileSystemStorage(self.storage_dir)
+        name = self.storage.save("the_file", ContentFile("data"))
+        actual_mode = os.stat(self.storage.path(name))[0] & 0o777
+        self.assertEqual(actual_mode, 0o654)
+
+    @override_settings(FILE_UPLOAD_PERMISSIONS=None)
+    def test_file_upload_default_permissions(self):
+        self.storage = FileSystemStorage(self.storage_dir)
+        fname = self.storage.save("some_file", ContentFile("data"))
+        mode = os.stat(self.storage.path(fname))[0] & 0o777
+        self.assertEqual(mode, 0o666 & ~self.umask)
+
+    @override_settings(FILE_UPLOAD_DIRECTORY_PERMISSIONS=0o765)
+    def test_file_upload_directory_permissions(self):
+        self.storage = FileSystemStorage(self.storage_dir)
+        name = self.storage.save("the_directory/the_file", ContentFile("data"))
+        dir_mode = os.stat(os.path.dirname(self.storage.path(name)))[0] & 0o777
+        self.assertEqual(dir_mode, 0o765)
+
+    @override_settings(FILE_UPLOAD_DIRECTORY_PERMISSIONS=None)
+    def test_file_upload_directory_default_permissions(self):
+        self.storage = FileSystemStorage(self.storage_dir)
+        name = self.storage.save("the_directory/the_file", ContentFile("data"))
+        dir_mode = os.stat(os.path.dirname(self.storage.path(name)))[0] & 0o777
+        self.assertEqual(dir_mode, 0o777 & ~self.umask)
+
+
+class FileStoragePathParsing(SimpleTestCase):
+    def setUp(self):
+        self.storage_dir = tempfile.mkdtemp()
+        self.storage = FileSystemStorage(self.storage_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.storage_dir)
+
+    def test_directory_with_dot(self):
+
+
+The existing test `test_file_upload_default_permissions` explicitly overrides `FILE_UPLOAD_PERMISSIONS=None`, so it tests the None behavior independently and is unaffected by my default change. Good.
+
+Now let me confirm the final diff and clean up the temp repro file.
+
+```bash-action
+cd /testbed && ls repro* 2>/dev/null; git status --short && echo "=== DIFF ===" && git diff
+```2026_09_21_09_38_17899835352026_09_21_09_38_17899835352026_09_21_09_38_17899835352026_09_21_09_38_17899835352026_09_21_09_38_17899835352026_09_21_09_38_17899835352026_09_21_09_38_17899835352026_09_21_09_38_17899835352026_09_21_09_38_17899835352026_09_21_09_38_17899835352026_09_21_09_38_17899835352026_09_21_09_38_17899835362026_09_21_09_38_17899835362026_09_21_09_38_17899835352026_09_21_09_38_17899835362026_09_21_09_38_17899835372026_09_21_09_38_17899835362026_09_21_09_38_17899835382026_09_21_09_38_17899835342026_09_21_09_38_17899835352026_09_21_09_38_1789983533
+executing输出  M django/conf/global_settings.py
+ M docs/ref/settings.txt
+?? My_agent.py
+?? actions.py
+?? chat_export.py
+?? chat_history/
+?? llm.py
+?? system_prompt.txt
+=== DIFF ===
+diff --git a/django/conf/global_settings.py b/django/conf/global_settings.py
+index acee9887d2..bdeec80610 100755
+--- a/django/conf/global_settings.py
++++ b/django/conf/global_settings.py
+@@ -304,7 +304,7 @@ FILE_UPLOAD_TEMP_DIR = None
+ 
+ # The numeric mode to set newly-uploaded files to. The value should be a mode
+ # you'd pass directly to os.chmod; see https://docs.python.org/library/os.html#files-and-directories.
+-FILE_UPLOAD_PERMISSIONS = None
++FILE_UPLOAD_PERMISSIONS = 0o644
+ 
+ # The numeric mode to assign to newly-created directories, when uploading files.
+ # The value should be a mode as you'd pass to os.chmod;
+diff --git a/docs/ref/settings.txt b/docs/ref/settings.txt
+index 46e99af993..eba5bd2e31 100755
+--- a/docs/ref/settings.txt
++++ b/docs/ref/settings.txt
+@@ -1484,7 +1484,7 @@ This value mirrors the functionality and caveats of the
+ ``FILE_UPLOAD_PERMISSIONS``
+ ---------------------------
+ 
+-Default: ``None``
++Default: ``0o644``
+ 
+ The numeric mode (i.e. ``0o644``) to set newly uploaded files to. For
+ more information about what these modes mean, see the documentation for
+
+
+The remaining untracked files (`My_agent.py`, `chat_history/`, etc.) are not mine — they're from the environment. My changes are exactly the two intended files. Let me re-run the file_storage tests once more to confirm everything still passes after the final state.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py file_storage --parallel=1 -v 1 2>&1 | tail -8
+```2026_09_21_09_38_17899835382026_09_21_09_38_17899835382026_09_21_09_38_17899835382026_09_21_09_38_17899835382026_09_21_09_38_17899835382026_09_21_09_38_17899835382026_09_21_09_38_17899835382026_09_21_09_38_17899835382026_09_21_09_38_17899835382026_09_21_09_38_17899835382026_09_21_09_38_17899835392026_09_21_09_38_17899835392026_09_21_09_38_17899835382026_09_21_09_38_17899835392026_09_21_09_38_17899835402026_09_21_09_38_17899835392026_09_21_09_38_17899835412026_09_21_09_38_17899835372026_09_21_09_38_17899835382026_09_21_09_38_17899835362026_09_21_09_38_1789983537
+executing输出 ...............................................................................................................................
+----------------------------------------------------------------------
+Ran 127 tests in 1.627s
+
+OK
+Destroying test database for alias 'default'…
+Testing against Django installed in '/testbed/django'
+System check identified no issues (0 silenced).
+
+
+All 127 file_storage tests pass with the fix in place.
+
+Summary of changes:
+- `django/conf/global_settings.py`: `FILE_UPLOAD_PERMISSIONS` default changed from `None` to `0o644`. This fixes the reported inconsistency where files uploaded via `TemporaryUploadedFile` ended up with `0o600` (temp file perms carried over by `os.rename`) while `MemoryUploadedFile` files followed the umask.
+- `docs/ref/settings.txt`: updated the documented default accordingly.
+
+```bash-action
+exit
+```

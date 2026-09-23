@@ -1,0 +1,621 @@
+plan-unwanted
+I'll start by exploring the issue. Let me look at the relevant source code.
+
+```bash-action
+cd /testbed && sed -n '1100,1140p' django/db/models/sql/query.py
+```
+
+Let me read the plan first. Actually, per the agent protocol, let me present a plan.
+
+**Plan:**
+1. Locate `check_filterable` in `django/db/models/sql/query.py` and the `filterable` attribute handling in `django/db/models/fields/__init__.py` / `django/db/models/query_utils.py`.
+2. The root cause: `filterable=False` is a *field* attribute on the RHS model, but `check_filterable` is being applied to the whole related model when a FK value is compared — actually it's applied to the field being filtered. Since `ProductMetaDataType` has a field named `filterable`, and the model gets `filterable` attribute resolution, the issue is likely that `filterable` is resolved via `getattr(model, 'filterable', True)` on an *instance* of the related model, picking up the model field.
+3. Fix: check the `filterable` attribute more precisely (only on the field-like object / use the model's resolved attribute safely).
+4. Verify with a minimal reproduction, then run existing tests.
+
+Shall I proceed?
+executing输出             if not check_rel_lookup_compatibility(value._meta.model, opts, field):
+                raise ValueError(
+                    'Cannot query "%s": Must be "%s" instance.' %
+                    (value, opts.object_name))
+
+    def check_related_objects(self, field, value, opts):
+        """Check the type of object passed to query relations."""
+        if field.is_relation:
+            # Check that the field and the queryset use the same model in a
+            # query like .filter(author=Author.objects.all()). For example, the
+            # opts would be Author's (from the author field) and value.model
+            # would be Author.objects.all() queryset's .model (Author also).
+            # The field is the related field on the lhs side.
+            if (isinstance(value, Query) and not value.has_select_fields and
+                    not check_rel_lookup_compatibility(value.model, opts, field)):
+                raise ValueError(
+                    'Cannot use QuerySet for "%s": Use a QuerySet for "%s".' %
+                    (value.model._meta.object_name, opts.object_name)
+                )
+            elif hasattr(value, '_meta'):
+                self.check_query_object_type(value, opts, field)
+            elif hasattr(value, '__iter__'):
+                for v in value:
+                    self.check_query_object_type(v, opts, field)
+
+    def check_filterable(self, expression):
+        """Raise an error if expression cannot be used in a WHERE clause."""
+        if not getattr(expression, 'filterable', True):
+            raise NotSupportedError(
+                expression.__class__.__name__ + ' is disallowed in the filter '
+                'clause.'
+            )
+        if hasattr(expression, 'get_source_expressions'):
+            for expr in expression.get_source_expressions():
+                self.check_filterable(expr)
+
+    def build_lookup(self, lookups, lhs, rhs):
+        """
+        Try to extract transforms and lookup from given lhs.
+
+        The lhs value is something that works like SQLExpression.
+
+
+**Found the root cause.**
+
+In `check_filterable`, it does `getattr(expression, 'filterable', True)`. When the RHS is a model *instance* (e.g. `self.brand_metadata` which is a `ProductMetaDataType`), the expression passed here (the RHS value) is that model instance. Since `ProductMetaDataType` has a *field* named `filterable` (a BooleanField), `getattr(instance, 'filterable')` returns the field's value — and Django model fields named `filterable` shadow... actually the instance attribute lookup returns the BooleanField's value (`False` by default), so `check_filterable` raises `NotSupportedError`.
+
+The fix: only check `filterable` on expression objects that are genuine query expressions (have `resolve_expression`/are `BaseExpression`), not on plain model instances used as RHS values. Let me look at the broader context and how it's called.
+
+```bash-action
+cd /testbed && git log --oneline -1 && sed -n '1240,1290p' django/db/models/sql/query.py
+```
+
+Let me plan this properly.
+
+**Plan:**
+1. Inspect `build_filter` to see where `check_filterable` is invoked on the RHS value, confirming the RHS model instance is being passed.
+2. The minimal fix is in `check_filterable`: skip non-expression objects (model instances / plain values). A robust approach is to only raise for objects where `filterable` is a genuine expression-level flag — but simplest correct fix aligned with upstream: check `filterable` only when the expression is not a plain value. Actually upstream Django fixed this by making the model-instance RHS be resolved before the check, or by not treating model instance attributes.
+
+Let me look at `build_filter` first before deciding.
+
+```bash-action
+cd /testbed && sed -n '1225,1275p' django/db/models/sql/query.py
+```
+executing输出 d7c675aaf5 SWE-bench
+                allow_joins=allow_joins,
+                split_subq=split_subq,
+                check_filterable=check_filterable,
+            )
+        if hasattr(filter_expr, 'resolve_expression'):
+            if not getattr(filter_expr, 'conditional', False):
+                raise TypeError('Cannot filter against a non-conditional expression.')
+            condition = self.build_lookup(
+                ['exact'], filter_expr.resolve_expression(self, allow_joins=allow_joins), True
+            )
+            clause = self.where_class()
+            clause.add(condition, AND)
+            return clause, []
+        arg, value = filter_expr
+        if not arg:
+            raise FieldError("Cannot parse keyword query %r" % arg)
+        lookups, parts, reffed_expression = self.solve_lookup_type(arg)
+
+        if check_filterable:
+            self.check_filterable(reffed_expression)
+
+        if not allow_joins and len(parts) > 1:
+            raise FieldError("Joined field references are not permitted in this query")
+
+        pre_joins = self.alias_refcount.copy()
+        value = self.resolve_lookup_value(value, can_reuse, allow_joins)
+        used_joins = {k for k, v in self.alias_refcount.items() if v > pre_joins.get(k, 0)}
+
+        if check_filterable:
+            self.check_filterable(value)
+
+        clause = self.where_class()
+        if reffed_expression:
+            condition = self.build_lookup(lookups, reffed_expression, value)
+            clause.add(condition, AND)
+            return clause, []
+
+        opts = self.get_meta()
+        alias = self.get_initial_alias()
+        allow_many = not branch_negated or not split_subq
+
+        try:
+            join_info = self.setup_joins(
+                parts, opts, alias, can_reuse=can_reuse, allow_many=allow_many,
+                reuse_with_filtered_relation=reuse_with_filtered_relation,
+            )
+
+            # Prevent iterator from being consumed by check_related_objects()
+            if isinstance(value, Iterator):
+                value = list(value)
+            self.check_related_objects(join_info.final_field, value, join_info.opts)
+
+
+**Confirmed the root cause.** In `build_filter`, `check_filterable(value)` is called on `value`, where `value` is the RHS. When the RHS is a model instance (e.g. `metadata_type=self.brand_metadata`), `resolve_lookup_value` turns it into that instance, and `getattr(instance, 'filterable', True)` picks up the model's `BooleanField` named `filterable`, returning `False` → `NotSupportedError`.
+
+The correct fix: `filterable=False` is only meaningful on *query expressions* (things with `resolve_expression`), not on model instances / plain values.
+
+```bash-action
+cd /testbed && grep -rn "filterable" django/db/models/ --include=*.py
+```2026_09_21_09_46_1789983993
+executing输出 django/db/models/expressions.py:159:    filterable = True
+django/db/models/expressions.py:1205:    filterable = False
+django/db/models/sql/query.py:1125:    def check_filterable(self, expression):
+django/db/models/sql/query.py:1127:        if not getattr(expression, 'filterable', True):
+django/db/models/sql/query.py:1134:                self.check_filterable(expr)
+django/db/models/sql/query.py:1203:                     reuse_with_filtered_relation=False, check_filterable=True):
+django/db/models/sql/query.py:1242:                check_filterable=check_filterable,
+django/db/models/sql/query.py:1258:        if check_filterable:
+django/db/models/sql/query.py:1259:            self.check_filterable(reffed_expression)
+django/db/models/sql/query.py:1268:        if check_filterable:
+django/db/models/sql/query.py:1269:            self.check_filterable(value)
+django/db/models/sql/query.py:1366:               check_filterable=True):
+django/db/models/sql/query.py:1378:                split_subq=split_subq, check_filterable=check_filterable,
+django/db/models/query_utils.py:105:            check_filterable=False,
+
+
+Now let me reproduce the bug minimally.
+
+```bash-action
+cd /testbed && sed -n '1120,1136p' django/db/models/sql/query.py
+```
+
+Let me write a minimal reproduction and confirm the bug exists.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+)
+django.setup()
+
+from django.db import models, connection
+
+
+class ProductMetaDataType(models.Model):
+    label = models.CharField(max_length=255, unique=True)
+    filterable = models.BooleanField(default=False)
+    class Meta:
+        app_label = 'auth'
+
+
+class ProductMetaData(models.Model):
+    value = models.TextField()
+    metadata_type = models.ForeignKey(ProductMetaDataType, on_delete=models.CASCADE)
+    class Meta:
+        app_label = 'auth'
+
+
+with connection.schema_editor() as se:
+    se.create_model(ProductMetaDataType)
+    se.create_model(ProductMetaData)
+
+mt = ProductMetaDataType.objects.create(label='x', filterable=False)
+qs = ProductMetaData.objects.filter(value="Dark Vador", metadata_type=mt)
+print("OK:", qs.query)
+EOF
+python /tmp/repro.py
+```2026_09_21_09_46_1789983997
+executing输出                 self.check_query_object_type(value, opts, field)
+            elif hasattr(value, '__iter__'):
+                for v in value:
+                    self.check_query_object_type(v, opts, field)
+
+    def check_filterable(self, expression):
+        """Raise an error if expression cannot be used in a WHERE clause."""
+        if not getattr(expression, 'filterable', True):
+            raise NotSupportedError(
+                expression.__class__.__name__ + ' is disallowed in the filter '
+                'clause.'
+            )
+        if hasattr(expression, 'get_source_expressions'):
+            for expr in expression.get_source_expressions():
+                self.check_filterable(expr)
+
+    def build_lookup(self, lookups, lhs, rhs):
+
+
+The `sed` output came out but I didn't see the repro result. Let me run it separately.
+
+```bash-action
+cd /testbed && python /tmp/repro.py
+```2026_09_21_09_46_17899840012026_09_21_09_46_1789983998
+executing输出 python: can't open file '/tmp/repro.py': [Errno 2] No such file or directory
+
+
+The heredoc didn't persist. Let me write the file with python instead.
+
+```bash-action
+cd /testbed && cat > /testbed/repro_check_filterable.py << 'PYEOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+)
+django.setup()
+
+from django.db import models, connection
+
+
+class ProductMetaDataType(models.Model):
+    label = models.CharField(max_length=255, unique=True)
+    filterable = models.BooleanField(default=False)
+    class Meta:
+        app_label = 'auth'
+
+
+class ProductMetaData(models.Model):
+    value = models.TextField()
+    metadata_type = models.ForeignKey(ProductMetaDataType, on_delete=models.CASCADE)
+    class Meta:
+        app_label = 'auth'
+
+
+with connection.schema_editor() as se:
+    se.create_model(ProductMetaDataType)
+    se.create_model(ProductMetaData)
+
+mt = ProductMetaDataType.objects.create(label='x', filterable=False)
+qs = ProductMetaData.objects.filter(value="Dark Vador", metadata_type=mt)
+print("OK:", qs.query)
+PYEOF
+python /testbed/repro_check_filterable.py
+```
+executing输出 Traceback (most recent call last):
+  File "/testbed/repro_check_filterable.py", line 2, in <module>
+    from django.conf import settings
+  File "/testbed/django/conf/__init__.py", line 19, in <module>
+    from django.core.validators import URLValidator
+  File "/testbed/django/core/validators.py", line 8, in <module>
+    from django.utils.encoding import punycode
+  File "/testbed/django/utils/encoding.py", line 8, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+Wrong python env — `/testbed` python isn't the configured one for that cwd. Let me find the right interpreter.
+
+```bash-action
+cd /testbed && which python python3; python -c "import django; print(django.__file__)" 2>&1 | head; ls /opt/conda/envs 2>/dev/null; pip show asgiref 2>&1 | head -3
+```2026_09_21_09_46_1789984001
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python3
+/testbed/django/__init__.py
+WARNING: Package(s) not found: asgiref
+
+
+`asgiref` isn't installed for this python. Let me run the repro via the test runner instead, or find another python.
+
+```bash-action
+cd /testbed && ls /usr/bin/python3* 2>/dev/null; for p in /usr/bin/python3 /opt/miniconda3/envs/*/bin/python; do [ -x "$p" ] && echo "== $p" && $p -c "import asgiref; print('asgiref ok')" 2>&1 | head -1; done
+```2026_09_21_09_46_17899840032026_09_21_09_46_1789984000
+executing输出 /usr/bin/python3
+/usr/bin/python3-config
+/usr/bin/python3.10
+/usr/bin/python3.10-config
+== /usr/bin/python3
+Traceback (most recent call last):
+== /opt/miniconda3/envs/testbed/bin/python
+asgiref ok
+
+
+The testbed conda env has asgiref. Let me use `/opt/miniconda3/envs/testbed/bin/python`.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /testbed/repro_check_filterable.py
+```2026_09_21_09_46_17899840042026_09_21_09_46_17899840012026_09_21_09_46_1789984001
+executing输出 Traceback (most recent call last):
+  File "/testbed/repro_check_filterable.py", line 31, in <module>
+    qs = ProductMetaData.objects.filter(value="Dark Vador", metadata_type=mt)
+  File "/testbed/django/db/models/manager.py", line 85, in manager_method
+    return getattr(self.get_queryset(), name)(*args, **kwargs)
+  File "/testbed/django/db/models/query.py", line 942, in filter
+    return self._filter_or_exclude(False, *args, **kwargs)
+  File "/testbed/django/db/models/query.py", line 962, in _filter_or_exclude
+    clone._filter_or_exclude_inplace(negate, *args, **kwargs)
+  File "/testbed/django/db/models/query.py", line 969, in _filter_or_exclude_inplace
+    self._query.add_q(Q(*args, **kwargs))
+  File "/testbed/django/db/models/sql/query.py", line 1356, in add_q
+    clause, _ = self._add_q(q_object, self.used_aliases)
+  File "/testbed/django/db/models/sql/query.py", line 1378, in _add_q
+    split_subq=split_subq, check_filterable=check_filterable,
+  File "/testbed/django/db/models/sql/query.py", line 1269, in build_filter
+    self.check_filterable(value)
+  File "/testbed/django/db/models/sql/query.py", line 1129, in check_filterable
+    expression.__class__.__name__ + ' is disallowed in the filter '
+django.db.utils.NotSupportedError: ProductMetaDataType is disallowed in the filter clause.
+
+
+Bug reproduced. Now let me apply the fix. The correct approach: only inspect `filterable` on actual query expressions, not plain values / model instances. Upstream Django's fix checks that the object is an expression.
+
+Let me apply the fix:
+
+```bash-action
+cd /testbed && sed -n '1125,1135p' django/db/models/sql/query.py
+```2026_09_21_09_46_17899840042026_09_21_09_46_1789984003
+executing输出     def check_filterable(self, expression):
+        """Raise an error if expression cannot be used in a WHERE clause."""
+        if not getattr(expression, 'filterable', True):
+            raise NotSupportedError(
+                expression.__class__.__name__ + ' is disallowed in the filter '
+                'clause.'
+            )
+        if hasattr(expression, 'get_source_expressions'):
+            for expr in expression.get_source_expressions():
+                self.check_filterable(expr)
+
+
+
+The fix should only look at `filterable` when the object is actually a query expression. Model instances don't have `resolve_expression` in a way we want here... but they do. Better: restrict the check to instances that are `BaseExpression` or that explicitly declare `filterable` as a non-field attribute.
+
+The cleanest, targeted fix: only apply the `filterable` check to objects that are instances of `BaseExpression` (where `filterable` is a declared class attribute). Let me check how upstream fixed it — this is a known Django ticket (#31643). Upstream fix made `check_filterable` skip when the value is not an expression by checking `hasattr(expression, 'resolve_expression')`... but model instances have `resolve_expression`? No — model instances do not. Let me verify.
+
+```bash-action
+cd /testbed && grep -n "filterable = False" -B 20 django/db/models/expressions.py | head -40
+```2026_09_21_09_46_17899840052026_09_21_09_46_17899840052026_09_21_09_46_1789984004
+executing输出 1185-        self.descending = not self.descending
+1186-        if self.nulls_first or self.nulls_last:
+1187-            self.nulls_first = not self.nulls_first
+1188-            self.nulls_last = not self.nulls_last
+1189-        return self
+1190-
+1191-    def asc(self):
+1192-        self.descending = False
+1193-
+1194-    def desc(self):
+1195-        self.descending = True
+1196-
+1197-
+1198-class Window(Expression):
+1199-    template = '%(expression)s OVER (%(window)s)'
+1200-    # Although the main expression may either be an aggregate or an
+1201-    # expression with an aggregate function, the GROUP BY that will
+1202-    # be introduced in the query as a result is not desired.
+1203-    contains_aggregate = False
+1204-    contains_over_clause = True
+1205:    filterable = False
+
+
+`filterable = False` only appears on the `Window` expression. So `filterable` is meant to be an expression-level flag.
+
+The proper fix (matching upstream Django #31643): in `check_filterable`, don't recurse into / check RHS values that are model instances by only checking the flag on objects that define it as an expression attribute. Upstream's actual fix was in `build_filter`: it moved the `check_filterable(value)` call so it doesn't run for related-field lookups with a model instance RHS — but a simpler, correct fix is to make `check_filterable` only inspect `filterable` for `BaseExpression` instances.
+
+Let me look at what upstream did precisely. The Django fix (commit for #31643) changed `check_filterable` signature usage: `check_filterable(value)` was guarded so it only runs when `value` has `resolve_expression`. Let me check the `build_filter` flow around line 1266-1270.
+
+```bash-action
+cd /testbed && sed -n '1255,1275p' django/db/models/sql/query.py
+```2026_09_21_09_46_17899840082026_09_21_09_46_17899840062026_09_21_09_46_17899840062026_09_21_09_46_1789984006
+executing输出             raise FieldError("Cannot parse keyword query %r" % arg)
+        lookups, parts, reffed_expression = self.solve_lookup_type(arg)
+
+        if check_filterable:
+            self.check_filterable(reffed_expression)
+
+        if not allow_joins and len(parts) > 1:
+            raise FieldError("Joined field references are not permitted in this query")
+
+        pre_joins = self.alias_refcount.copy()
+        value = self.resolve_lookup_value(value, can_reuse, allow_joins)
+        used_joins = {k for k, v in self.alias_refcount.items() if v > pre_joins.get(k, 0)}
+
+        if check_filterable:
+            self.check_filterable(value)
+
+        clause = self.where_class()
+        if reffed_expression:
+            condition = self.build_lookup(lookups, reffed_expression, value)
+            clause.add(condition, AND)
+            return clause, []
+
+
+The correct upstream fix (Django ticket #31643) modifies `check_filterable` to only check `filterable` when the value is a query expression — i.e. it distinguishes between model instances and expressions. Upstream's fix: only call `check_filterable` on the RHS if it's an expression.
+
+The minimal, correct fix is to guard the check so model instances aren't treated as expressions. I'll modify `check_filterable` to only raise if the object is a `BaseExpression` (or subclass) — since `filterable` is only declared there.
+
+Let me implement it in `query.py`:
+
+```bash-action
+cd /testbed && python - << 'PYEOF'
+import re
+p = 'django/db/models/sql/query.py'
+s = open(p).read()
+old = '''    def check_filterable(self, expression):
+        """Raise an error if expression cannot be used in a WHERE clause."""
+        if not getattr(expression, 'filterable', True):
+            raise NotSupportedError(
+                expression.__class__.__name__ + ' is disallowed in the filter '
+                'clause.'
+            )
+        if hasattr(expression, 'get_source_expressions'):
+            for expr in expression.get_source_expressions():
+                self.check_filterable(expr)
+'''
+new = '''    def check_filterable(self, expression):
+        """Raise an error if expression cannot be used in a WHERE clause."""
+        if (
+            hasattr(expression, 'resolve_expression') and
+            not getattr(expression, 'filterable', True)
+        ):
+            raise NotSupportedError(
+                expression.__class__.__name__ + ' is disallowed in the filter '
+                'clause.'
+            )
+        if hasattr(expression, 'get_source_expressions'):
+            for expr in expression.get_source_expressions():
+                self.check_filterable(expr)
+'''
+assert old in s, "old block not found"
+open(p, 'w').write(s.replace(old, new))
+print("patched")
+PYEOF
+```2026_09_21_09_46_17899840082026_09_21_09_46_17899840082026_09_21_09_46_1789984008
+executing输出 patched
+
+
+Wait — I need to verify model instances don't have `resolve_expression`. Let me check, and re-run the repro.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /testbed/repro_check_filterable.py
+```2026_09_21_09_46_17899840112026_09_21_09_46_17899840102026_09_21_09_46_1789984009
+executing输出 OK: SELECT "auth_productmetadata"."id", "auth_productmetadata"."value", "auth_productmetadata"."metadata_type_id" FROM "auth_productmetadata" WHERE ("auth_productmetadata"."metadata_type_id" = 1 AND "auth_productmetadata"."value" = Dark Vador)
+
+
+The repro now passes. But I must verify the fix still blocks `Window` expressions (the original intent of `filterable=False`). Let me test that the existing test for `filterable=False` still works.
+
+```bash-action
+cd /testbed && grep -rn "disallowed in the filter\|filterable" tests/ --include=*.py | head -20
+```2026_09_21_09_46_17899840122026_09_21_09_46_17899840112026_09_21_09_46_17899840112026_09_21_09_46_1789984011
+executing输出 tests/expressions_window/tests.py:843:        msg = 'Window is disallowed in the filter clause'
+tests/expressions_window/tests.py:868:        msg = 'Window is disallowed in the filter clause'
+
+
+There's a test for the `Window` case. Let me check whether `Window` has `resolve_expression`.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import django
+from django.db.models import Window
+print('resolve_expression' in dir(Window))
+" 2>&1 | tail -3
+```
+
+Actually, `Window` is a subclass of `Expression` which has `resolve_expression`. Let me run the existing window tests to confirm my change didn't break the intended behavior.
+
+```bash-action
+cd /testbed && sed -n '835,875p' tests/expressions_window/tests.py
+```2026_09_21_09_46_17899840142026_09_21_09_46_17899840132026_09_21_09_46_1789984013
+executing输出 True
+
+
+Good — `Window` has `resolve_expression`, so my guard still blocks it. Let me run the existing window tests.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py expressions_window --settings=test_sqlite -v1 2>&1 | tail -15
+```2026_09_21_09_46_17899840162026_09_21_09_46_17899840152026_09_21_09_46_17899840142026_09_21_09_46_1789984015
+executing输出 Testing against Django installed in '/testbed/django' with up to 16 processes
+System check identified no issues (0 silenced).
+Creating test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+..............s...............................ss.
+----------------------------------------------------------------------
+Ran 49 tests in 0.132s
+
+OK (skipped=3)
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+Window tests pass. Now let me also check the docs — the issue says "should be documented". Let me check the docs mention for `filterable` to see if documentation is expected, but the requirement says only change necessary source.
+
+Let me also run the broader query/expressions test suites to be sure.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py queries expressions --settings=test_sqlite -v1 2>&1 | tail -8
+```2026_09_21_09_46_17899840172026_09_21_09_46_17899840162026_09_21_09_46_17899840162026_09_21_09_46_17899840162026_09_21_09_46_1789984016
+executing输出 Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+Output got truncated to only the tail. Let me check the exit status explicitly.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py queries expressions --settings=test_sqlite -v1 > /tmp/qt.log 2>&1; echo "EXIT=$?"; grep -E "OK|FAILED|ERROR|Ran " /tmp/qt.log | tail -5
+```2026_09_21_09_46_17899840212026_09_21_09_46_17899840202026_09_21_09_46_17899840192026_09_21_09_46_17899840192026_09_21_09_46_17899840202026_09_21_09_46_1789984020
+executing输出 EXIT=0
+Ran 533 tests in 0.450s
+OK (skipped=15, expected failures=2)
+
+
+All 533 tests pass. Now let me clean up my repro file (it's not source, but I created it in the repo) and verify the git diff shows only the intended change.
+
+```bash-action
+cd /testbed && rm -f /testbed/repro_check_filterable.py && git status --short && echo "---DIFF---" && git diff
+```2026_09_21_09_46_17899840222026_09_21_09_46_17899840222026_09_21_09_46_1789984022
+executing输出  M django/db/models/sql/query.py
+?? My_agent.py
+?? actions.py
+?? chat_export.py
+?? chat_history/
+?? llm.py
+?? system_prompt.txt
+---DIFF---
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index ce18098fd2..d65141b834 100755
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1124,7 +1124,10 @@ class Query(BaseExpression):
+ 
+     def check_filterable(self, expression):
+         """Raise an error if expression cannot be used in a WHERE clause."""
+-        if not getattr(expression, 'filterable', True):
++        if (
++            hasattr(expression, 'resolve_expression') and
++            not getattr(expression, 'filterable', True)
++        ):
+             raise NotSupportedError(
+                 expression.__class__.__name__ + ' is disallowed in the filter '
+                 'clause.'
+
+
+The diff is clean — only `django/db/models/sql/query.py` is modified (the other untracked files are pre-existing agent harness files, not mine). My repro file is removed.
+
+Let me do one final confirmation that the repro is fixed and the Window case is still blocked, using an inline one-liner to avoid leaving files:
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import django
+from django.conf import settings
+settings.configure(INSTALLED_APPS=['django.contrib.contenttypes','django.contrib.auth'], DATABASES={'default':{'ENGINE':'django.db.backends.sqlite3','NAME':':memory:'}})
+django.setup()
+from django.db import models, connection
+from django.db.models import Window, F, Sum
+from django.db.utils import NotSupportedError
+
+class T(models.Model):
+    label = models.CharField(max_length=50)
+    filterable = models.BooleanField(default=False)
+    class Meta: app_label='auth'
+class M(models.Model):
+    value = models.TextField()
+    mt = models.ForeignKey(T, on_delete=models.CASCADE)
+    class Meta: app_label='auth'
+with connection.schema_editor() as se:
+    se.create_model(T); se.create_model(M)
+t = T.objects.create(label='x', filterable=False)
+print('RHS model instance OK:', bool(M.objects.filter(value='v', mt=t).query))
+try:
+    M.objects.filter(value=Window(Sum('value')))
+    print('FAIL: window allowed')
+except NotSupportedError as e:
+    print('Window still blocked:', e)
+"
+```2026_09_21_09_47_1789984023
+executing输出 RHS model instance OK: True
+Window still blocked: Window is disallowed in the filter clause.
+
+
+Both behaviors confirmed:
+- RHS model instance with a field named `filterable` no longer raises `NotSupportedError`.
+- `Window` expressions are still correctly blocked (existing behavior preserved).
+
+Existing tests pass (533 query/expression tests + 49 window tests). The fix only touches the necessary source file.
+
+```bash-action
+exit
+```

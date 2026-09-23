@@ -1,0 +1,372 @@
+plan-unwanted
+我先定位出问题的源码，确认根因。
+
+```bash-action
+cd /testbed && sed -n '240,300p' django/db/models/deletion.py
+```
+executing输出         for model, instances in self.data.items():
+            for obj in instances:
+                yield model, obj
+
+    def sort(self):
+        sorted_models = []
+        concrete_models = set()
+        models = list(self.data)
+        while len(sorted_models) < len(models):
+            found = False
+            for model in models:
+                if model in sorted_models:
+                    continue
+                dependencies = self.dependencies.get(model._meta.concrete_model)
+                if not (dependencies and dependencies.difference(concrete_models)):
+                    sorted_models.append(model)
+                    concrete_models.add(model._meta.concrete_model)
+                    found = True
+            if not found:
+                return
+        self.data = {model: self.data[model] for model in sorted_models}
+
+    def delete(self):
+        # sort instance collections
+        for model, instances in self.data.items():
+            self.data[model] = sorted(instances, key=attrgetter("pk"))
+
+        # if possible, bring the models in an order suitable for databases that
+        # don't support transactions or cannot defer constraint checks until the
+        # end of a transaction.
+        self.sort()
+        # number of objects deleted for each model label
+        deleted_counter = Counter()
+
+        # Optimize for the case with a single obj and no dependencies
+        if len(self.data) == 1 and len(instances) == 1:
+            instance = list(instances)[0]
+            if self.can_fast_delete(instance):
+                with transaction.mark_for_rollback_on_error():
+                    count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
+                return count, {model._meta.label: count}
+
+        with transaction.atomic(using=self.using, savepoint=False):
+            # send pre_delete signals
+            for model, obj in self.instances_with_model():
+                if not model._meta.auto_created:
+                    signals.pre_delete.send(
+                        sender=model, instance=obj, using=self.using
+                    )
+
+            # fast deletes
+            for qs in self.fast_deletes:
+                count = qs._raw_delete(using=self.using)
+                deleted_counter[qs.model._meta.label] += count
+
+            # update fields
+            for model, instances_for_fieldvalues in self.field_updates.items():
+                for (field, value), instances in instances_for_fieldvalues.items():
+                    query = sql.UpdateQuery(model)
+                    query.update_batch([obj.pk for obj in instances],
+                                       {field.name: value}, self.using)
+
+
+问题定位到了：`delete()` 中有一个「单对象无依赖」的快速路径优化（`Optimize for the case with a single obj and no dependencies`）。这条路径直接执行 SQL 删除并 return，**没有把 instance.pk 置为 None**，也没有发送 post_delete 信号。而正常路径后面会设置 pk 为 None。
+
+我先看正常路径的结尾，确认 pk 置 None 的逻辑。
+
+```bash-action
+cd /testbed && sed -n '300,340p' django/db/models/deletion.py
+```2026_09_21_09_39_1789983566
+executing输出                                        {field.name: value}, self.using)
+
+            # reverse instance collections
+            for instances in self.data.values():
+                instances.reverse()
+
+            # delete instances
+            for model, instances in self.data.items():
+                query = sql.DeleteQuery(model)
+                pk_list = [obj.pk for obj in instances]
+                count = query.delete_batch(pk_list, self.using)
+                deleted_counter[model._meta.label] += count
+
+                if not model._meta.auto_created:
+                    for obj in instances:
+                        signals.post_delete.send(
+                            sender=model, instance=obj, using=self.using
+                        )
+
+        # update collected instances
+        for instances_for_fieldvalues in self.field_updates.values():
+            for (field, value), instances in instances_for_fieldvalues.items():
+                for obj in instances:
+                    setattr(obj, field.attname, value)
+        for model, instances in self.data.items():
+            for instance in instances:
+                setattr(instance, model._meta.pk.attname, None)
+        return sum(deleted_counter.values()), dict(deleted_counter)
+
+
+确认了根因：快速路径（第 276-281 行）提前 return，跳过了末尾「把 pk 置为 None」的逻辑（第 331 行附近）。
+
+不过 issue 说 "any instances without dependencies"，更本质的是快速路径那句 `if len(self.data) == 1 and len(instances) == 1:` 里 `instances` 是循环变量，可能误用；但这里核心修复是让快速路径也把 pk 置 None。
+
+我先看一下 `can_fast_delete`，并确认这个快速路径是否也应该发 post_delete 信号。实际上 `can_fast_delete` 保证没有信号、没有级联，所以只需补上 pk 置 None。
+
+让我检查是否有其他地方有类似「快速路径 return 前没置 pk」的格式问题。
+
+```bash-action
+cd /testbed && grep -n "return count" django/db/models/deletion.py
+```2026_09_21_09_39_1789983567
+executing输出 280:                return count, {model._meta.label: count}
+
+
+只有一处。现在写一个最小复现脚本确认 bug 存在。
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth"],
+    DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
+)
+django.setup()
+from django.db import connection, models
+
+class Book(models.Model):
+    title = models.CharField(max_length=100)
+    class Meta:
+        app_label = "auth"
+
+with connection.schema_editor() as se:
+    se.create_model(Book)
+
+b = Book.objects.create(title="x")
+pk = b.pk
+b.delete()
+print("pk after delete:", b.pk)
+assert b.pk is None, "BUG: pk not cleared"
+print("OK")
+EOF
+python /tmp/repro.py
+```2026_09_21_09_39_17899835692026_09_21_09_39_1789983569
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+需要把仓库根目录加入 sys.path。
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 7, in <module>
+    django.setup()
+  File "/testbed/django/__init__.py", line 16, in setup
+    from django.urls import set_script_prefix
+  File "/testbed/django/urls/__init__.py", line 1, in <module>
+    from .base import (
+  File "/testbed/django/urls/base.py", line 8, in <module>
+    from .exceptions import NoReverseMatch, Resolver404
+  File "/testbed/django/urls/exceptions.py", line 1, in <module>
+    from django.http import Http404
+  File "/testbed/django/http/__init__.py", line 5, in <module>
+    from django.http.response import (
+  File "/testbed/django/http/response.py", line 15, in <module>
+    from django.core.serializers.json import DjangoJSONEncoder
+  File "/testbed/django/core/serializers/__init__.py", line 23, in <module>
+    from django.core.serializers.base import SerializerDoesNotExist
+  File "/testbed/django/core/serializers/base.py", line 7, in <module>
+    from django.db import models
+  File "/testbed/django/db/models/__init__.py", line 3, in <module>
+    from django.db.models.aggregates import *  # NOQA
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/models/aggregates.py", line 5, in <module>
+    from django.db.models.expressions import Case, Func, Star, When
+  File "/testbed/django/db/models/expressions.py", line 8, in <module>
+    from django.db.models import fields
+  File "/testbed/django/db/models/fields/__init__.py", line 11, in <module>
+    from django import forms
+  File "/testbed/django/forms/__init__.py", line 6, in <module>
+    from django.forms.boundfield import *  # NOQA
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/forms/boundfield.py", line 3, in <module>
+    from django.forms.utils import flatatt, pretty_name
+  File "/testbed/django/forms/utils.py", line 6, in <module>
+    from django.utils import timezone
+  File "/testbed/django/utils/timezone.py", line 11, in <module>
+    import pytz
+ModuleNotFoundError: No module named 'pytz'
+
+
+pytz 缺失，说明环境需要走 tox / 或者正确的 python。用户说当前 shell 的 python 就是配置好的测试环境。让我确认一下解释器。
+
+```bash-action
+cd /testbed && which python && python -c "import sys; print(sys.executable)" && ls tests/ | head && python -c "import django; print(django.__file__)"
+```
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python
+README.rst
+absolute_url_overrides
+admin_autodiscover
+admin_changelist
+admin_checks
+admin_custom_urls
+admin_default_site
+admin_docs
+admin_filters
+admin_inlines
+/testbed/django/__init__.py
+
+
+python 能找到 /testbed 的 django（当前目录在 path 里），但缺 pytz。看看有没有其他 python 环境。
+
+```bash-action
+cd /testbed && pip list 2>/dev/null | grep -i -E "pytz|django" ; ls /opt/miniconda3/envs 2>/dev/null
+```2026_09_21_09_39_1789983572
+executing输出 testbed
+
+
+有个 `testbed` conda 环境，用它。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "import django, pytz; print(django.__file__)" && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_39_1789983574
+executing输出 /testbed/django/__init__.py
+pk after delete: 1
+Traceback (most recent call last):
+  File "/tmp/repro.py", line 22, in <module>
+    assert b.pk is None, "BUG: pk not cleared"
+AssertionError: BUG: pk not cleared
+
+
+Bug 复现成功：pk 仍是 1，未清空。现在修复快速路径，在 return 前把 pk 置 None（与常规路径一致）。
+
+```bash-action
+cd /testbed && sed -n '274,282p' django/db/models/deletion.py
+```2026_09_21_09_39_1789983575
+executing输出         # Optimize for the case with a single obj and no dependencies
+        if len(self.data) == 1 and len(instances) == 1:
+            instance = list(instances)[0]
+            if self.can_fast_delete(instance):
+                with transaction.mark_for_rollback_on_error():
+                    count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
+                return count, {model._meta.label: count}
+
+        with transaction.atomic(using=self.using, savepoint=False):
+
+
+注意 `if len(self.data) == 1 and len(instances) == 1:` 里的 `instances` 是上面循环的残留变量，判断有误。但为最小改动、只修 issue 描述的问题，我聚焦于清理 pk。判断条件本身语义也不对（应判断该 model 的 instances），但与 issue 无关，保守处理。
+
+我用精确字符串替换来改快速路径。
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = "django/db/models/deletion.py"
+s = open(p).read()
+old = '''            if self.can_fast_delete(instance):
+                with transaction.mark_for_rollback_on_error():
+                    count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
+                return count, {model._meta.label: count}'''
+new = '''            if self.can_fast_delete(instance):
+                with transaction.mark_for_rollback_on_error():
+                    count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
+                setattr(instance, model._meta.pk.attname, None)
+                return count, {model._meta.label: count}'''
+assert s.count(old) == 1
+open(p, "w").write(s.replace(old, new))
+print("patched")
+EOF
+```2026_09_21_09_39_17899835752026_09_21_09_39_1789983576
+executing输出 patched
+
+
+现在重跑复现脚本确认修复。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_39_1789983578
+executing输出 pk after delete: None
+OK
+
+
+修复生效。现在找仓库里覆盖 deletion 模块的已有测试文件并运行。
+
+```bash-action
+cd /testbed && ls tests/ | grep -i -E "delet" && ls tests/delete/
+```
+executing输出 delete
+delete_regress
+save_delete_hooks
+__init__.py
+models.py
+tests.py
+
+
+```bash-action
+cd /testbed/tests && /opt/miniconda3/envs/testbed/bin/python runtests.py delete delete_regress save_delete_hooks 2>&1 | tail -30
+```
+executing输出 System check identified no issues (0 silenced).
+Creating test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+s.............s.................................s............
+----------------------------------------------------------------------
+Ran 61 tests in 0.438s
+
+OK (skipped=3)
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+全部通过（61 tests, OK）。相关测试也跑一下 `delete` 模型的其它直接测试，并确认 git diff。
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_39_17899835822026_09_21_09_39_1789983582
+executing输出 diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index 92fe4affb9..3a462f1c4c 100755
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -277,6 +277,7 @@ class Collector:
+             if self.can_fast_delete(instance):
+                 with transaction.mark_for_rollback_on_error():
+                     count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
++                setattr(instance, model._meta.pk.attname, None)
+                 return count, {model._meta.label: count}
+ 
+         with transaction.atomic(using=self.using, savepoint=False):
+
+
+改动符合预期：仅在快速删除路径 return 之前补上 PK 置 None，与常规路径末尾逻辑一致，未改动测试文件。
+
+已完成：
+1. 定位根因：`Collector.delete()` 中「单对象无依赖」快速路径提前 return，跳过了末尾将 PK 置为 None 的逻辑。
+2. 最小复现脚本确认 bug 存在（pk 仍为 1）。
+3. 修复：在快速路径 return 前加 `setattr(instance, model._meta.pk.attname, None)`。
+4. 重跑复现脚本 → pk 为 None，OK。
+5. 运行相关已有测试 `delete`、`delete_regress`、`save_delete_hooks`（61 tests，OK）。
+
+```bash-action
+exit
+```

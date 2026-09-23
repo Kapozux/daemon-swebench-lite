@@ -1,0 +1,486 @@
+plan-needed
+我先说一下我的计划，请你确认后再动手。
+
+**计划：**
+
+1. 先阅读 issue，确认问题：对 `union()` 后的 queryset 调用 `distinct()`（尤其是 `distinct('name')`）应该报错，因为 `DISTINCT ON` 无法作用于 UNION 结果，当前 Django 却静默忽略，导致结果错误。
+
+2. 在 `/testbed` 里定位 QuerySet 的 `distinct()` 实现，以及 union/combined queryset 相关的类（如 `django/db/models/query.py` 里的 `QuerySet.distinct` 和 `CombinedQuerySet`）。
+
+3. 参照 Django 现有对 union queryset 上不支持操作的处理方式（例如 `order_by` 或其他被禁止的方法），确定应该在 `distinct()` 被调用时抛出 `NotSupportedError` 或 `TypeError`，而不是静默忽略。
+
+4. 写一个最小复现脚本，确认当前 `union().distinct()` 不报错（bug 存在）。
+
+5. 修改源码：在 `CombinedQuerySet`（或相应位置）的 `distinct()` 方法里，对 union/combined queryset 抛出合适的异常，并写清楚报错信息。
+
+6. 重跑最小复现脚本，确认现在会正确抛错。
+
+7. 找到仓库里覆盖该模块（`QuerySet.distinct` / combined queryset）的已有测试文件跑一遍，确认没有破坏其他行为。
+
+8. 用 `git diff` 确认改动，最后运行 exit。
+
+请确认（ok），我再开始执行。
+```plan-finish
+```
+我先看一下 issue 相关代码，定位 `distinct` 和 combined queryset 的实现。
+
+```bash-action
+cd /testbed && grep -n "def distinct" django/db/models/query.py
+```
+executing输出 1137:    def distinct(self, *field_names):
+
+
+让我查看这个方法的实现和相关上下文。
+
+```bash-action
+cd /testbed && sed -n '1130,1160p' django/db/models/query.py
+```2026_09_21_09_46_1789983973
+executing输出         assert not self.query.is_sliced, \
+            "Cannot reorder a query once a slice has been taken."
+        obj = self._chain()
+        obj.query.clear_ordering(force_empty=False)
+        obj.query.add_ordering(*field_names)
+        return obj
+
+    def distinct(self, *field_names):
+        """
+        Return a new QuerySet instance that will select only distinct results.
+        """
+        assert not self.query.is_sliced, \
+            "Cannot create distinct fields once a slice has been taken."
+        obj = self._chain()
+        obj.query.add_distinct_fields(*field_names)
+        return obj
+
+    def extra(self, select=None, where=None, params=None, tables=None,
+              order_by=None, select_params=None):
+        """Add extra SQL fragments to the query."""
+        self._not_support_combined_queries('extra')
+        assert not self.query.is_sliced, \
+            "Cannot change a query once a slice has been taken"
+        clone = self._chain()
+        clone.query.add_extra(select, select_params, where, params, tables, order_by)
+        return clone
+
+    def reverse(self):
+        """Reverse the ordering of the QuerySet."""
+        if self.query.is_sliced:
+            raise TypeError('Cannot reverse a query once a slice has been taken.')
+
+
+我看到了 `_not_support_combined_queries` 的用法。让我看看这个方法的定义，以及其他被禁止的方法是怎么调用的。
+
+```bash-action
+cd /testbed && grep -n "_not_support_combined_queries\|def union\|class CombinedQuerySet\|_combinator_query" django/db/models/query.py
+```2026_09_21_09_46_1789983974
+executing输出 726:        self._not_support_combined_queries('delete')
+775:        self._not_support_combined_queries('update')
+941:        self._not_support_combined_queries('filter')
+949:        self._not_support_combined_queries('exclude')
+988:    def _combinator_query(self, combinator, *other_qs, all=False):
+999:    def union(self, *other_qs, all=False):
+1003:            return qs[0]._combinator_query('union', *qs[1:], all=all) if qs else self
+1004:        return self._combinator_query('union', *other_qs, all=all)
+1013:        return self._combinator_query('intersection', *other_qs)
+1019:        return self._combinator_query('difference', *other_qs)
+1045:        self._not_support_combined_queries('select_related')
+1067:        self._not_support_combined_queries('prefetch_related')
+1086:        self._not_support_combined_queries('annotate')
+1150:        self._not_support_combined_queries('extra')
+1172:        self._not_support_combined_queries('defer')
+1188:        self._not_support_combined_queries('only')
+1375:    def _not_support_combined_queries(self, operation_name):
+
+
+现在看看 `_not_support_combined_queries` 的定义和 `_combinator_query`。
+
+```bash-action
+cd /testbed && sed -n '988,1030p;1375,1390p' django/db/models/query.py
+```2026_09_21_09_46_17899839752026_09_21_09_46_1789983975
+executing输出     def _combinator_query(self, combinator, *other_qs, all=False):
+        # Clone the query to inherit the select list and everything
+        clone = self._chain()
+        # Clear limits and ordering so they can be reapplied
+        clone.query.clear_ordering(True)
+        clone.query.clear_limits()
+        clone.query.combined_queries = (self.query,) + tuple(qs.query for qs in other_qs)
+        clone.query.combinator = combinator
+        clone.query.combinator_all = all
+        return clone
+
+    def union(self, *other_qs, all=False):
+        # If the query is an EmptyQuerySet, combine all nonempty querysets.
+        if isinstance(self, EmptyQuerySet):
+            qs = [q for q in other_qs if not isinstance(q, EmptyQuerySet)]
+            return qs[0]._combinator_query('union', *qs[1:], all=all) if qs else self
+        return self._combinator_query('union', *other_qs, all=all)
+
+    def intersection(self, *other_qs):
+        # If any query is an EmptyQuerySet, return it.
+        if isinstance(self, EmptyQuerySet):
+            return self
+        for other in other_qs:
+            if isinstance(other, EmptyQuerySet):
+                return other
+        return self._combinator_query('intersection', *other_qs)
+
+    def difference(self, *other_qs):
+        # If the query is an EmptyQuerySet, return it.
+        if isinstance(self, EmptyQuerySet):
+            return self
+        return self._combinator_query('difference', *other_qs)
+
+    def select_for_update(self, nowait=False, skip_locked=False, of=()):
+        """
+        Return a new QuerySet instance that will select objects with a
+        FOR UPDATE lock.
+        """
+        if nowait and skip_locked:
+            raise ValueError('The nowait option cannot be used with skip_locked.')
+        obj = self._chain()
+        obj._for_write = True
+        obj.query.select_for_update = True
+    def _not_support_combined_queries(self, operation_name):
+        if self.query.combinator:
+            raise NotSupportedError(
+                'Calling QuerySet.%s() after %s() is not supported.'
+                % (operation_name, self.query.combinator)
+            )
+
+
+class InstanceCheckMeta(type):
+    def __instancecheck__(self, instance):
+        return isinstance(instance, QuerySet) and instance.query.is_empty()
+
+
+class EmptyQuerySet(metaclass=InstanceCheckMeta):
+    """
+    Marker class to checking if a queryset is empty by .none():
+
+
+我已经了解了机制。`distinct()` 缺少 `_not_support_combined_queries('distinct')` 检查。先写一个最小复现脚本确认 bug 存在。
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    DEBUG=True,
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 't'],
+)
+django.setup()
+from django.db import models, connection
+
+class Sample(models.Model):
+    name = models.CharField(max_length=50)
+    class Meta:
+        app_label = 't'
+
+with connection.schema_editor() as se:
+    se.create_model(Sample)
+
+qs = Sample.objects.all()
+qs1 = qs.filter(name='a')
+qs2 = qs.filter(name='b')
+combined = qs1.union(qs2)
+try:
+    r = combined.distinct('name')
+    print("NO ERROR (bug present):", r)
+except Exception as e:
+    print("Raised:", type(e).__name__, e)
+EOF
+python /tmp/repro.py
+```2026_09_21_09_46_17899839762026_09_21_09_46_17899839762026_09_21_09_46_1789983976
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+需要从仓库根目录运行才能导入本地 django。
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_09_46_17899839772026_09_21_09_46_1789983977
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 2, in <module>
+    from django.conf import settings
+  File "/testbed/django/conf/__init__.py", line 19, in <module>
+    from django.core.validators import URLValidator
+  File "/testbed/django/core/validators.py", line 8, in <module>
+    from django.utils.encoding import punycode
+  File "/testbed/django/utils/encoding.py", line 8, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+环境可能需要用特定的测试运行方式。看看是否有可用的 python 解释器或已安装环境。
+
+```bash-action
+cd /testbed && ls && which python python3 && python -c "import sys; print(sys.prefix)"
+```2026_09_21_09_46_17899839782026_09_21_09_46_17899839782026_09_21_09_46_1789983978
+executing输出 AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+django
+docs
+extras
+js_tests
+llm.py
+package.json
+scripts
+setup.cfg
+setup.py
+system_prompt.txt
+tests
+tox.ini
+/opt/miniconda3/bin/python
+/opt/miniconda3/bin/python3
+/opt/miniconda3
+
+
+需要激活正确的 conda 环境。看看有哪些环境。
+
+```bash-action
+ls /opt/miniconda3/envs/ 2>/dev/null; pip show django 2>/dev/null | head -3
+```
+executing输出 testbed
+
+
+用 testbed 环境。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_46_17899839812026_09_21_09_46_17899839812026_09_21_09_46_17899839812026_09_21_09_46_1789983982
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 8, in <module>
+    django.setup()
+  File "/testbed/django/__init__.py", line 24, in setup
+    apps.populate(settings.INSTALLED_APPS)
+  File "/testbed/django/apps/registry.py", line 91, in populate
+    app_config = AppConfig.create(entry)
+  File "/testbed/django/apps/config.py", line 90, in create
+    module = import_module(entry)
+  File "/opt/miniconda3/envs/testbed/lib/python3.6/importlib/__init__.py", line 126, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+  File "<frozen importlib._bootstrap>", line 994, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 971, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 953, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 't'
+
+
+`t` app 不存在。简化一下，去掉 INSTALLED_APPS 里的 `t`，改用 contenttypes 和 auth 即可。
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    DEBUG=True,
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+)
+django.setup()
+from django.db import models, connection
+
+class Sample(models.Model):
+    name = models.CharField(max_length=50)
+    class Meta:
+        app_label = 'contenttypes'
+
+with connection.schema_editor() as se:
+    se.create_model(Sample)
+
+qs = Sample.objects.all()
+qs1 = qs.filter(name='a')
+qs2 = qs.filter(name='b')
+combined = qs1.union(qs2)
+try:
+    r = combined.distinct('name')
+    print("NO ERROR (bug present):", r)
+except Exception as e:
+    print("Raised:", type(e).__name__, e)
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_46_17899839822026_09_21_09_46_1789983982
+executing输出 NO ERROR (bug present): <QuerySet []>
+
+
+Bug 已确认：`union().distinct()` 没有报错。现在修复源码。
+
+```bash-action
+cd /testbed && sed -n '1137,1147p' django/db/models/query.py
+```2026_09_21_09_46_17899839842026_09_21_09_46_1789983984
+executing输出     def distinct(self, *field_names):
+        """
+        Return a new QuerySet instance that will select only distinct results.
+        """
+        assert not self.query.is_sliced, \
+            "Cannot create distinct fields once a slice has been taken."
+        obj = self._chain()
+        obj.query.add_distinct_fields(*field_names)
+        return obj
+
+    def extra(self, select=None, where=None, params=None, tables=None,
+
+
+现在修改 `distinct`，加入 combined queries 检查。
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'django/db/models/query.py'
+s = open(p).read()
+old = '''    def distinct(self, *field_names):
+        """
+        Return a new QuerySet instance that will select only distinct results.
+        """
+        assert not self.query.is_sliced, \\
+            "Cannot create distinct fields once a slice has been taken."
+        obj = self._chain()
+        obj.query.add_distinct_fields(*field_names)
+        return obj
+'''
+new = '''    def distinct(self, *field_names):
+        """
+        Return a new QuerySet instance that will select only distinct results.
+        """
+        self._not_support_combined_queries('distinct')
+        assert not self.query.is_sliced, \\
+            "Cannot create distinct fields once a slice has been taken."
+        obj = self._chain()
+        obj.query.add_distinct_fields(*field_names)
+        return obj
+'''
+assert old in s
+open(p, 'w').write(s.replace(old, new))
+print("done")
+EOF
+```2026_09_21_09_46_17899839852026_09_21_09_46_17899839852026_09_21_09_46_1789983985
+executing输出 done
+
+
+现在重跑复现脚本确认修复。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_46_17899839862026_09_21_09_46_17899839862026_09_21_09_46_1789983987
+executing输出 Raised: NotSupportedError Calling QuerySet.distinct() after union() is not supported.
+
+
+修复生效。现在找仓库里覆盖该模块的已有测试文件跑一遍。相关测试应该在 `tests/queries/` 下。
+
+```bash-action
+cd /testbed && grep -rln "_not_support_combined_queries\|after union() is not supported\|def test_.*distinct" tests/queries/ | head
+```2026_09_21_09_46_1789983988
+executing输出 tests/queries/tests.py
+tests/queries/test_qs_combinators.py
+
+
+运行这两个测试文件。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py queries.test_qs_combinators queries.tests -v1 2>&1 | tail -20
+```2026_09_21_09_46_17899839892026_09_21_09_46_17899839892026_09_21_09_46_17899839892026_09_21_09_46_17899839892026_09_21_09_46_17899839892026_09_21_09_46_1789983990
+
+<system>Tool ran without output or errors</system>
+executing输出 Ran 312 tests in 0.338s
+
+OK (skipped=5, expected failures=2)
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+全部通过（312 tests OK）。由于 issue 涉及 `distinct`，也顺便检查 `distinct` 相关测试是否受影响，加跑跟 distinct 相关的模块。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py queries.test_qs_combinators.DistinctOnTests 2>&1 | tail -8
+```2026_09_21_09_46_17899839912026_09_21_09_46_17899839912026_09_21_09_46_17899839912026_09_21_09_46_17899839912026_09_21_09_46_17899839922026_09_21_09_46_1789983992
+
+<system>Tool ran without output or errors</system>2026_09_21_09_46_1789983992
+
+可能测试类名不对，看看确切名称。
+
+```bash-action
+cd /testbed && grep -n "class.*Test\|distinct" tests/queries/test_qs_combinators.py | head -40
+```2026_09_21_09_46_17899839932026_09_21_09_46_1789983993
+executing输出 AttributeError: module 'queries.test_qs_combinators' has no attribute 'DistinctOnTests'
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
+Testing against Django installed in '/testbed/django' with up to 16 processes
+System check identified no issues (1 silenced).
+
+
+类名不对。看下实际的测试类。
+
+```bash-action
+cd /testbed && grep -n "^class " tests/queries/test_qs_combinators.py
+```2026_09_21_09_46_17899839942026_09_21_09_46_17899839942026_09_21_09_46_1789983994
+
+<system>Tool ran without output or errors</system>2026_09_21_09_46_1789983994
+
+grep 没输出，可能用不同缩进。直接 cat 文件前部分。
+
+```bash-action
+cd /testbed && grep -n "class " tests/queries/test_qs_combinators.py
+```2026_09_21_09_46_17899839952026_09_21_09_46_17899839952026_09_21_09_46_1789983995
+
+<system>Tool ran without output or errors</system>
+executing输出 9:class QuerySetSetOperationTests(TestCase):
+
+
+只有这一个测试类。之前整体运行 test_qs_combinators 已经全部通过，覆盖到了。现在用 git diff 确认改动。
+
+```bash-action
+cd /testbed && git diff
+```
+executing输出 diff --git a/django/db/models/query.py b/django/db/models/query.py
+index e0eeccefa6..5c70229263 100755
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1138,6 +1138,7 @@ class QuerySet:
+         """
+         Return a new QuerySet instance that will select only distinct results.
+         """
++        self._not_support_combined_queries('distinct')
+         assert not self.query.is_sliced, \
+             "Cannot create distinct fields once a slice has been taken."
+         obj = self._chain()
+
+
+改动正是预期的，只加了一行，最小化修改。所有相关测试通过，复现脚本确认 bug 已修。任务完成。
+
+```bash-action
+exit
+```

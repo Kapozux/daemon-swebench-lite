@@ -1,0 +1,381 @@
+plan-unwanted
+我先确认一下问题所在的源码位置。
+
+```bash-action
+cd /testbed && grep -n "display_for_field" django/contrib/admin/utils.py
+```
+executing输出 380:def display_for_field(value, field, empty_value_display):
+
+
+让我看看这个函数的实现。
+
+```bash-action
+cd /testbed && sed -n '360,420p' django/contrib/admin/utils.py
+```2026_09_21_09_43_1789983834
+executing输出         attr = name
+
+    if return_attr:
+        return (label, attr)
+    else:
+        return label
+
+
+def help_text_for_field(name, model):
+    help_text = ""
+    try:
+        field = _get_non_gfk_field(model._meta, name)
+    except (FieldDoesNotExist, FieldIsAForeignKeyColumnName):
+        pass
+    else:
+        if hasattr(field, 'help_text'):
+            help_text = field.help_text
+    return help_text
+
+
+def display_for_field(value, field, empty_value_display):
+    from django.contrib.admin.templatetags.admin_list import _boolean_icon
+
+    if getattr(field, 'flatchoices', None):
+        return dict(field.flatchoices).get(value, empty_value_display)
+    # BooleanField needs special-case null-handling, so it comes before the
+    # general null test.
+    elif isinstance(field, models.BooleanField):
+        return _boolean_icon(value)
+    elif value is None:
+        return empty_value_display
+    elif isinstance(field, models.DateTimeField):
+        return formats.localize(timezone.template_localtime(value))
+    elif isinstance(field, (models.DateField, models.TimeField)):
+        return formats.localize(value)
+    elif isinstance(field, models.DecimalField):
+        return formats.number_format(value, field.decimal_places)
+    elif isinstance(field, (models.IntegerField, models.FloatField)):
+        return formats.number_format(value)
+    elif isinstance(field, models.FileField) and value:
+        return format_html('<a href="{}">{}</a>', value.url, value)
+    else:
+        return display_for_value(value, empty_value_display)
+
+
+def display_for_value(value, empty_value_display, boolean=False):
+    from django.contrib.admin.templatetags.admin_list import _boolean_icon
+
+    if boolean:
+        return _boolean_icon(value)
+    elif value is None:
+        return empty_value_display
+    elif isinstance(value, bool):
+        return str(value)
+    elif isinstance(value, datetime.datetime):
+        return formats.localize(timezone.template_localtime(value))
+    elif isinstance(value, (datetime.date, datetime.time)):
+        return formats.localize(value)
+    elif isinstance(value, (int, decimal.Decimal, float)):
+        return formats.number_format(value)
+    elif isinstance(value, (list, tuple)):
+
+
+Now let me check the JSONField's `prepare_value` method to understand the fix.
+
+```bash-action
+cd /testbed && grep -n "prepare_value\|class JSONField\|class InvalidJSONInput\|class JSONString" django/forms/fields.py
+```2026_09_21_09_43_1789983835
+executing输出 120:    def prepare_value(self, value):
+453:    def prepare_value(self, value):
+488:    def prepare_value(self, value):
+1201:    def prepare_value(self, value):
+1218:class InvalidJSONInput(str):
+1222:class JSONString(str):
+1226:class JSONField(CharField):
+1265:    def prepare_value(self, value):
+
+
+```bash-action
+cd /testbed && sed -n '1218,1290p' django/forms/fields.py
+```2026_09_21_09_43_17899838352026_09_21_09_43_1789983835
+executing输出 class InvalidJSONInput(str):
+    pass
+
+
+class JSONString(str):
+    pass
+
+
+class JSONField(CharField):
+    default_error_messages = {
+        'invalid': _('Enter a valid JSON.'),
+    }
+    widget = Textarea
+
+    def __init__(self, encoder=None, decoder=None, **kwargs):
+        self.encoder = encoder
+        self.decoder = decoder
+        super().__init__(**kwargs)
+
+    def to_python(self, value):
+        if self.disabled:
+            return value
+        if value in self.empty_values:
+            return None
+        elif isinstance(value, (list, dict, int, float, JSONString)):
+            return value
+        try:
+            converted = json.loads(value, cls=self.decoder)
+        except json.JSONDecodeError:
+            raise ValidationError(
+                self.error_messages['invalid'],
+                code='invalid',
+                params={'value': value},
+            )
+        if isinstance(converted, str):
+            return JSONString(converted)
+        else:
+            return converted
+
+    def bound_data(self, data, initial):
+        if self.disabled:
+            return initial
+        try:
+            return json.loads(data, cls=self.decoder)
+        except json.JSONDecodeError:
+            return InvalidJSONInput(data)
+
+    def prepare_value(self, value):
+        if isinstance(value, InvalidJSONInput):
+            return value
+        return json.dumps(value, cls=self.encoder)
+
+    def has_changed(self, initial, data):
+        if super().has_changed(initial, data):
+            return True
+        # For purposes of seeing whether something has changed, True isn't the
+        # same as 1 and the order of keys doesn't matter.
+        return (
+            json.dumps(initial, sort_keys=True, cls=self.encoder) !=
+            json.dumps(self.to_python(data), sort_keys=True, cls=self.encoder)
+        )
+
+
+I understand the issue. Now let me make the fix.
+
+```bash-action
+cd /testbed && python -c "
+from django.contrib.admin.utils import display_for_field
+from django.db import models
+f = models.JSONField()
+print(repr(display_for_field({'foo': 'bar'}, f, '-')))
+"
+```2026_09_21_09_43_17899838352026_09_21_09_43_1789983835
+executing输出 Traceback (most recent call last):
+  File "<string>", line 2, in <module>
+  File "/testbed/django/contrib/admin/__init__.py", line 2, in <module>
+    from django.contrib.admin.filters import (
+  File "/testbed/django/contrib/admin/filters.py", line 10, in <module>
+    from django.contrib.admin.options import IncorrectLookupParameters
+  File "/testbed/django/contrib/admin/options.py", line 8, in <module>
+    from django import forms
+  File "/testbed/django/forms/__init__.py", line 6, in <module>
+    from django.forms.boundfield import *  # NOQA
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/forms/boundfield.py", line 4, in <module>
+    from django.forms.utils import flatatt, pretty_name
+  File "/testbed/django/forms/utils.py", line 4, in <module>
+    from django.conf import settings
+  File "/testbed/django/conf/__init__.py", line 19, in <module>
+    from django.core.validators import URLValidator
+  File "/testbed/django/core/validators.py", line 8, in <module>
+    from django.utils.encoding import punycode
+  File "/testbed/django/utils/encoding.py", line 8, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+Need to set up the environment. Let me find the right python.
+
+```bash-action
+cd /testbed && ls && which python && python --version && pip list 2>/dev/null | grep -i asgiref
+```
+executing输出 AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+django
+docs
+extras
+js_tests
+llm.py
+package.json
+scripts
+setup.cfg
+setup.py
+system_prompt.txt
+tests
+tox.ini
+/opt/miniconda3/bin/python
+Python 3.11.5
+
+
+```bash-action
+cd /testbed && pip install asgiref pytz sqlparse 2>&1 | tail -3
+```2026_09_21_09_43_17899838382026_09_21_09_43_1789983837
+executing输出 Installing collected packages: pytz, sqlparse, asgiref
+Successfully installed asgiref-3.12.1 pytz-2026.3.post1 sqlparse-0.6.0
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /testbed && python -c "
+import django
+from django.conf import settings
+settings.configure(DEBUG=True, DATABASES={}, INSTALLED_APPS=['django.contrib.contenttypes','django.contrib.auth'])
+django.setup()
+from django.contrib.admin.utils import display_for_field
+from django.db import models
+f = models.JSONField()
+orig = display_for_field.__wrapped__ if hasattr(display_for_field,'__wrapped__') else display_for_field
+print(repr(display_for_field({'foo': 'bar'}, f, '-')))
+"
+```2026_09_21_09_44_17899838412026_09_21_09_43_17899838382026_09_21_09_43_1789983841
+executing输出 "{'foo': 'bar'}"
+
+
+Bug confirmed: `{'foo': 'bar'}` instead of `{"foo": "bar"}`. Now let me apply the fix.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'django/contrib/admin/utils.py'
+s = open(p).read()
+old = """    elif isinstance(field, models.FileField) and value:
+        return format_html('<a href="{}">{}</a>', value.url, value)
+    else:
+        return display_for_value(value, empty_value_display)"""
+new = """    elif isinstance(field, models.FileField) and value:
+        return format_html('<a href="{}">{}</a>', value.url, value)
+    elif isinstance(field, models.JSONField) and value:
+        try:
+            return field.formfield().prepare_value(value)
+        except TypeError:
+            return value
+    else:
+        return display_for_value(value, empty_value_display)"""
+assert old in s
+open(p,'w').write(s.replace(old,new))
+print("done")
+EOF
+```2026_09_21_09_44_17899838442026_09_21_09_44_17899838412026_09_21_09_44_17899838442026_09_21_09_44_1789983845
+executing输出 done
+
+
+Now verify the fix:
+
+```bash-action
+cd /testbed && python -c "
+import django
+from django.conf import settings
+settings.configure(DEBUG=True, DATABASES={}, INSTALLED_APPS=['django.contrib.contenttypes','django.contrib.auth'])
+django.setup()
+from django.contrib.admin.utils import display_for_field
+from django.db import models
+f = models.JSONField()
+print(repr(display_for_field({'foo': 'bar'}, f, '-')))
+print(repr(display_for_field([1,2,3], f, '-')))
+print(repr(display_for_field(None, f, 'EMPTY')))
+"
+```2026_09_21_09_44_17899838452026_09_21_09_44_17899838452026_09_21_09_44_17899838462026_09_21_09_44_1789983846
+executing输出 '{"foo": "bar"}'
+'[1, 2, 3]'
+'EMPTY'
+
+
+Now correct JSON. Let me find and run the existing tests covering this module.
+
+```bash-action
+cd /testbed && grep -rln "display_for_field" tests/
+```2026_09_21_09_44_17899838472026_09_21_09_44_17899838472026_09_21_09_44_17899838472026_09_21_09_44_17899838472026_09_21_09_44_1789983847
+executing输出 tests/admin_utils/tests.py
+
+
+```bash-action
+cd /testbed && python tests/runtests.py admin_utils 2>&1 | tail -20
+```2026_09_21_09_44_17899838492026_09_21_09_44_1789983848
+executing输出 Traceback (most recent call last):
+  File "/testbed/tests/runtests.py", line 14, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/testbed/tests/runtests.py", line 16, in <module>
+    raise RuntimeError(
+RuntimeError: Django module not found, reference tests/README.rst for instructions.
+
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python tests/runtests.py admin_utils 2>&1 | tail -20
+```2026_09_21_09_44_17899838502026_09_21_09_44_1789983850
+executing输出 Creating test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Cloning test database for alias 'default'...
+Testing against Django installed in '/testbed/django' with up to 16 processes
+System check identified no issues (0 silenced).
+..................................
+----------------------------------------------------------------------
+Ran 34 tests in 0.206s
+
+OK
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+Tests pass. Now let me check the git diff.
+
+```bash-action
+cd /testbed && git diff django/contrib/admin/utils.py
+```2026_09_21_09_44_17899838512026_09_21_09_44_17899838512026_09_21_09_44_17899838502026_09_21_09_44_17899838512026_09_21_09_44_1789983852
+
+<system>You have 161 weighted tokens left</system>
+executing输出 diff --git a/django/contrib/admin/utils.py b/django/contrib/admin/utils.py
+index e4ddc8f017..03b710d082 100755
+--- a/django/contrib/admin/utils.py
++++ b/django/contrib/admin/utils.py
+@@ -398,6 +398,11 @@ def display_for_field(value, field, empty_value_display):
+         return formats.number_format(value)
+     elif isinstance(field, models.FileField) and value:
+         return format_html('<a href="{}">{}</a>', value.url, value)
++    elif isinstance(field, models.JSONField) and value:
++        try:
++            return field.formfield().prepare_value(value)
++        except TypeError:
++            return value
+     else:
+         return display_for_value(value, empty_value_display)
+ 
+
+
+The fix is exactly as intended. Summary:
+
+- **Root cause**: `display_for_field` in `django/contrib/admin/utils.py` fell through to `display_for_value`, which returns the raw Python `repr` for dicts/lists — producing `{'foo': 'bar'}` instead of valid JSON.
+- **Fix**: Added a special case for `models.JSONField` that calls the field's form field `prepare_value` (which handles `InvalidJSONInput` too), falling back to the raw value on `TypeError`.
+- **Verification**: Bug reproduced before the change, correct JSON output after. Existing `admin_utils` test suite (34 tests) passes.
+
+Done.
+
+```bash-action
+exit
+```

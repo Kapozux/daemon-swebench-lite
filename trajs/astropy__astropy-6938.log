@@ -1,0 +1,819 @@
+plan-unwanted
+我先看一下相关源码和上下文，确认问题。
+
+```bash-action
+cd /testbed && grep -n "Replace exponent separator" -A3 -B3 astropy/io/fits/fitsrec.py
+```
+executing输出 1259-
+1260-            output_field[jdx] = value
+1261-
+1262:        # Replace exponent separator in floating point numbers
+1263-        if 'D' in format:
+1264-            output_field.replace(encode_ascii('E'), encode_ascii('D'))
+1265-
+
+
+我先看看这个函数的完整上下文，理解 `output_field` 是什么类型以及后续如何使用。
+
+```bash-action
+cd /testbed && sed -n '1200,1290p' astropy/io/fits/fitsrec.py
+```2026_09_21_09_37_1789983453
+executing输出         The ``input_field`` is the internal representation of the values, and
+        the ``output_field`` is the character array representing the ASCII
+        output that will be written.
+        """
+
+        starts = self._coldefs.starts[:]
+        spans = self._coldefs.spans
+        format = self._coldefs[col_idx].format
+
+        # The the index of the "end" column of the record, beyond
+        # which we can't write
+        end = super().field(-1).itemsize
+        starts.append(end + starts[-1])
+
+        if col_idx > 0:
+            lead = starts[col_idx] - starts[col_idx - 1] - spans[col_idx - 1]
+        else:
+            lead = 0
+
+        if lead < 0:
+            warnings.warn('Column {!r} starting point overlaps the previous '
+                          'column.'.format(col_idx + 1))
+
+        trail = starts[col_idx + 1] - starts[col_idx] - spans[col_idx]
+
+        if trail < 0:
+            warnings.warn('Column {!r} ending point overlaps the next '
+                          'column.'.format(col_idx + 1))
+
+        # TODO: It would be nice if these string column formatting
+        # details were left to a specialized class, as is the case
+        # with FormatX and FormatP
+        if 'A' in format:
+            _pc = '{:'
+        else:
+            _pc = '{:>'
+
+        fmt = ''.join([_pc, format[1:], ASCII2STR[format[0]], '}',
+                       (' ' * trail)])
+
+        # Even if the format precision is 0, we should output a decimal point
+        # as long as there is space to do so--not including a decimal point in
+        # a float value is discouraged by the FITS Standard
+        trailing_decimal = (format.precision == 0 and
+                            format.format in ('F', 'E', 'D'))
+
+        # not using numarray.strings's num2char because the
+        # result is not allowed to expand (as C/Python does).
+        for jdx, value in enumerate(input_field):
+            value = fmt.format(value)
+            if len(value) > starts[col_idx + 1] - starts[col_idx]:
+                raise ValueError(
+                    "Value {!r} does not fit into the output's itemsize of "
+                    "{}.".format(value, spans[col_idx]))
+
+            if trailing_decimal and value[0] == ' ':
+                # We have some extra space in the field for the trailing
+                # decimal point
+                value = value[1:] + '.'
+
+            output_field[jdx] = value
+
+        # Replace exponent separator in floating point numbers
+        if 'D' in format:
+            output_field.replace(encode_ascii('E'), encode_ascii('D'))
+
+
+def _get_recarray_field(array, key):
+    """
+    Compatibility function for using the recarray base class's field method.
+    This incorporates the legacy functionality of returning string arrays as
+    Numeric-style chararray objects.
+    """
+
+    # Numpy >= 1.10.dev recarray no longer returns chararrays for strings
+    # This is currently needed for backwards-compatibility and for
+    # automatic truncation of trailing whitespace
+    field = np.recarray.field(array, key)
+    if (field.dtype.char in ('S', 'U') and
+            not isinstance(field, chararray.chararray)):
+        field = field.view(chararray.chararray)
+    return field
+
+
+class _UnicodeArrayEncodeError(UnicodeEncodeError):
+    def __init__(self, encoding, object_, start, end, reason, index):
+        super().__init__(encoding, object_, start, end, reason)
+        self.index = index
+
+
+def _ascii_encode(inarray, out=None):
+
+
+Now let me look at how `output_field` is created in the calling function to understand the fix.
+
+```bash-action
+cd /testbed && grep -n "output_field\|_format_float\|def _convert_\|_get_recarray_field" astropy/io/fits/fitsrec.py | head -60
+```2026_09_21_09_37_1789983453
+executing输出 313:                    column.array = _get_recarray_field(arr.hdu.data,
+379:            field = _get_recarray_field(data, idx)
+694:        field = _get_recarray_field(base, name)
+768:    def _convert_x(self, field, recformat):
+777:    def _convert_p(self, column, field, recformat):
+819:    def _convert_ascii(self, column, field):
+860:    def _convert_other(self, column, field, recformat):
+1070:            raw_field = _get_recarray_field(self, indx)
+1154:    def _scale_back_strings(self, col_idx, input_field, output_field):
+1160:        # At the other end the *output_field* may also be of type 'S' or of
+1165:        # unicode strings (dtype 'U').  Therefore the output_field of the
+1171:        # If the output_field is non-ASCII we will worry about ASCII encoding
+1173:        if input_field.dtype.kind == 'U' and output_field.dtype.kind == 'S':
+1175:                _ascii_encode(input_field, out=output_field)
+1188:            input_field = input_field.flatten().view(output_field.dtype)
+1189:            output_field.flat[:] = input_field
+1194:        _rstrip_inplace(output_field)
+1196:    def _scale_back_ascii(self, col_idx, input_field, output_field):
+1201:        the ``output_field`` is the character array representing the ASCII
+1260:            output_field[jdx] = value
+1264:            output_field.replace(encode_ascii('E'), encode_ascii('D'))
+1267:def _get_recarray_field(array, key):
+
+
+```bash-action
+cd /testbed && sed -n '1140,1200p' astropy/io/fits/fitsrec.py
+```2026_09_21_09_37_1789983455
+executing输出                         # into arrays
+                        raw_field[:] = dummy.ravel().view(raw_field.dtype)
+
+                del dummy
+
+            # ASCII table does not have Boolean type
+            elif _bool and name in self._converted:
+                choices = (np.array([ord('F')], dtype=np.int8)[0],
+                           np.array([ord('T')], dtype=np.int8)[0])
+                raw_field[:] = np.choose(field, choices)
+
+        # Store the updated heapsize
+        self._heapsize = heapsize
+
+    def _scale_back_strings(self, col_idx, input_field, output_field):
+        # There are a few possibilities this has to be able to handle properly
+        # The input_field, which comes from the _converted column is of dtype
+        # 'Un' so that elements read out of the array are normal str
+        # objects (i.e. unicode strings)
+        #
+        # At the other end the *output_field* may also be of type 'S' or of
+        # type 'U'.  It will *usually* be of type 'S' because when reading
+        # an existing FITS table the raw data is just ASCII strings, and
+        # represented in Numpy as an S array.  However, when a user creates
+        # a new table from scratch, they *might* pass in a column containing
+        # unicode strings (dtype 'U').  Therefore the output_field of the
+        # raw array is actually a unicode array.  But we still want to make
+        # sure the data is encodable as ASCII.  Later when we write out the
+        # array we use, in the dtype 'U' case, a different write routine
+        # that writes row by row and encodes any 'U' columns to ASCII.
+
+        # If the output_field is non-ASCII we will worry about ASCII encoding
+        # later when writing; otherwise we can do it right here
+        if input_field.dtype.kind == 'U' and output_field.dtype.kind == 'S':
+            try:
+                _ascii_encode(input_field, out=output_field)
+            except _UnicodeArrayEncodeError as exc:
+                raise ValueError(
+                    "Could not save column '{0}': Contains characters that "
+                    "cannot be encoded as ASCII as required by FITS, starting "
+                    "at the index {1!r} of the column, and the index {2} of "
+                    "the string at that location.".format(
+                        self._coldefs[col_idx].name,
+                        exc.index[0] if len(exc.index) == 1 else exc.index,
+                        exc.start))
+        else:
+            # Otherwise go ahead and do a direct copy into--if both are type
+            # 'U' we'll handle encoding later
+            input_field = input_field.flatten().view(output_field.dtype)
+            output_field.flat[:] = input_field
+
+        # Ensure that blanks at the end of each string are
+        # converted to nulls instead of spaces, see Trac #15
+        # and #111
+        _rstrip_inplace(output_field)
+
+    def _scale_back_ascii(self, col_idx, input_field, output_field):
+        """
+        Convert internal array values back to ASCII table representation.
+
+        The ``input_field`` is the internal representation of the values, and
+
+
+Now let me check how `_scale_back_ascii` is called to understand the `output_field` type.
+
+```bash-action
+cd /testbed && grep -n "_scale_back_ascii" astropy/io/fits/fitsrec.py
+```2026_09_21_09_37_17899834552026_09_21_09_37_1789983455
+executing输出 1125:                    self._scale_back_ascii(indx, dummy, raw_field)
+1196:    def _scale_back_ascii(self, col_idx, input_field, output_field):
+
+
+```bash-action
+cd /testbed && sed -n '1090,1135p' astropy/io/fits/fitsrec.py
+```2026_09_21_09_37_1789983457
+executing输出                     raw_field[:, 1][:] += heapsize
+
+                heapsize += raw_field[:, 0].sum() * dtype.itemsize
+                # Even if this VLA has not been read or updated, we need to
+                # include the size of its constituent arrays in the heap size
+                # total
+
+            if isinstance(recformat, _FormatX) and name in self._converted:
+                _wrapx(self._converted[name], raw_field, recformat.repeat)
+                continue
+
+            _str, _bool, _number, _scale, _zero, bscale, bzero, _ = \
+                self._get_scale_factors(column)
+
+            field = self._converted.get(name, raw_field)
+
+            # conversion for both ASCII and binary tables
+            if _number or _str:
+                if _number and (_scale or _zero) and column._physical_values:
+                    dummy = field.copy()
+                    if _zero:
+                        dummy -= bzero
+                    if _scale:
+                        dummy /= bscale
+                    # This will set the raw values in the recarray back to
+                    # their non-physical storage values, so the column should
+                    # be mark is not scaled
+                    column._physical_values = False
+                elif _str or isinstance(self._coldefs, _AsciiColDefs):
+                    dummy = field
+                else:
+                    continue
+
+                # ASCII table, convert numbers to strings
+                if isinstance(self._coldefs, _AsciiColDefs):
+                    self._scale_back_ascii(indx, dummy, raw_field)
+                # binary table string column
+                elif isinstance(raw_field, chararray.chararray):
+                    self._scale_back_strings(indx, dummy, raw_field)
+                # all other binary table columns
+                else:
+                    if len(raw_field) and isinstance(raw_field[0],
+                                                     np.integer):
+                        dummy = np.around(dummy)
+
+                    if raw_field.shape == dummy.shape:
+
+
+Now I understand. `raw_field` comes from `_get_recarray_field`, which returns a `chararray.chararray` for 'S' dtype. The `.replace()` method for chararray returns a copy, so the call doesn't modify in place.
+
+The fix: assign the result back, or better yet, copy into the field in-place. Since `output_field` is a chararray view into the raw data, we need to write back. Let me create a minimal reproduction first to confirm the bug.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import numpy as np
+from astropy.io import fits
+
+# Create an ASCII table with D-format (double precision) column
+col = fits.Column(name='x', format='D10.3', array=np.array([1.5, 2.5, 3.5]))
+hdul = fits.HDUList([fits.PrimaryHDU(), fits.TableHDU.from_columns([col])])
+hdul.writeto('/tmp/test_d.fits', overwrite=True)
+
+# Read raw bytes back to check for 'D' exponent
+with open('/tmp/test_d.fits', 'rb') as f:
+    data = f.read()
+
+# Find the data section - search for the numeric values
+print(repr(data[-80:]))
+EOF
+python /tmp/repro.py
+```2026_09_21_09_37_17899834572026_09_21_09_37_1789983458
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+
+
+```bash-action
+cd /testbed && which python && python --version && python -c "import sys; print(sys.executable)"
+```
+executing输出 /opt/miniconda3/bin/python
+Python 3.11.5
+/opt/miniconda3/bin/python
+
+
+```bash-action
+cd /testbed && ls /opt/miniconda3/envs/ && cat /testbed/setup.cfg 2>/dev/null | head -5
+```2026_09_21_09_37_1789983460
+executing输出 testbed
+[build_sphinx]
+source-dir = docs
+build-dir = docs/_build
+all_files = 1
+
+
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_37_17899834602026_09_21_09_37_1789983460
+executing输出 b'                                                                                '
+
+
+The values aren't in the last part. Let me improve the repro to search properly.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import numpy as np
+from astropy.io import fits
+
+# Create an ASCII table with D-format (double precision) column
+col = fits.Column(name='x', format='D12.3', array=np.array([1.5, 2.5, 3.5]))
+hdul = fits.HDUList([fits.PrimaryHDU(), fits.TableHDU.from_columns([col])])
+hdul.writeto('/tmp/test_d.fits', overwrite=True)
+
+with open('/tmp/test_d.fits', 'rb') as f:
+    data = f.read()
+
+import re
+# find numeric fields
+print("Data portion:", repr(data[2880:]))
+m = re.findall(rb'[0-9.E D+-]{5,}', data[2880:])
+print(m)
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_37_17899834612026_09_21_09_37_1789983462
+executing输出 Data portion: b"XTENSION= 'TABLE   '           / ASCII table extension                          BITPIX  =                    8 / array data type                                NAXIS   =                    2 / number of array dimensions                     NAXIS1  =                   12 / length of dimension 1                          NAXIS2  =                    3 / length of dimension 2                          PCOUNT  =                    0 / number of group parameters                     GCOUNT  =                    1 / number of groups                               TFIELDS =                    1 / number of table fields                         TTYPE1  = 'x       '                                                            TFORM1  = 'D12.3   '                                                            TBCOL1  =                    1                                                  END                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+....(省略中间部分)...
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            ']
+
+
+The data rows are empty! The values are spaces. That's a more serious issue. Let me check what's happening - the format `D12.3` produces something. Let me debug directly.
+
+```bash-action
+cd /testbed && cat > /tmp/repro2.py << 'EOF'
+import numpy as np
+from astropy.io import fits
+
+col = fits.Column(name='x', format='D12.3', array=np.array([1.5, 2.5, 3.5]))
+hdul = fits.HDUList([fits.PrimaryHDU(), fits.TableHDU.from_columns([col])])
+hdu = hdul[1]
+hdu.writeto('/tmp/test_d2.fits', overwrite=True)
+
+# Inspect the raw data array
+coldefs = hdu.columns
+print("format:", coldefs[0].format)
+arr = hdu.data
+print(arr)
+print(repr(arr['x']))
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro2.py
+```2026_09_21_09_37_17899834632026_09_21_09_37_1789983464
+executing输出 format: D12.3
+[(1.5,) (2.5,) (3.5,)]
+array([1.5, 2.5, 3.5])
+
+
+The in-memory data is fine, but upon writing, the values become blank. This confirms there's a bug in `_scale_back_ascii`. Let me add a debug to see what `value` looks like before assignment.
+
+```bash-action
+cd /testbed && cat > /tmp/repro3.py << 'EOF'
+import numpy as np
+from astropy.io import fits
+from astropy.io.fits import fitsrec
+
+orig = fitsrec.FITS_rec._scale_back_ascii
+def patched(self, col_idx, input_field, output_field):
+    print("input:", repr(input_field))
+    print("output dtype:", output_field.dtype, "shape", output_field.shape)
+    orig(self, col_idx, input_field, output_field)
+    print("after output:", repr(output_field))
+fitsrec.FITS_rec._scale_back_ascii = patched
+
+col = fits.Column(name='x', format='D12.3', array=np.array([1.5, 2.5, 3.5]))
+hdul = fits.HDUList([fits.PrimaryHDU(), fits.TableHDU.from_columns([col])])
+hdul.writeto('/tmp/test_d3.fits', overwrite=True)
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro3.py
+```2026_09_21_09_37_17899834652026_09_21_09_37_17899834652026_09_21_09_37_1789983466
+executing输出 input: array([1.5, 2.5, 3.5])
+output dtype: |S12 shape (3,)
+after output: chararray([b'   1.500E+00', b'   2.500E+00', b'   3.500E+00'],
+          dtype='|S12')
+
+
+Interesting! So `_scale_back_ascii` correctly writes `b'   1.500E+00'` (with E). Then the `'D' in format` branch is SUPPOSED to replace E with D but fails (because `.replace()` returns a copy). Actually wait, values show fine here after the function... Let me check why the file is blank. The issue is the trailing `_rstrip`? No. Let me check the intermediate write path. Actually the patched function shows correct output. Let me re-examine the file.
+
+Actually, the repro2 showed the file values blank. Let me look more carefully at how the write handles the chararray encoding for ASCII tables.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+with open('/tmp/test_d3.fits','rb') as f:
+    d = f.read()
+print(repr(d[2880:]))
+print(len(d))
+"
+```2026_09_21_09_37_1789983468202609_21_09_37_1789983469
+executing输出 b"XTENSION= 'TABLE   '           / ASCII table extension                          BITPIX  =                    8 / array data type                                NAXIS   =                    2 / number of array dimensions                     NAXIS1  =                   12 / length of dimension 1                          NAXIS2  =                    3 / length of dimension 2                          PCOUNT  =                    0 / number of group parameters                     GCOUNT  =                    1 / number of groups                               TFIELDS =                    1 / number of table fields                         TTYPE1  = 'x       '                                                            TFORM1  = 'D12.3   '                                                            TBCOL1  =                    1                                                  END                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+....(省略中间部分)...
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        "
+8640
+
+
+The data portion is entirely spaces in the file, even though `_scale_back_ascii` set the raw_field to the correct values. This means the data written is from a different array, OR the write path re-does the conversion. Let me trace the actual write. Wait - maybe `output_field` is not the actual `raw_field` used for writing. Let me check the writeto path and whether there are two conversions.
+
+Actually let me test with `E` format to compare:
+
+```bash-action
+cd /testbed && cat > /tmp/repro4.py << 'EOF'
+import numpy as np
+from astropy.io import fits
+
+for fmt in ('E12.3', 'D12.3', 'F12.3'):
+    col = fits.Column(name='x', format=fmt, array=np.array([1.5, 2.5, 3.5]))
+    hdul = fits.HDUList([fits.PrimaryHDU(), fits.TableHDU.from_columns([col])])
+    hdul.writeto('/tmp/t.fits', overwrite=True)
+    with open('/tmp/t.fits','rb') as f:
+        d = f.read()
+    print(fmt, repr(d[2880:2880+36]))
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro4.py
+```2026_09_21_09_37_17899834702026_09_21_09_37_1789983471
+executing输出 E12.3 b"XTENSION= 'TABLE   '           / ASC"
+D12.3 b"XTENSION= 'TABLE   '           / ASC"
+F12.3 b"XTENSION= 'TABLE   '           / ASC"
+
+
+The data is later in the file. Let me find the data offset properly (headers are 2880-byte blocks; this has multiple header blocks).
+
+```bash-action
+cd /testbed && cat > /tmp/repro5.py << 'EOF'
+import numpy as np
+from astropy.io import fits
+
+for fmt in ('E12.3', 'D12.3', 'F12.3'):
+    col = fits.Column(name='x', format=fmt, array=np.array([1.5, 2.5, 3.5]))
+    hdul = fits.HDUList([fits.PrimaryHDU(), fits.TableHDU.from_columns([col])])
+    hdul.writeto('/tmp/t.fits', overwrite=True)
+    with open('/tmp/t.fits','rb') as f:
+        d = f.read()
+    # find END marker then data follows at next 2880 boundary
+    idx = d.index(b'END' , 2880)
+    start = ((idx // 2880) + 1) * 2880
+    print(fmt, repr(d[start:start+36]))
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro5.py
+```2026_09_21_09_37_17899834722026_09_21_09_37_1789983473
+executing输出 E12.3 b'   1.500E+00   2.500E+00   3.500E+00'
+D12.3 b'   1.500E+00   2.500E+00   3.500E+00'
+F12.3 b'       1.500       2.500       3.500'
+
+
+Now confirmed the bug. `D12.3` should write `D` exponents (`1.500D+00`) but writes `E`. The `.replace()` call returns a copy and doesn't modify in-place.
+
+Now the fix. `output_field` is a chararray. I'll use in-place comparison and assignment:
+
+```bash-action
+cd /testbed && sed -n '1258,1266p' astropy/io/fits/fitsrec.py
+```2026_09_21_09_37_17899834752026_09_21_09_37_1789983475
+executing输出                 value = value[1:] + '.'
+
+            output_field[jdx] = value
+
+        # Replace exponent separator in floating point numbers
+        if 'D' in format:
+            output_field.replace(encode_ascii('E'), encode_ascii('D'))
+
+
+
+
+Now let me apply the fix. Since the field is a chararray, I can use element-wise comparison for in-place replacement.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import numpy as np
+from numpy import chararray
+a = chararray.chararray(3, itemsize=12)
+a[:] = [b'1.500E+00', b'2.500E+00', b'3.500E+00']
+print(repr(a))
+a[a == b'E'] = b'D'
+print(repr(a))
+"
+```2026_09_21_09_37_17899834762026_09_21_09_37_1789983477
+executing输出 Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+AttributeError: type object 'chararray' has no attribute 'chararray'
+
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import numpy as np
+from numpy import chararray
+a = chararray(a) if False else None
+a = chararray.chararray(3, itemsize=12)
+print(type(a))
+"
+```
+
+Let me check the import.
+
+```bash-action
+cd /testbed && grep -n "chararray" astropy/io/fits/fitsrec.py | head
+```2026_09_21_09_37_17899834782026_09_21_09_37_17899834792026_09_21_09_37_1789983480
+executing输出 Traceback (most recent call last):
+  File "<string>", line 5, in <module>
+AttributeError: type object 'chararray' has no attribute 'chararray'
+
+
+Let me find how chararray is imported.
+
+```bash-action
+cd /testbed && grep -n "import.*chararray\|chararray\." astropy/io/fits/fitsrec.py | head -20
+```2026_09_21_09_37_17899834792026_09_21_09_37_17899834792026_09_21_09_37_1789983480
+executing输出 13:from numpy import char as chararray
+1127:                elif isinstance(raw_field, chararray.chararray):
+1279:            not isinstance(field, chararray.chararray)):
+1280:        field = field.view(chararray.chararray)
+
+
+`from numpy import char as chararray`. Let me test in-place replacement.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import numpy as np
+from numpy import char as chararray
+a = chararray.chararray(3, itemsize=12)
+a[:] = [b'1.500E+00', b'2.500E+00', b'3.500E+00']
+print(repr(a))
+a[a == b'E'] = b'D'
+print(repr(a))
+"
+```2026_09_21_09_38_17899834802026_09_21_09_38_1789983481
+executing输出 chararray([b'1.500E+00', b'2.500E+00', b'3.500E+00'], dtype='|S12')
+chararray([b'1.500E+00', b'2.500E+00', b'3.500E+00'], dtype='|S12')
+
+
+The whole-element comparison `a == b'E'` doesn't work. Let me test with the encode_ascii version used in code, and single-char comparison.
+
+```bash-action
+cd /testbed && grep -n "encode_ascii" astropy/io/fits/fitsrec.py | head
+```2026_09_21_09_38_17899834822026_09_21_09_38_1789983482
+executing输出 18:from .util import decode_ascii, encode_ascii, _rstrip_inplace
+837:        dummy = np.char.replace(dummy, encode_ascii('D'), encode_ascii('E'))
+838:        null_fill = encode_ascii(str(ASCIITNULL).rjust(format.width))
+1264:            output_field.replace(encode_ascii('E'), encode_ascii('D'))
+
+
+Line 837 shows the correct usage of `np.char.replace` for the reverse direction (D→E). Let me look at that.
+
+```bash-action
+cd /testbed && sed -n '819,860p' astropy/io/fits/fitsrec.py
+```2026_09_21_09_38_17899834832026_09_21_09_38_17899834842026_09_21_09_38_1789983484
+executing输出     def _convert_ascii(self, column, field):
+        """
+        Special handling for ASCII table columns to convert columns containing
+        numeric types to actual numeric arrays from the string representation.
+        """
+
+        format = column.format
+        recformat = ASCII2NUMPY[format[0]]
+        # if the string = TNULL, return ASCIITNULL
+        nullval = str(column.null).strip().encode('ascii')
+        if len(nullval) > format.width:
+            nullval = nullval[:format.width]
+
+        # Before using .replace make sure that any trailing bytes in each
+        # column are filled with spaces, and *not*, say, nulls; this causes
+        # functions like replace to potentially leave gibberish bytes in the
+        # array buffer.
+        dummy = np.char.ljust(field, format.width)
+        dummy = np.char.replace(dummy, encode_ascii('D'), encode_ascii('E'))
+        null_fill = encode_ascii(str(ASCIITNULL).rjust(format.width))
+
+        # Convert all fields equal to the TNULL value (nullval) to empty fields.
+        # TODO: These fields really should be conerted to NaN or something else undefined.
+        # Currently they are converted to empty fields, which are then set to zero.
+        dummy = np.where(np.char.strip(dummy) == nullval, null_fill, dummy)
+
+        # always replace empty fields, see https://github.com/astropy/astropy/pull/5394
+        if nullval != b'':
+            dummy = np.where(np.char.strip(dummy) == b'', null_fill, dummy)
+
+        try:
+            dummy = np.array(dummy, dtype=recformat)
+        except ValueError as exc:
+            indx = self.names.index(column.name)
+            raise ValueError(
+                '{}; the header may be missing the necessary TNULL{} '
+                'keyword or the table contains invalid data'.format(
+                    exc, indx + 1))
+
+        return dummy
+
+    def _convert_other(self, column, field, recformat):
+
+
+The read path uses `np.char.replace` which returns a new array, then reassigns to `dummy`. The write path uses `output_field.replace(...)` which is chararray's method returning a copy. Since `output_field` is a view into the raw data, we should use `np.char.replace` and assign back in-place using `output_field[:] = ...`.
+
+Let me apply the fix:
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import numpy as np
+from numpy import char as chararray
+from astropy.io.fits.util import encode_ascii
+a = chararray.chararray(3, itemsize=12)
+a[:] = [b'1.500E+00', b'2.500E+00', b'3.500E+00']
+res = np.char.replace(a, encode_ascii('E'), encode_ascii('D'))
+print(repr(res))
+a[:] = res
+print(repr(a))
+"
+```2026_09_21_09_38_17899834842026_09_21_09_38_17899834852026_09_21_09_38_1789983485
+executing输出 array([b'1.500D+00', b'2.500D+00', b'3.500D+00'], dtype='|S9')
+chararray([b'1.500D+00', b'2.500D+00', b'3.500D+00'], dtype='|S12')
+
+
+That works. `np.char.replace` returns a new array which I assign back into the view. Now let me apply the fix.
+
+```bash-action
+cd /testbed && python - << 'EOF'
+import re
+p = 'astropy/io/fits/fitsrec.py'
+s = open(p).read()
+old = """        # Replace exponent separator in floating point numbers
+        if 'D' in format:
+            output_field.replace(encode_ascii('E'), encode_ascii('D'))
+"""
+new = """        # Replace exponent separator in floating point numbers
+        if 'D' in format:
+            output_field[:] = np.char.replace(output_field, encode_ascii('E'),
+                                              encode_ascii('D'))
+"""
+assert old in s
+s = s.replace(old, new)
+open(p, 'w').write(s)
+print("done")
+EOF
+```
+```bash-action
+cd /testbed && git diff
+```
+executing输出 done
+
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_38_17899834892026_09_21_09_38_1789983489
+executing输出 diff --git a/astropy/io/fits/fitsrec.py b/astropy/io/fits/fitsrec.py
+index 574b4073b..621e0925b 100755
+--- a/astropy/io/fits/fitsrec.py
++++ b/astropy/io/fits/fitsrec.py
+@@ -1261,7 +1261,8 @@ class FITS_rec(np.recarray):
+ 
+         # Replace exponent separator in floating point numbers
+         if 'D' in format:
+-            output_field.replace(encode_ascii('E'), encode_ascii('D'))
++            output_field[:] = np.char.replace(output_field, encode_ascii('E'),
++                                              encode_ascii('D'))
+ 
+ 
+ def _get_recarray_field(array, key):
+
+
+Wait, `np.char.replace` on a chararray returns an array of shorter dtype (`|S9` in my test). Assigning back into `output_field[:]` (itemsize 12) works because numpy casts/pads. But let me verify the actual result is correct with padding. Let me rerun the repro.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro5.py
+```2026_09_21_09_38_17899834902026_09_21_09_38_17899834902026_09_21_09_38_1789983491
+executing输出 E12.3 b'   1.500E+00   2.500E+00   3.500E+00'
+D12.3 b'   1.500D+00   2.500D+00   3.500D+00'
+F12.3 b'       1.500       2.500       3.500'
+
+
+Now `D12.3` correctly writes `D` exponents. Let me also verify round-trip reading works and check edge cases like a column that is `D` format but with values whose mantissa has no E (very small). Let me run the existing test suite for fitsrec/ASCII tables.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import numpy as np
+from astropy.io import fits
+for vals in ([1.5,2.5], [1e100, 1e-100], [0.0, -1.25]):
+    col = fits.Column(name='x', format='D20.10', array=np.array(vals))
+    hdul = fits.HDUList([fits.PrimaryHDU(), fits.TableHDU.from_columns([col])])
+    hdul.writeto('/tmp/r.fits', overwrite=True)
+    with open('/tmp/r.fits','rb') as f: d=f.read()
+    idx=d.index(b'END',2880); start=((idx//2880)+1)*2880
+    print(repr(d[start:start+41]))
+    back = fits.open('/tmp/r.fits')[1].data['x']
+    print('roundtrip:', back, np.allclose(back, vals))
+"
+```2026_09_21_09_38_17899834912026_09_21_09_38_17899834922026_09_21_09_38_17899834922026_09_21_09_38_1789983493
+executing输出 b'    1.5000000000D+00    2.5000000000D+00 '
+roundtrip: [1.5 2.5] True
+b'   1.0000000000D+100   1.0000000000D-100 '
+roundtrip: [1.e+100 1.e-100] True
+b'    0.0000000000D+00   -1.2500000000D+00 '
+roundtrip: [ 0.   -1.25] True
+
+
+All cases work correctly with D exponents and roundtrip properly. Now let me run the existing tests covering the ASCII table write path.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest astropy/io/fits/tests/test_ascii.py -q 2>&1 | tail -20
+```2026_09_21_09_38_17899834942026_09_21_09_38_17899834952026_09_21_09_38_17899834952026_09_21_09_38_1789983495
+executing输出 
+=============================== warnings summary ===============================
+None
+  Module already imported so cannot be rewritten: astropy.tests.plugins.display
+
+-- Docs: http://doc.pytest.org/en/latest/warnings.html
+1 warnings in 0.00 seconds
+ERROR: file not found: astropy/io/fits/tests/test_ascii.py
+
+
+```bash-action
+cd /testbed && ls astropy/io/fits/tests/ | grep -i "ascii\|table\|fitsrec\|connect"
+```2026_09_21_09_38_17899834952026_09_21_09_38_17899834952026_09_21_09_38_17899834962026_09_21_09_38_17899834962026_09_21_09_38_1789983496
+executing输出 test_connect.py
+test_table.py
+
+
+ASCII table tests are in `test_table.py`. Let me run the relevant ones.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest astropy/io/fits/tests/test_table.py -q -k "ascii or D or exponent or format" 2>&1 | tail -20
+```2026_09_21_09_38_17899834962026_09_21_09_38_17899834972026_09_21_09_38_17899834972026_09_21_09_38_17899834972026_09_21_09_38_17899834972026_09_21_09_38_1789983497
+executing输出 ........                                                                 [100%]
+=============================== warnings summary ===============================
+None
+  Module already imported so cannot be rewritten: astropy.tests.plugins.display
+
+-- Docs: http://doc.pytest.org/en/latest/warnings.html
+============================= 78 tests deselected ==============================
+8 passed, 78 deselected, 1 warnings in 0.64 seconds
+
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest astropy/io/fits/tests/test_table.py -q 2>&1 | tail -15
+```2026_09_21_09_38_17899834992026_09_21_09_38_17899835002026_09_21_09_38_17899835002026_09_21_09_38_17899835002026_09_21_09_38_17899835002026_09_21_09_38_17899835002026_09_21_09_38_17899835002026_09_21_09_38_1789983501
+executing输出 .............................................................ss......... [ 83%]
+..............                                                           [100%]
+=============================== warnings summary ===============================
+None
+  Module already imported so cannot be rewritten: astropy.tests.plugins.display
+
+-- Docs: http://doc.pytest.org/en/latest/warnings.html
+84 passed, 2 skipped, 1 warnings in 0.93 seconds
+
+
+All tests pass. Let me also run the broader fits test suite parts related to fitsrec to be safe.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest astropy/io/fits/tests/test_connect.py -q 2>&1 | tail -8
+```2026_09_21_09_38_17899835022026_09_21_09_38_17899835032026_09_21_09_38_17899835032026_09_21_09_38_17899835032026_09_21_09_38_17899835032026_09_21_09_38_17899835032026_09_21_09_38_17899835042026_09_21_09_38_17899835032026_09_21_09_38_17899835032026_09_21_09_38_17899835042026_09_21_09_38_1789983504
+
+<system>Tool ran without output or errors</system>
+executing输出 .........................................ssss...........ss               [100%]
+=============================== warnings summary ===============================
+None
+  Module already imported so cannot be rewritten: astropy.tests.plugins.display
+
+-- Docs: http://doc.pytest.org/en/latest/warnings.html
+52 passed, 6 skipped, 1 warnings in 1.24 seconds
+
+
+All tests pass. The fix is confirmed correct. Let me verify the final diff once more.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_38_17899835052026_09_21_09_38_17899835052026_09_21_09_38_17899835062026_09_21_09_38_17899835062026_09_21_09_38_17899835062026_09_21_09_38_17899835062026_09_21_09_38_17899835072026_09_21_09_38_17899835062026_09_21_09_38_17899835062026_09_21_09_38_17899835072026_09_21_09_38_17899835072026_09_21_09_38_1789983507
+executing输出 diff --git a/astropy/io/fits/fitsrec.py b/astropy/io/fits/fitsrec.py
+index 574b4073b..621e0925b 100755
+--- a/astropy/io/fits/fitsrec.py
++++ b/astropy/io/fits/fitsrec.py
+@@ -1261,7 +1261,8 @@ class FITS_rec(np.recarray):
+ 
+         # Replace exponent separator in floating point numbers
+         if 'D' in format:
+-            output_field.replace(encode_ascii('E'), encode_ascii('D'))
++            output_field[:] = np.char.replace(output_field, encode_ascii('E'),
++                                              encode_ascii('D'))
+ 
+ 
+ def _get_recarray_field(array, key):
+
+
+The fix is complete and verified.
+
+**Root cause:** In `astropy/io/fits/fitsrec.py`, `_scale_back_ascii` called `output_field.replace(...)`. For numpy `chararray`, `.replace()` returns a *copy* rather than modifying in place, so the `E`→`D` exponent replacement for ASCII `D`-format columns was silently discarded, and data was written with `E` exponents (violating the FITS standard for `D` format).
+
+**Fix:** Use `np.char.replace` (which returns a new array) and assign the result back into `output_field[:]`, an in-place write into the underlying raw record buffer. This mirrors the reverse conversion already used in `_convert_ascii`.
+
+**Verification:**
+- Reproduced the bug before the fix (`D12.3` wrote `1.500E+00`).
+- After the fix `D12.3` writes `1.500D+00`; round-trip read/write works for normal, large/small (1e100/1e-100), zero and negative values.
+- `test_table.py`: 84 passed, 2 skipped; `test_connect.py`: 52 passed, 6 skipped.
+
+```bash-action
+exit
+```
