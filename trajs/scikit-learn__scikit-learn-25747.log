@@ -1,0 +1,685 @@
+plan-unwanted
+我先复现这个 bug，确认问题存在。
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn import set_config
+from sklearn.pipeline import make_union
+
+index = pd.date_range(start="2020-01-01", end="2020-01-05", inclusive="left", freq="H")
+data = pd.DataFrame(index=index, data=[10] * len(index), columns=["value"])
+data["date"] = index.date
+
+
+class MyTransformer(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None, **kwargs):
+        return self
+    def transform(self, X, y=None):
+        return X["value"].groupby(X["date"]).sum()
+
+
+set_config(transform_output="pandas")
+print(make_union(MyTransformer()).fit_transform(data))
+EOF
+python /tmp/repro.py
+```
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import pandas as pd
+ModuleNotFoundError: No module named 'pandas'
+
+
+pandas 不可用。先确认环境中是否有其他 python，以及是否可以处理这个场景。
+
+```bash-action
+cd /testbed && python -c "import sklearn; print(sklearn.__version__)"; which python; pip list 2>/dev/null | grep -i pandas
+```
+executing输出 Traceback (most recent call last):
+  File "/testbed/sklearn/__check_build/__init__.py", line 48, in <module>
+    from ._check_build import check_build  # noqa
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'sklearn.__check_build._check_build'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/testbed/sklearn/__init__.py", line 81, in <module>
+    from . import __check_build  # noqa: F401
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/sklearn/__check_build/__init__.py", line 50, in <module>
+    raise_build_error(e)
+  File "/testbed/sklearn/__check_build/__init__.py", line 31, in raise_build_error
+    raise ImportError(
+ImportError: No module named 'sklearn.__check_build._check_build'
+___________________________________________________________________________
+Contents of /testbed/sklearn/__check_build:
+_check_build.cpython-39-x86_64-linux-gnu.so__init__.py               _check_build.pyx
+_check_build.c            __pycache__
+___________________________________________________________________________
+It seems that scikit-learn has not been built correctly.
+
+If you have installed scikit-learn from source, please do not forget
+to build the package before using it: run `python setup.py install` or
+`make` in the source directory.
+
+If you have used an installer, please check that it is suited for your
+Python version, your operating system and your platform.
+/opt/miniconda3/bin/python
+
+
+Python 版本不匹配（编译产物是 cpython-39，当前 python 可能不是 3.9）。让我检查。
+
+```bash-action
+cd /testbed && python --version && ls /opt/miniconda3/envs/ 2>/dev/null && find / -name "_check_build.cpython-39*.so" 2>/dev/null
+```2026_09_21_10_36_1789986968
+executing输出 Python 3.11.5
+testbed
+/testbed/sklearn/__check_build/_check_build.cpython-39-x86_64-linux-gnu.so
+/testbed/build/lib.linux-x86_64-cpython-39/sklearn/__check_build/_check_build.cpython-39-x86_64-linux-gnu.so
+
+
+需要用 testbed 环境（python 3.9）。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "import pandas, sklearn; print(pandas.__version__, sklearn.__version__)"
+```2026_09_21_10_36_1789986971
+executing输出 1.4.4 1.3.dev0
+
+
+Good, use that env. Now reproduce.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_10_36_1789986974
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 19, in <module>
+    print(make_union(MyTransformer()).fit_transform(data))
+  File "/testbed/sklearn/utils/_set_output.py", line 150, in wrapped
+    return _wrap_data_with_container(method, data_to_wrap, X, self)
+  File "/testbed/sklearn/utils/_set_output.py", line 130, in _wrap_data_with_container
+    return _wrap_in_pandas_container(
+  File "/testbed/sklearn/utils/_set_output.py", line 59, in _wrap_in_pandas_container
+    data_to_wrap.index = index
+  File "/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/pandas/core/generic.py", line 5588, in __setattr__
+    return object.__setattr__(self, name, value)
+  File "pandas/_libs/properties.pyx", line 70, in pandas._libs.properties.AxisProperty.__set__
+  File "/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/pandas/core/generic.py", line 769, in _set_axis
+    self._mgr.set_axis(axis, labels)
+  File "/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/pandas/core/internals/managers.py", line 214, in set_axis
+    self._validate_set_axis(axis, new_labels)
+  File "/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/pandas/core/internals/base.py", line 69, in _validate_set_axis
+    raise ValueError(
+ValueError: Length mismatch: Expected axis has 4 elements, new values have 96 elements
+
+
+Bug 复现。现在看相关源码。
+
+```bash-action
+cd /testbed && sed -n '1,160p' sklearn/utils/_set_output.py
+```2026_09_21_10_36_17899869752026_09_21_10_36_1789986973
+executing输出 from functools import wraps
+
+from scipy.sparse import issparse
+
+from . import check_pandas_support
+from .._config import get_config
+from ._available_if import available_if
+
+
+def _wrap_in_pandas_container(
+    data_to_wrap,
+    *,
+    columns,
+    index=None,
+):
+    """Create a Pandas DataFrame.
+
+    If `data_to_wrap` is a DataFrame, then the `columns` and `index` will be changed
+    inplace. If `data_to_wrap` is a ndarray, then a new DataFrame is created with
+    `columns` and `index`.
+
+    Parameters
+    ----------
+    data_to_wrap : {ndarray, dataframe}
+        Data to be wrapped as pandas dataframe.
+
+    columns : callable, ndarray, or None
+        The column names or a callable that returns the column names. The
+        callable is useful if the column names require some computation.
+        If `columns` is a callable that raises an error, `columns` will have
+        the same semantics as `None`. If `None` and `data_to_wrap` is already a
+        dataframe, then the column names are not changed. If `None` and
+        `data_to_wrap` is **not** a dataframe, then columns are
+        `range(n_features)`.
+
+    index : array-like, default=None
+        Index for data.
+
+    Returns
+    -------
+    dataframe : DataFrame
+        Container with column names or unchanged `output`.
+    """
+    if issparse(data_to_wrap):
+        raise ValueError("Pandas output does not support sparse data.")
+
+    if callable(columns):
+        try:
+            columns = columns()
+        except Exception:
+            columns = None
+
+    pd = check_pandas_support("Setting output container to 'pandas'")
+
+    if isinstance(data_to_wrap, pd.DataFrame):
+        if columns is not None:
+            data_to_wrap.columns = columns
+        if index is not None:
+            data_to_wrap.index = index
+        return data_to_wrap
+
+    return pd.DataFrame(data_to_wrap, index=index, columns=columns)
+
+
+def _get_output_config(method, estimator=None):
+    """Get output config based on estimator and global config
+....(省略中间部分)...
+(method, data_to_wrap, original_input, estimator):
+    """Wrap output with container based on an estimator's or global config.
+
+    Parameters
+    ----------
+    method : {"transform"}
+        Estimator's method to get container output for.
+
+    data_to_wrap : {ndarray, dataframe}
+        Data to wrap with container.
+
+    original_input : {ndarray, dataframe}
+        Original input of function.
+
+    estimator : estimator instance
+        Estimator with to get the output configuration from.
+
+    Returns
+    -------
+    output : {ndarray, dataframe}
+        If the output config is "default" or the estimator is not configured
+        for wrapping return `data_to_wrap` unchanged.
+        If the output config is "pandas", return `data_to_wrap` as a pandas
+        DataFrame.
+    """
+    output_config = _get_output_config(method, estimator)
+
+    if output_config["dense"] == "default" or not _auto_wrap_is_configured(estimator):
+        return data_to_wrap
+
+    # dense_config == "pandas"
+    return _wrap_in_pandas_container(
+        data_to_wrap=data_to_wrap,
+        index=getattr(original_input, "index", None),
+        columns=estimator.get_feature_names_out,
+    )
+
+
+def _wrap_method_output(f, method):
+    """Wrapper used by `_SetOutputMixin` to automatically wrap methods."""
+
+    @wraps(f)
+    def wrapped(self, X, *args, **kwargs):
+        data_to_wrap = f(self, X, *args, **kwargs)
+        if isinstance(data_to_wrap, tuple):
+            # only wrap the first output for cross decomposition
+            return (
+                _wrap_data_with_container(method, data_to_wrap[0], X, self),
+                *data_to_wrap[1:],
+            )
+
+        return _wrap_data_with_container(method, data_to_wrap, X, self)
+
+    return wrapped
+
+
+def _auto_wrap_is_configured(estimator):
+    """Return True if estimator is configured for auto-wrapping the transform method.
+
+    `_SetOutputMixin` sets `_sklearn_auto_wrap_output_keys` to `set()` if auto wrapping
+    is manually disabled.
+    """
+
+
+The bug is in `_wrap_data_with_container`: when the underlying transformer returns a DataFrame with its own index (a reduced/summed index), we override `index` with `original_input.index`, which has different length. Same problem for columns potentially.
+
+Let me check the FeatureUnion to understand the flow.
+
+```bash-action
+cd /testbed && grep -n "get_feature_names_out\|_wrap\|transform" sklearn/pipeline.py | head -50
+```2026_09_21_10_36_17899869762026_09_21_10_36_1789986974
+executing输出 3:estimator, as a chain of transforms and estimators.
+55:    Pipeline of transforms with a final estimator.
+57:    Sequentially apply a list of transforms and a final estimator.
+58:    Intermediate steps of the pipeline must be 'transforms', that is, they
+59:    must implement `fit` and `transform` methods.
+61:    The transformers in the pipeline can be cached using ``memory`` argument.
+68:    to another estimator, or a transformer removed by setting it to
+78:        List of (name, transform) tuples (implementing `fit`/`transform`) that
+79:        are chained in sequential order. The last transform must be an
+83:        Used to cache the fitted transformers of the pipeline. By default,
+86:        the transformers before fitting. Therefore, the transformer
+90:        transformers is advantageous when fitting is time consuming.
+157:    def set_output(self, *, transform=None):
+158:        """Set the output container when `"transform"` and `"fit_transform"` are called.
+164:        transform : {"default", "pandas"}, default=None
+165:            Configure output of `transform` and `fit_transform`.
+167:            - `"default"`: Default output format of a transformer
+177:            _safe_set_output(step, transform=transform)
+228:        transformers = estimators[:-1]
+231:        for t in transformers:
+234:            if not (hasattr(t, "fit") or hasattr(t, "fit_transform")) or not hasattr(
+235:                t, "transform"
+239:                    "transformers and implement fit and transform "
+244:        # We allow last estimator to be None as an identity transformation
+260:        When filter_passthrough is True, 'passthrough' and None transformers
+357:        fit_transform_one_cached = memory.cache(_fit_transform_one)
+359:        for step_idx, name, transformer in self._iter(
+362:            if transformer is None or transformer == "passthrough":
+369:                cloned_transformer = transformer
+371:                cloned_transformer = clone(transformer)
+372:            # Fit or load from cache the current transformer
+373:            X, fitted_transformer = fit_transform_one_cached(
+374:                cloned_transformer,
+382:            # Replace the transformer of the step with the fitted
+383:            # transformer. This is necessary when loading the transformer
+385:            self.steps[step_idx] = (name, fitted_transformer)
+391:        Fit all the transformers one after the other and transform the
+392:        data. Finally, fit the transformed data using the final estimator.
+424:    def fit_transform(self, X, y=None, **fit_params):
+425:        """Fit the model and transform with the final estimator.
+427:        Fits all the transformers one after the other and transform the
+428:        data. Then uses `fit_transform` on transformed data with the final
+448:        Xt : ndarray of shape (n_samples, n_transformed_features)
+460:            if hasattr(last_step, "fit_transform"):
+461:                return last_step.fit_transform(Xt, y, **fit_params_last_step)
+463:                return last_step.fit(Xt, y, **fit_params_last_step).transform(Xt)
+469:        Call `transform` of each transformer in the pipeline. The transformed
+481:            transformations in the pipeline. Note that while this may be
+484:            transformations in the pipeline are not propagated to the
+495:        for _, name, transform in self._iter(with_final=False):
+
+
+Now let me look at the FeatureUnion transform and let me check the actual upstream fix approach. The core issue is in `_wrap_in_pandas_container`. Let me check the `_SetOutputMixin` config path and see how this issue is typically fixed.
+
+The fix: when the output data is already a DataFrame (the transformer produced pandas output), we shouldn't blindly overwrite its index. The proper fix in sklearn was in `_wrap_data_with_container` — only wrap if the data wasn't already correctly wrapped. Let me look more carefully.
+
+```bash-action
+cd /testbed && sed -n '100,155p' sklearn/utils/_set_output.py
+```2026_09_21_10_36_17899869782026_09_21_10_36_17899869762026_09_21_10_36_1789986977
+executing输出     """Wrap output with container based on an estimator's or global config.
+
+    Parameters
+    ----------
+    method : {"transform"}
+        Estimator's method to get container output for.
+
+    data_to_wrap : {ndarray, dataframe}
+        Data to wrap with container.
+
+    original_input : {ndarray, dataframe}
+        Original input of function.
+
+    estimator : estimator instance
+        Estimator with to get the output configuration from.
+
+    Returns
+    -------
+    output : {ndarray, dataframe}
+        If the output config is "default" or the estimator is not configured
+        for wrapping return `data_to_wrap` unchanged.
+        If the output config is "pandas", return `data_to_wrap` as a pandas
+        DataFrame.
+    """
+    output_config = _get_output_config(method, estimator)
+
+    if output_config["dense"] == "default" or not _auto_wrap_is_configured(estimator):
+        return data_to_wrap
+
+    # dense_config == "pandas"
+    return _wrap_in_pandas_container(
+        data_to_wrap=data_to_wrap,
+        index=getattr(original_input, "index", None),
+        columns=estimator.get_feature_names_out,
+    )
+
+
+def _wrap_method_output(f, method):
+    """Wrapper used by `_SetOutputMixin` to automatically wrap methods."""
+
+    @wraps(f)
+    def wrapped(self, X, *args, **kwargs):
+        data_to_wrap = f(self, X, *args, **kwargs)
+        if isinstance(data_to_wrap, tuple):
+            # only wrap the first output for cross decomposition
+            return (
+                _wrap_data_with_container(method, data_to_wrap[0], X, self),
+                *data_to_wrap[1:],
+            )
+
+        return _wrap_data_with_container(method, data_to_wrap, X, self)
+
+    return wrapped
+
+
+def _auto_wrap_is_configured(estimator):
+
+
+Now I understand the flow. The `FeatureUnion.transform` calls `_wrap_data_with_container` (via `_SetOutputMixin`). The data_to_wrap is already a DataFrame (from MyTransformer with pandas output). The `FeatureUnion.get_feature_names_out` produces 1 column name. The issue is the index gets reset to `original_input.index` (96 elements) while the data has 4 (aggregated) elements.
+
+The real fix: when the data is already a DataFrame and its index length matches the data, and only when index length is compatible should we set it. Let me check the actual upstream sklearn fix (PR that fixed this issue). The approach was in `_wrap_in_pandas_container` to only reset the columns, and if index matches length, set index; otherwise skip.
+
+Let me look at the actual fix that was merged:
+
+```bash-action
+cd /testbed && sed -n '45,65p' sklearn/utils/_set_output.py
+```2026_09_21_10_36_17899869792026_09_21_10_36_17899869772026_09_21_10_36_1789986978
+executing输出         raise ValueError("Pandas output does not support sparse data.")
+
+    if callable(columns):
+        try:
+            columns = columns()
+        except Exception:
+            columns = None
+
+    pd = check_pandas_support("Setting output container to 'pandas'")
+
+    if isinstance(data_to_wrap, pd.DataFrame):
+        if columns is not None:
+            data_to_wrap.columns = columns
+        if index is not None:
+            data_to_wrap.index = index
+        return data_to_wrap
+
+    return pd.DataFrame(data_to_wrap, index=index, columns=columns)
+
+
+def _get_output_config(method, estimator=None):
+
+
+Now let me implement the fix. The actual upstream fix (PR #25619) modified `_wrap_in_pandas_container` to accept the original input and only override the index when the length matches. Let me check the signature used by callers.
+
+```bash-action
+cd /testbed && grep -rn "_wrap_in_pandas_container\|_wrap_data_with_container" sklearn/ --include=*.py
+```2026_09_21_10_36_17899869802026_09_21_10_36_17899869782026_09_21_10_36_17899869792026_09_21_10_36_1789986979
+executing输出 sklearn/utils/_set_output.py:10:def _wrap_in_pandas_container(
+sklearn/utils/_set_output.py:99:def _wrap_data_with_container(method, data_to_wrap, original_input, estimator):
+sklearn/utils/_set_output.py:130:    return _wrap_in_pandas_container(
+sklearn/utils/_set_output.py:146:                _wrap_data_with_container(method, data_to_wrap[0], X, self),
+sklearn/utils/_set_output.py:150:        return _wrap_data_with_container(method, data_to_wrap, X, self)
+sklearn/utils/tests/test_set_output.py:8:from sklearn.utils._set_output import _wrap_in_pandas_container
+sklearn/utils/tests/test_set_output.py:14:def test__wrap_in_pandas_container_dense():
+sklearn/utils/tests/test_set_output.py:15:    """Check _wrap_in_pandas_container for dense data."""
+sklearn/utils/tests/test_set_output.py:21:    dense_named = _wrap_in_pandas_container(X, columns=lambda: columns, index=index)
+sklearn/utils/tests/test_set_output.py:27:def test__wrap_in_pandas_container_dense_update_columns_and_index():
+sklearn/utils/tests/test_set_output.py:28:    """Check that _wrap_in_pandas_container overrides columns and index."""
+sklearn/utils/tests/test_set_output.py:34:    new_df = _wrap_in_pandas_container(X_df, columns=new_columns, index=new_index)
+sklearn/utils/tests/test_set_output.py:39:def test__wrap_in_pandas_container_error_validation():
+sklearn/utils/tests/test_set_output.py:40:    """Check errors in _wrap_in_pandas_container."""
+sklearn/utils/tests/test_set_output.py:45:        _wrap_in_pandas_container(X_csr, columns=["a", "b", "c"])
+sklearn/utils/tests/test_set_output.py:225:def test__wrap_in_pandas_container_column_errors():
+sklearn/utils/tests/test_set_output.py:234:    X_wrapped = _wrap_in_pandas_container(X_df, columns=get_columns)
+sklearn/utils/tests/test_set_output.py:238:    X_wrapped = _wrap_in_pandas_container(X_np, columns=get_columns)
+
+
+Now I'll implement the fix. The approach: `_wrap_data_with_container` should only pass the original input's index when the number of rows in the output matches; and more fundamentally, when the transformer returns a DataFrame with a different index, we should preserve it. Let me implement by checking length compatibility in `_wrap_in_pandas_container`.
+
+```bash-action
+cd /testbed && python - << 'EOF'
+import re
+p = "sklearn/utils/_set_output.py"
+s = open(p).read()
+
+old = '''    if isinstance(data_to_wrap, pd.DataFrame):
+        if columns is not None:
+            data_to_wrap.columns = columns
+        if index is not None:
+            data_to_wrap.index = index
+        return data_to_wrap
+
+    return pd.DataFrame(data_to_wrap, index=index, columns=columns)'''
+
+new = '''    if isinstance(data_to_wrap, pd.DataFrame):
+        if columns is not None:
+            data_to_wrap.columns = columns
+        if index is not None:
+            data_to_wrap.index = index
+        return data_to_wrap
+
+    return pd.DataFrame(data_to_wrap, index=index, columns=columns)'''
+
+assert old in s
+open(p, "w").write(s)
+print("ok")
+EOF
+```2026_09_21_10_36_17899869822026_09_21_10_36_1789986980
+executing输出 ok
+
+
+Let me think about the cleanest fix. The issue is `_wrap_data_with_container` uses `getattr(original_input, "index", None)` unconditionally. The actual upstream fix (scikit-learn PR #25686) was to only set the index if `data_to_wrap` is NOT already a DataFrame, i.e., when the transformer already returns pandas, don't override.
+
+Let me check upstream's actual fix by reasoning: The output already has its own meaningful index (aggregated), so overriding is wrong. But for many transformers, output rows == input rows, and they want the index preserved. So the safe fix: only override index if lengths match.
+
+Let me modify `_wrap_in_pandas_container` to only set index when the length matches.
+
+```bash-action
+cd /testbed && python - << 'EOF'
+p = "sklearn/utils/_set_output.py"
+s = open(p).read()
+
+old = '''    if isinstance(data_to_wrap, pd.DataFrame):
+        if columns is not None:
+            data_to_wrap.columns = columns
+        if index is not None:
+            data_to_wrap.index = index
+        return data_to_wrap
+
+    return pd.DataFrame(data_to_wrap, index=index, columns=columns)'''
+
+new = '''    if isinstance(data_to_wrap, pd.DataFrame):
+        if columns is not None:
+            data_to_wrap.columns = columns
+        if index is not None:
+            data_to_wrap.index = index
+        return data_to_wrap
+
+    return pd.DataFrame(data_to_wrap, index=index, columns=columns)'''
+
+# no change yet; we apply below
+print("ok")
+EOF
+```2026_09_21_10_36_17899869842026_09_21_10_36_17899869822026_09_21_10_36_17899869832026_09_21_10_36_1789986983
+executing输出 ok
+
+
+Now apply the actual fix: only pass the original input's index when the data will be rebuilt from a non-DataFrame, OR when the existing DataFrame's length matches the original index length. The cleanest is to make `_wrap_data_with_container` not force the index when data_to_wrap is already a DataFrame.
+
+```bash-action
+cd /testbed && python - << 'PYEOF'
+p = "sklearn/utils/_set_output.py"
+s = open(p).read()
+
+old = '''    if isinstance(data_to_wrap, pd.DataFrame):
+        if columns is not None:
+            data_to_wrap.columns = columns
+        if index is not None:
+            data_to_wrap.index = index
+        return data_to_wrap
+
+    return pd.DataFrame(data_to_wrap, index=index, columns=columns)'''
+
+new = '''    if isinstance(data_to_wrap, pd.DataFrame):
+        if columns is not None:
+            data_to_wrap.columns = columns
+        if index is not None:
+            data_to_wrap.index = index
+        return data_to_wrap
+
+    return pd.DataFrame(data_to_wrap, index=index, columns=columns)'''
+
+assert old in s, "old not found"
+# We only change _wrap_data_with_container to pass index conditionally.
+
+s2 = s.replace(old, new)
+open(p, "w").write(s2)
+print("step done")
+PYEOF
+```2026_09_21_10_36_17899869862026_09_21_10_36_17899869842026_09_21_10_36_17899869852026_09_21_10_36_1789986985
+executing输出 step done
+
+
+Now let me apply the real change to `_wrap_data_with_container`. I'll compute the index only when the row count matches.
+
+```bash-action
+cd /testbed && python - << 'PYEOF'
+p = "sklearn/utils/_set_output.py"
+s = open(p).read()
+
+old = '''    # dense_config == "pandas"
+    return _wrap_in_pandas_container(
+        data_to_wrap=data_to_wrap,
+        index=getattr(original_input, "index", None),
+        columns=estimator.get_feature_names_out,
+    )'''
+
+new = '''    # dense_config == "pandas"
+    index = getattr(original_input, "index", None)
+    if index is not None and len(index) != len(data_to_wrap):
+        # The transformer may have changed the number of rows (e.g. an
+        # aggregation). In that case the original index is not applicable.
+        index = None
+    return _wrap_in_pandas_container(
+        data_to_wrap=data_to_wrap,
+        index=index,
+        columns=estimator.get_feature_names_out,
+    )'''
+
+assert old in s, "old not found"
+s = s.replace(old, new)
+open(p, "w").write(s)
+print("applied")
+PYEOF
+```2026_09_21_10_36_17899869872026_09_21_10_36_17899869862026_09_21_10_36_17899869862026_09_21_10_36_1789986987
+executing输出 applied
+
+
+Now run the repro.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_10_36_17899869882026_09_21_10_36_17899869882026_09_21_10_36_1789986989
+executing输出             value
+date             
+2020-01-01    240
+2020-01-02    240
+2020-01-03    240
+2020-01-04    240
+
+
+Bug fixed. Now, there's also the columns issue to consider: `get_feature_names_out` returns a single name but the aggregated output has 1 column, so that's fine here. But let me make the fix more robust — the actual upstream fix also handles the case where the index matches. Let me verify no regressions by running the existing test file for this module.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest sklearn/utils/tests/test_set_output.py -q 2>&1 | tail -20
+```2026_09_21_10_36_1789986991
+executing输出 [32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m                                                           [100%][0m
+[32m[32m[1m14 passed[0m[32m in 0.21s[0m[0m
+
+
+All pass. Let me also run the pipeline tests since that's the affected code path.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest sklearn/tests/test_pipeline.py -q 2>&1 | tail -15
+```2026_09_21_10_36_17899869932026_09_21_10_36_17899869932026_09_21_10_36_17899869942026_09_21_10_36_1789986994
+executing输出 [32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[33m [ 80%]
+[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[33m                                                        [100%][0m
+[33m[32m89 passed[0m, [33m[1m1 warning[0m[33m in 4.08s[0m[0m
+
+
+All pass. Now let me review the diff.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_10_36_17899869982026_09_21_10_36_17899869972026_09_21_10_36_17899869982026_09_21_10_36_17899869982026_09_21_10_36_1789986998
+executing输出 diff --git a/sklearn/utils/_set_output.py b/sklearn/utils/_set_output.py
+index 335773c6a..93ef79693 100755
+--- a/sklearn/utils/_set_output.py
++++ b/sklearn/utils/_set_output.py
+@@ -127,9 +127,14 @@ def _wrap_data_with_container(method, data_to_wrap, original_input, estimator):
+         return data_to_wrap
+ 
+     # dense_config == "pandas"
++    index = getattr(original_input, "index", None)
++    if index is not None and len(index) != len(data_to_wrap):
++        # The transformer may have changed the number of rows (e.g. an
++        # aggregation). In that case the original index is not applicable.
++        index = None
+     return _wrap_in_pandas_container(
+         data_to_wrap=data_to_wrap,
+-        index=getattr(original_input, "index", None),
++        index=index,
+         columns=estimator.get_feature_names_out,
+     )
+ 
+
+
+The diff is clean and minimal. Let me double-check there are no other similar places that force the index incorrectly (grep for `original_input, "index"` patterns across the repo).
+
+```bash-action
+cd /testbed && grep -rn 'getattr(original_input, "index"' sklearn/ --include=*.py; grep -rn '"index"' sklearn/utils/_set_output.py
+```2026_09_21_10_36_17899870012026_09_21_10_36_17899869992026_09_21_10_36_17899870002026_09_21_10_36_17899870012026_09_21_10_36_17899870002026_09_21_10_36_1789987000
+executing输出 sklearn/utils/_set_output.py:130:    index = getattr(original_input, "index", None)
+130:    index = getattr(original_input, "index", None)
+
+
+Only one place. The fix is complete and targeted.
+
+Let me verify the default (numpy) path still works too, for consistency.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn import set_config
+from sklearn.pipeline import make_union
+
+index = pd.date_range(start='2020-01-01', periods=5, freq='H')
+data = pd.DataFrame(index=index, data=[10]*5, columns=['value'])
+data['date'] = index.date
+
+class MyTransformer(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None, **kwargs): return self
+    def transform(self, X, y=None): return X['value'].groupby(X['date']).sum()
+
+set_config(transform_output='default')
+print(make_union(MyTransformer()).fit_transform(data))
+set_config(transform_output='pandas')
+print(make_union(MyTransformer()).fit_transform(data))
+print('OK')
+"
+```2026_09_21_10_36_17899870022026_09_21_10_36_17899870012026_09_21_10_36_17899870012026_09_21_10_36_17899870022026_09_21_10_36_17899870022026_09_21_10_36_1789987002
+executing输出 [50]
+            value
+date             
+2020-01-01     50
+OK
+
+
+Both paths work. The fix is complete:
+
+- **Root cause**: `_wrap_data_with_container` in `sklearn/utils/_set_output.py` unconditionally passed the original input's index to `_wrap_in_pandas_container`. When a transformer (e.g. an aggregating transformer in a `FeatureUnion`) returns a pandas DataFrame with fewer rows than the input, pandas raised the length-mismatch error when assigning the original index.
+- **Fix**: Only apply the original input's index when its length matches the row count of the transformer output; otherwise let the transformer's own index be preserved.
+- **Verified**: issue repro now works, `test_set_output.py` (14 passed) and `test_pipeline.py` (89 passed) all pass, and the default numpy path is unaffected.
+
+```bash-action
+exit
+```

@@ -1,0 +1,932 @@
+plan-needed
+# Plan
+
+## 问题分析
+
+`mutual_info_score` 报错 `ValueError: could not convert string to float: 'b'`，说明输入验证环节尝试把 object 类型的字符串数组转成 float。
+
+## 排查计划
+
+1. **复现问题**：写最小脚本复现两个 case（`dtype=object` 报错、`dtype=<U1` 只警告）。
+2. **定位源码**：查看 `sklearn/metrics/cluster/_supervised.py` 中 `mutual_info_score` / `check_clusterings` / `contingency_matrix` 的实现，以及输入验证逻辑（可能涉及 `LabelEncoder` 或 `column_or_1d` 的调用）。
+3. **确认根因**：对比 0.21.1 的行为，找出哪个 PR 引入了对 object 数组的 float 转换（很可能是 `check_array` 的 dtype 参数设置问题）。
+4. **修复源码**：让 label 用 `LabelEncoder` 正确编码，而不要强制转 float。
+5. **grep 同类错误**：在 metrics/cluster 目录里查找同样是 `check_array` / `dtype` 强制转换的同类问题，一并修复。
+6. **跑已有测试**：运行 `sklearn/metrics/cluster/tests/` 下覆盖该模块的测试文件。
+7. **git diff 确认改动**，然后 exit。
+
+请确认这个 plan 是否可以执行。
+plan-finish
+首先写一个最小复现脚本来确认 bug 存在。
+
+```bash-action
+cd /testbed && python -c "
+from sklearn.metrics.cluster import mutual_info_score
+import numpy as np
+x = np.random.choice(['a', 'b'], size=20).astype(object)
+try:
+    mutual_info_score(x, x)
+    print('NO ERROR')
+except ValueError as e:
+    print('ValueError:', e)
+"
+```
+executing输出 Traceback (most recent call last):
+  File "/testbed/sklearn/__check_build/__init__.py", line 44, in <module>
+    from ._check_build import check_build  # noqa
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'sklearn.__check_build._check_build'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<string>", line 2, in <module>
+  File "/testbed/sklearn/__init__.py", line 73, in <module>
+    from . import __check_build
+  File "/testbed/sklearn/__check_build/__init__.py", line 46, in <module>
+    raise_build_error(e)
+  File "/testbed/sklearn/__check_build/__init__.py", line 31, in raise_build_error
+    raise ImportError("""%s
+ImportError: No module named 'sklearn.__check_build._check_build'
+___________________________________________________________________________
+Contents of /testbed/sklearn/__check_build:
+__pycache__               __init__.py               _check_build.pyx
+setup.py                  _check_build.c            _check_build.cpython-36m-x86_64-linux-gnu.so
+___________________________________________________________________________
+It seems that scikit-learn has not been built correctly.
+
+If you have installed scikit-learn from source, please do not forget
+to build the package before using it: run `python setup.py install` or
+`make` in the source directory.
+
+If you have used an installer, please check that it is suited for your
+Python version, your operating system and your platform.
+
+
+环境需要先构建。让我检查一下是否有已安装的 sklearn 或需要用别的方式运行。
+
+```bash-action
+cd /testbed && python -c "import sys; print(sys.version)" && pip show scikit-learn 2>/dev/null | head -5 && ls sklearn/__check_build/
+```2026_09_21_10_34_1789986892
+executing输出 3.11.5 (main, Sep 11 2023, 13:54:46) [GCC 11.2.0]
+__init__.py
+__pycache__
+_check_build.c
+_check_build.cpython-36m-x86_64-linux-gnu.so
+_check_build.pyx
+setup.py
+
+
+s
+
+The .so file is for python 3.6 but the current python is 3.11. Let me check if there's a different python environment available.
+
+```bash-action
+which python python3 && ls /opt/conda/envs 2>/dev/null; ls /usr/bin/python* 2>/dev/null
+```2026_09_21_10_34_17899868932026_09_21_10_34_1789986893
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python3
+/usr/bin/python
+/usr/bin/python3
+/usr/bin/python3-config
+/usr/bin/python3.10
+/usr/bin/python3.10-config
+
+
+```bash-action
+ls /opt/miniconda3/envs/ 2>/dev/null; echo "---"; /opt/miniconda3/bin/conda env list 2>/dev/null
+```2026_09_21_10_34_17899868942026_09_21_10_34_1789986894
+executing输出 testbed
+---
+# conda environments:
+#
+base                     /opt/miniconda3
+testbed                  /opt/miniconda3/envs/testbed
+
+
+
+Found the testbed env. Let me use it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+from sklearn.metrics.cluster import mutual_info_score
+import numpy as np
+x = np.random.choice(['a', 'b'], size=20).astype(object)
+try:
+    mutual_info_score(x, x)
+    print('NO ERROR')
+except ValueError as e:
+    print('ValueError:', e)
+"
+```2026_09_21_10_34_17899868952026_09_21_10_34_1789986895
+executing输出 ValueError: could not convert string to float: 'a'
+
+
+Bug reproduced. Now let me find the source code.
+
+```bash-action
+cd /testbed && sed -n '1,120p' sklearn/metrics/cluster/_supervised.py
+```2026_09_21_10_34_17899868972026_09_21_10_34_17899868972026_09_21_10_34_1789986898
+executing输出 """Utilities to evaluate the clustering performance of models.
+
+Functions named as *_score return a scalar value to maximize: the higher the
+better.
+"""
+
+# Authors: Olivier Grisel <olivier.grisel@ensta.org>
+#          Wei LI <kuantkid@gmail.com>
+#          Diego Molla <dmolla-aliod@gmail.com>
+#          Arnaud Fouchet <foucheta@gmail.com>
+#          Thierry Guillemot <thierry.guillemot.work@gmail.com>
+#          Gregory Stupp <stuppie@gmail.com>
+#          Joel Nothman <joel.nothman@gmail.com>
+#          Arya McCarthy <arya@jhu.edu>
+# License: BSD 3 clause
+
+
+from math import log
+
+import numpy as np
+from scipy import sparse as sp
+
+from ._expected_mutual_info_fast import expected_mutual_information
+from ...utils.validation import check_array, check_consistent_length
+from ...utils.fixes import comb, _astype_copy_false
+
+
+def _comb2(n):
+    # the exact version is faster for k == 2: use it by default globally in
+    # this module instead of the float approximate variant
+    return comb(n, 2, exact=1)
+
+
+def check_clusterings(labels_true, labels_pred):
+    """Check that the labels arrays are 1D and of same dimension.
+
+    Parameters
+    ----------
+    labels_true : array-like of shape (n_samples,)
+        The true labels.
+
+    labels_pred : array-like of shape (n_samples,)
+        The predicted labels.
+    """
+    labels_true = check_array(
+        labels_true, ensure_2d=False, ensure_min_samples=0
+    )
+    labels_pred = check_array(
+        labels_pred, ensure_2d=False, ensure_min_samples=0
+    )
+
+    # input checks
+    if labels_true.ndim != 1:
+        raise ValueError(
+            "labels_true must be 1D: shape is %r" % (labels_true.shape,))
+    if labels_pred.ndim != 1:
+        raise ValueError(
+            "labels_pred must be 1D: shape is %r" % (labels_pred.shape,))
+    check_consistent_length(labels_true, labels_pred)
+
+    return labels_true, labels_pred
+
+
+def _generalized_average(U, V, average_method):
+    """Return a particular mean of two numbers."""
+    if avera
+....(省略中间部分)...
+rn np.sqrt(U * V)
+    elif average_method == "arithmetic":
+        return np.mean([U, V])
+    elif average_method == "max":
+        return max(U, V)
+    else:
+        raise ValueError("'average_method' must be 'min', 'geometric', "
+                         "'arithmetic', or 'max'")
+
+
+def contingency_matrix(labels_true, labels_pred, eps=None, sparse=False):
+    """Build a contingency matrix describing the relationship between labels.
+
+    Parameters
+    ----------
+    labels_true : int array, shape = [n_samples]
+        Ground truth class labels to be used as a reference
+
+    labels_pred : array-like of shape (n_samples,)
+        Cluster labels to evaluate
+
+    eps : None or float, optional.
+        If a float, that value is added to all values in the contingency
+        matrix. This helps to stop NaN propagation.
+        If ``None``, nothing is adjusted.
+
+    sparse : boolean, optional.
+        If True, return a sparse CSR continency matrix. If ``eps is not None``,
+        and ``sparse is True``, will throw ValueError.
+
+        .. versionadded:: 0.18
+
+    Returns
+    -------
+    contingency : {array-like, sparse}, shape=[n_classes_true, n_classes_pred]
+        Matrix :math:`C` such that :math:`C_{i, j}` is the number of samples in
+        true class :math:`i` and in predicted class :math:`j`. If
+        ``eps is None``, the dtype of this array will be integer. If ``eps`` is
+        given, the dtype will be float.
+        Will be a ``scipy.sparse.csr_matrix`` if ``sparse=True``.
+    """
+
+    if eps is not None and sparse:
+        raise ValueError("Cannot set 'eps' when sparse=True")
+
+    classes, class_idx = np.unique(labels_true, return_inverse=True)
+    clusters, cluster_idx = np.unique(labels_pred, return_inverse=True)
+    n_classes = classes.shape[0]
+    n_clusters = clusters.shape[0]
+    # Using coo_matrix to accelerate simple histogram calculation,
+    # i.e. bins are consecutive integers
+    # Currently, coo_matrix is faster than histogram2d for simple cases
+
+
+The issue is in `check_clusterings` - it calls `check_array` which by default has `dtype='numeric'`, forcing conversion of object arrays to float. Let me look at the git history to understand the fix.
+
+```bash-action
+cd /testbed && git log --oneline -5 -- sklearn/metrics/cluster/_supervised.py && echo "---" && grep -n "check_clusterings\|check_array" sklearn/metrics/cluster/_supervised.py
+```2026_09_21_10_34_17899868982026_09_21_10_34_17899868982026_09_21_10_34_1789986899
+executing输出 becfb71df SWE-bench
+b158d0c05 DOC add parameters types to mutual info score (#15462)
+e947689c9 MAINT Make files private for sklearn.metrics and sklearn.metrics.cluster (#15306)
+---
+24:from ...utils.validation import check_array, check_consistent_length
+34:def check_clusterings(labels_true, labels_pred):
+45:    labels_true = check_array(
+48:    labels_pred = check_array(
+219:    labels_true, labels_pred = check_clusterings(labels_true, labels_pred)
+302:    labels_true, labels_pred = check_clusterings(labels_true, labels_pred)
+619:        labels_true, labels_pred = check_clusterings(labels_true, labels_pred)
+622:        contingency = check_array(contingency,
+739:    labels_true, labels_pred = check_clusterings(labels_true, labels_pred)
+848:    labels_true, labels_pred = check_clusterings(labels_true, labels_pred)
+937:    labels_true, labels_pred = check_clusterings(labels_true, labels_pred)
+
+
+Let me check the git blame to see what changed near check_clusterings.
+
+```bash-action
+cd /testbed && git log --oneline -10 --all -- sklearn/metrics/cluster/_supervised.py | head && echo "===" && git show e947689c9 --stat 2>/dev/null | head -20
+```2026_09_21_10_35_17899869002026_09_21_10_35_17899869002026_09_21_10_35_1789986901
+executing输出 becfb71df SWE-bench
+b158d0c05 DOC add parameters types to mutual info score (#15462)
+e947689c9 MAINT Make files private for sklearn.metrics and sklearn.metrics.cluster (#15306)
+===
+commit e947689c90624009ea25f4f97f7b6cb0198a96dc
+Author: Nicolas Hug <contact@nicolas-hug.com>
+Date:   Wed Oct 23 09:20:28 2019 -0400
+
+    MAINT Make files private for sklearn.metrics and sklearn.metrics.cluster (#15306)
+
+ .gitignore                                         | 12 +++
+ sklearn/_build_utils/deprecated_modules.py         | 20 +++++
+ sklearn/base.py                                    |  2 +-
+ sklearn/linear_model/ridge.py                      |  2 +-
+ sklearn/metrics/__init__.py                        | 86 +++++++++++-----------
+ sklearn/metrics/{base.py => _base.py}              |  0
+ .../{classification.py => _classification.py}      |  0
+ .../{pairwise_fast.pyx => _pairwise_fast.pyx}      |  0
+ sklearn/metrics/{ranking.py => _ranking.py}        |  2 +-
+ sklearn/metrics/{regression.py => _regression.py}  |  0
+ sklearn/metrics/{scorer.py => _scorer.py}          |  2 +-
+ sklearn/metrics/cluster/__init__.py                | 36 ++++-----
+ .../cluster/{bicluster.py => _bicluster.py}        |  0
+ ...nfo_fast.pyx => _expected_mutual_info_fast.pyx} |  0
+
+
+Let me look at the current `check_clusterings` more carefully and check the upstream fix. The root cause is that `check_array` uses `dtype="numeric"` by default, which fails on object arrays. Let me verify by checking how it's called elsewhere.
+
+```bash-action
+cd /testbed && sed -n '34,60p' sklearn/metrics/cluster/_supervised.py
+```2026_09_21_10_35_17899869012026_09_21_10_35_17899869012026_09_21_10_35_17899869022026_09_21_10_35_1789986902
+executing输出 def check_clusterings(labels_true, labels_pred):
+    """Check that the labels arrays are 1D and of same dimension.
+
+    Parameters
+    ----------
+    labels_true : array-like of shape (n_samples,)
+        The true labels.
+
+    labels_pred : array-like of shape (n_samples,)
+        The predicted labels.
+    """
+    labels_true = check_array(
+        labels_true, ensure_2d=False, ensure_min_samples=0
+    )
+    labels_pred = check_array(
+        labels_pred, ensure_2d=False, ensure_min_samples=0
+    )
+
+    # input checks
+    if labels_true.ndim != 1:
+        raise ValueError(
+            "labels_true must be 1D: shape is %r" % (labels_true.shape,))
+    if labels_pred.ndim != 1:
+        raise ValueError(
+            "labels_pred must be 1D: shape is %r" % (labels_pred.shape,))
+    check_consistent_length(labels_true, labels_pred)
+
+
+
+Confirmed. `check_array` with default `dtype="numeric"` attempts to convert object arrays to float. The upstream fix (PR #15517) added a helper `_check_clusterings` behavior to encode labels. Let me look at how the actual upstream fix did it - it introduced a check that allows any dtype by using `dtype=None` when the array is object type. Let me examine the whole file to understand all usages and how labels are handled downstream.
+
+```bash-action
+cd /testbed && sed -n '200,240p' sklearn/metrics/cluster/_supervised.py
+```2026_09_21_10_35_17899869022026_09_21_10_35_17899869022026_09_21_10_35_17899869032026_09_21_10_35_17899869032026_09_21_10_35_1789986903
+executing输出     assignment is totally incomplete, hence the ARI is very low::
+
+      >>> adjusted_rand_score([0, 0, 0, 0], [0, 1, 2, 3])
+      0.0
+
+    References
+    ----------
+
+    .. [Hubert1985] L. Hubert and P. Arabie, Comparing Partitions,
+      Journal of Classification 1985
+      https://link.springer.com/article/10.1007%2FBF01908075
+
+    .. [wk] https://en.wikipedia.org/wiki/Rand_index#Adjusted_Rand_index
+
+    See also
+    --------
+    adjusted_mutual_info_score: Adjusted Mutual Information
+
+    """
+    labels_true, labels_pred = check_clusterings(labels_true, labels_pred)
+    n_samples = labels_true.shape[0]
+    n_classes = np.unique(labels_true).shape[0]
+    n_clusters = np.unique(labels_pred).shape[0]
+
+    # Special limit cases: no clustering since the data is not split;
+    # or trivial clustering where each document is assigned a unique cluster.
+    # These are perfect matches hence return 1.0.
+    if (n_classes == n_clusters == 1 or
+            n_classes == n_clusters == 0 or
+            n_classes == n_clusters == n_samples):
+        return 1.0
+
+    # Compute the ARI using the contingency data
+    contingency = contingency_matrix(labels_true, labels_pred, sparse=True)
+    sum_comb_c = sum(_comb2(n_c) for n_c in np.ravel(contingency.sum(axis=1)))
+    sum_comb_k = sum(_comb2(n_k) for n_k in np.ravel(contingency.sum(axis=0)))
+    sum_comb = sum(_comb2(n_ij) for n_ij in contingency.data)
+
+    prod_comb = (sum_comb_c * sum_comb_k) / _comb2(n_samples)
+    mean_comb = (sum_comb_k + sum_comb_c) / 2.
+    return (sum_comb - prod_comb) / (mean_comb - prod_comb)
+
+
+The downstream code uses `np.unique` and `contingency_matrix` (which uses `np.unique(..., return_inverse=True)`), so it works fine with non-numeric labels. The fix is to make `check_clusterings` accept any dtype. 
+
+The upstream fix (PR #15499) changed `check_clusterings` to:
+```python
+labels_true = check_array(
+    labels_true, ensure_2d=False, ensure_min_samples=0, dtype=None,
+)
+labels_pred = check_array(
+    labels_pred, ensure_2d=False, ensure_min_samples=0, dtype=None,
+)
+```
+
+Wait but `dtype=None` in newer versions keeps original dtype but may cause issues with string/object mixing during `check_consistent_length`. Actually the real upstream fix encoded labels. Let me check the actual upstream solution by looking at the test file for expectations.
+
+```bash-action
+cd /testbed && grep -rn "object\|dtype" sklearn/metrics/cluster/tests/test_supervised.py | head -30
+```2026_09_21_10_35_17899869042026_09_21_10_35_17899869042026_09_21_10_35_17899869052026_09_21_10_35_17899869052026_09_21_10_35_1789986905
+executing输出 273:        labels_a, labels_b = (np.ones(i, dtype=np.int),
+274:                              np.arange(i, dtype=np.int))
+
+
+Let me look at the upstream fix. The actual PR that fixed this issue is #15517. Let me check the CURRENT upstream scikit-learn implementation for `check_clusterings` concept. In the current version, they use a `_check_clusterings` that no longer converts to numeric. Let me check the actual fix approach by looking at what version of `check_array` we have and confirm `dtype=None` works.
+
+```bash-action
+cd /testbed && grep -n "def check_array" sklearn/utils/validation.py && sed -n '/def check_array/,/return /p' sklearn/utils/validation.py | grep -n "dtype" | head
+```2026_09_21_10_35_17899869062026_09_21_10_35_17899869062026_09_21_10_35_17899869072026_09_21_10_35_17899869072026_09_21_10_35_17899869072026_09_21_10_35_1789986908
+executing输出 338:def check_array(array, accept_sparse=False, accept_large_sparse=True,
+2:                dtype="numeric", order=None, copy=False, force_all_finite=True,
+4:                ensure_min_features=1, warn_on_dtype=None, estimator=None):
+9:    only finite values. If the dtype of the array is object, attempt
+27:        only if its indices are stored with a 32-bit dtype.
+31:    dtype : string, type, list of types or None (default="numeric")
+32:        Data type of result. If None, the dtype of the input is preserved.
+33:        If "numeric", dtype is preserved unless array.dtype is object.
+34:        If dtype is a list of types, conversion on the first type is only
+35:        performed if the dtype of the input is not in the list.
+57:        For object dtyped data, only np.nan is checked and not np.inf.
+
+
+`dtype=None` preserves input dtype, but for object arrays with strings, the downstream operations need actual encoding. Actually `np.unique` works fine on object arrays of strings. Let me check what `contingency_matrix` does - it uses `np.unique(..., return_inverse=True)` which handles object arrays fine.
+
+However `check_array` with `dtype=None` on object arrays will still run `force_all_finite` check which may complain. Also the `mutual_info_score` and others use `_astype_copy_false` to convert to `np.int64` on the codes from `np.unique`, so those work.
+
+Let me look at the actual upstream commit fix. The PR is #15517 "Fix clustering metrics with string labels". Let me check how `mutual_info_score` uses the labels.
+
+```bash-action
+cd /testbed && sed -n '55,140p' sklearn/metrics/cluster/_supervised.py
+```2026_09_21_10_35_17899869082026_09_21_10_35_17899869082026_09_21_10_35_17899869082026_09_21_10_35_17899869092026_09_21_10_35_1789986910
+executing输出             "labels_true must be 1D: shape is %r" % (labels_true.shape,))
+    if labels_pred.ndim != 1:
+        raise ValueError(
+            "labels_pred must be 1D: shape is %r" % (labels_pred.shape,))
+    check_consistent_length(labels_true, labels_pred)
+
+    return labels_true, labels_pred
+
+
+def _generalized_average(U, V, average_method):
+    """Return a particular mean of two numbers."""
+    if average_method == "min":
+        return min(U, V)
+    elif average_method == "geometric":
+        return np.sqrt(U * V)
+    elif average_method == "arithmetic":
+        return np.mean([U, V])
+    elif average_method == "max":
+        return max(U, V)
+    else:
+        raise ValueError("'average_method' must be 'min', 'geometric', "
+                         "'arithmetic', or 'max'")
+
+
+def contingency_matrix(labels_true, labels_pred, eps=None, sparse=False):
+    """Build a contingency matrix describing the relationship between labels.
+
+    Parameters
+    ----------
+    labels_true : int array, shape = [n_samples]
+        Ground truth class labels to be used as a reference
+
+    labels_pred : array-like of shape (n_samples,)
+        Cluster labels to evaluate
+
+    eps : None or float, optional.
+        If a float, that value is added to all values in the contingency
+        matrix. This helps to stop NaN propagation.
+        If ``None``, nothing is adjusted.
+
+    sparse : boolean, optional.
+        If True, return a sparse CSR continency matrix. If ``eps is not None``,
+        and ``sparse is True``, will throw ValueError.
+
+        .. versionadded:: 0.18
+
+    Returns
+    -------
+    contingency : {array-like, sparse}, shape=[n_classes_true, n_classes_pred]
+        Matrix :math:`C` such that :math:`C_{i, j}` is the number of samples in
+        true class :math:`i` and in predicted class :math:`j`. If
+        ``eps is None``, the dtype of this array will be integer. If ``eps`` is
+        given, the dtype will be float.
+        Will be a ``scipy.sparse.csr_matrix`` if ``sparse=True``.
+    """
+
+    if eps is not None and sparse:
+        raise ValueError("Cannot set 'eps' when sparse=True")
+
+    classes, class_idx = np.unique(labels_true, return_inverse=True)
+    clusters, cluster_idx = np.unique(labels_pred, return_inverse=True)
+    n_classes = classes.shape[0]
+    n_clusters = clusters.shape[0]
+    # Using coo_matrix to accelerate simple histogram calculation,
+    # i.e. bins are consecutive integers
+    # Currently, coo_matrix is faster than histogram2d for simple cases
+    contingency = sp.coo_matrix((np.ones(class_idx.shape[0]),
+                                 (class_idx, cluster_idx)),
+                                shape=(n_classes, n_clusters),
+                                dtype=np.int)
+    if sparse:
+        contingency = contingency.tocsr()
+        contingency.sum_duplicates()
+    else:
+        contingency = contingency.toarray()
+        if eps is not None:
+            # don't use += as contingency is integer
+            contingency = contingency + eps
+    return contingency
+
+
+# clustering measures
+
+def adjusted_rand_score(labels_true, labels_pred):
+    """Rand index adjusted for chance.
+
+
+
+`contingency_matrix` uses `np.unique` with `return_inverse=True`, which handles strings fine. The only issue is `check_clusterings` forcing numeric conversion. 
+
+The upstream fix (PR #15517) modified `check_clusterings` to not force numeric dtype, but instead added a two-pass approach: first try with `dtype="numeric"`, and if it fails, fall back to `dtype=None`. Actually the real upstream fix used `LabelEncoder`. Let me confirm the actual upstream implementation:
+
+The actual upstream fix in PR #15517 changed `check_clusterings` to:
+```python
+def check_clusterings(labels_true, labels_pred):
+    labels_true = check_array(
+        labels_true, ensure_2d=False, ensure_min_samples=0, dtype=None,
+    )
+    labels_pred = check_array(
+        labels_pred, ensure_2d=False, ensure_min_samples=0, dtype=None,
+    )
+    ...
+```
+
+But `dtype=None` on numeric arrays keeps them numeric. However, there's a subtlety: with `dtype=None`, `check_array` will still try `np.asarray`, which works for object arrays. Let me just try this fix. But wait - `check_array` with `dtype=None` and object arrays should work. Let me verify by testing directly.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+from sklearn.utils.validation import check_array
+import numpy as np
+x = np.array(['a','b','a'], dtype=object)
+try:
+    r = check_array(x, ensure_2d=False, ensure_min_samples=0, dtype=None)
+    print('OK', r.dtype)
+except Exception as e:
+    print('ERR', type(e).__name__, e)
+"
+```2026_09_21_10_35_17899869102026_09_21_10_35_17899869102026_09_21_10_35_17899869112026_09_21_10_35_17899869112026_09_21_10_35_17899869122026_09_21_10_35_1789986912
+executing输出 OK object
+
+
+`dtype=None` works. Now let me verify the full `mutual_info_score` works with string object arrays after this change. Let me also confirm the numeric path still works (mixed problem: the whole pipeline needs `np.unique` handling). Let me check `mutual_info_score` body more.
+
+```bash-action
+cd /testbed && sed -n '290,340p' sklearn/metrics/cluster/_supervised.py
+```2026_09_21_10_35_17899869122026_09_21_10_35_17899869122026_09_21_10_35_17899869132026_09_21_10_35_17899869132026_09_21_10_35_17899869132026_09_21_10_35_17899869132026_09_21_10_35_17899869142026_09_21_10_35_1789986913
+executing输出     completeness : float
+       score between 0.0 and 1.0. 1.0 stands for perfectly complete labeling
+
+    v_measure : float
+        harmonic mean of the first two
+
+    See also
+    --------
+    homogeneity_score
+    completeness_score
+    v_measure_score
+    """
+    labels_true, labels_pred = check_clusterings(labels_true, labels_pred)
+
+    if len(labels_true) == 0:
+        return 1.0, 1.0, 1.0
+
+    entropy_C = entropy(labels_true)
+    entropy_K = entropy(labels_pred)
+
+    contingency = contingency_matrix(labels_true, labels_pred, sparse=True)
+    MI = mutual_info_score(None, None, contingency=contingency)
+
+    homogeneity = MI / (entropy_C) if entropy_C else 1.0
+    completeness = MI / (entropy_K) if entropy_K else 1.0
+
+    if homogeneity + completeness == 0.0:
+        v_measure_score = 0.0
+    else:
+        v_measure_score = ((1 + beta) * homogeneity * completeness
+                           / (beta * homogeneity + completeness))
+
+    return homogeneity, completeness, v_measure_score
+
+
+def homogeneity_score(labels_true, labels_pred):
+    """Homogeneity metric of a cluster labeling given a ground truth.
+
+    A clustering result satisfies homogeneity if all of its clusters
+    contain only data points which are members of a single class.
+
+    This metric is independent of the absolute values of the labels:
+    a permutation of the class or cluster label values won't change the
+    score value in any way.
+
+    This metric is not symmetric: switching ``label_true`` with ``label_pred``
+    will return the :func:`completeness_score` which will be different in
+    general.
+
+    Read more in the :ref:`User Guide <homogeneity_completeness>`.
+
+
+
+Now let me find `mutual_info_score` body (the entropy computation part).
+
+```bash-action
+cd /testbed && sed -n '600,680p' sklearn/metrics/cluster/_supervised.py
+```2026_09_21_10_35_17899869142026_09_21_10_35_17899869142026_09_21_10_35_17899869152026_09_21_10_35_17899869152026_09_21_10_35_17899869152026_09_21_10_35_1789986915
+executing输出         A contingency matrix given by the :func:`contingency_matrix` function.
+        If value is ``None``, it will be computed, otherwise the given value is
+        used, with ``labels_true`` and ``labels_pred`` ignored.
+
+    Returns
+    -------
+    mi : float
+       Mutual information, a non-negative value
+
+    Notes
+    -----
+    The logarithm used is the natural logarithm (base-e).
+
+    See also
+    --------
+    adjusted_mutual_info_score: Adjusted against chance Mutual Information
+    normalized_mutual_info_score: Normalized Mutual Information
+    """
+    if contingency is None:
+        labels_true, labels_pred = check_clusterings(labels_true, labels_pred)
+        contingency = contingency_matrix(labels_true, labels_pred, sparse=True)
+    else:
+        contingency = check_array(contingency,
+                                  accept_sparse=['csr', 'csc', 'coo'],
+                                  dtype=[int, np.int32, np.int64])
+
+    if isinstance(contingency, np.ndarray):
+        # For an array
+        nzx, nzy = np.nonzero(contingency)
+        nz_val = contingency[nzx, nzy]
+    elif sp.issparse(contingency):
+        # For a sparse matrix
+        nzx, nzy, nz_val = sp.find(contingency)
+    else:
+        raise ValueError("Unsupported type for 'contingency': %s" %
+                         type(contingency))
+
+    contingency_sum = contingency.sum()
+    pi = np.ravel(contingency.sum(axis=1))
+    pj = np.ravel(contingency.sum(axis=0))
+    log_contingency_nm = np.log(nz_val)
+    contingency_nm = nz_val / contingency_sum
+    # Don't need to calculate the full outer product, just for non-zeroes
+    outer = (pi.take(nzx).astype(np.int64, copy=False)
+             * pj.take(nzy).astype(np.int64, copy=False))
+    log_outer = -np.log(outer) + log(pi.sum()) + log(pj.sum())
+    mi = (contingency_nm * (log_contingency_nm - log(contingency_sum)) +
+          contingency_nm * log_outer)
+    return mi.sum()
+
+
+def adjusted_mutual_info_score(labels_true, labels_pred,
+                               average_method='arithmetic'):
+    """Adjusted Mutual Information between two clusterings.
+
+    Adjusted Mutual Information (AMI) is an adjustment of the Mutual
+    Information (MI) score to account for chance. It accounts for the fact that
+    the MI is generally higher for two clusterings with a larger number of
+    clusters, regardless of whether there is actually more information shared.
+    For two clusterings :math:`U` and :math:`V`, the AMI is given as::
+
+        AMI(U, V) = [MI(U, V) - E(MI(U, V))] / [avg(H(U), H(V)) - E(MI(U, V))]
+
+    This metric is independent of the absolute values of the labels:
+    a permutation of the class or cluster label values won't change the
+    score value in any way.
+
+    This metric is furthermore symmetric: switching ``label_true`` with
+    ``label_pred`` will return the same score value. This can be useful to
+    measure the agreement of two independent label assignments strategies
+    on the same dataset when the real ground truth is not known.
+
+    Be mindful that this function is an order of magnitude slower than other
+    metrics, such as the Adjusted Rand Index.
+
+    Read more in the :ref:`User Guide <mutual_info_score>`.
+
+    Parameters
+    ----------
+    labels_true : int array, shape = [n_samples]
+        A clustering of the data into disjoint subsets.
+
+
+The `mutual_info_score` uses `contingency_matrix` which uses `np.unique`, so string labels are handled fine. The fix is just in `check_clusterings`. Let me apply the fix using `dtype=None`.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+path = "sklearn/metrics/cluster/_supervised.py"
+with open(path) as f:
+    src = f.read()
+
+old = '''    labels_true = check_array(
+        labels_true, ensure_2d=False, ensure_min_samples=0
+    )
+    labels_pred = check_array(
+        labels_pred, ensure_2d=False, ensure_min_samples=0
+    )'''
+
+new = '''    labels_true = check_array(
+        labels_true, ensure_2d=False, ensure_min_samples=0, dtype=None,
+    )
+    labels_pred = check_array(
+        labels_pred, ensure_2d=False, ensure_min_samples=0, dtype=None,
+    )'''
+
+assert old in src, "pattern not found"
+src = src.replace(old, new, 1)
+with open(path, "w") as f:
+    f.write(src)
+print("patched")
+EOF
+```2026_09_21_10_35_1789986915
+executing输出 patched
+
+
+Now let me rerun the reproduction script.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+from sklearn.metrics.cluster import mutual_info_score
+import numpy as np
+x = np.random.choice(['a', 'b'], size=20).astype(object)
+print('object result:', mutual_info_score(x, x))
+y = np.random.choice(['a', 'b'], size=20)
+print('str result:', mutual_info_score(y, y))
+import warnings
+with warnings.catch_warnings():
+    warnings.simplefilter('error')
+    print('str no-warn result:', mutual_info_score(y, y))
+"
+```2026_09_21_10_35_17899869172026_09_21_10_35_1789986917
+executing输出 object result: 0.6108643020548934
+str result: 0.6474466390346323
+str no-warn result: 0.6474466390346323
+
+
+Both object and string arrays now work without warning. Let me also test numeric labels still work correctly (regression check).
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+from sklearn.metrics.cluster import (mutual_info_score, adjusted_rand_score,
+    normalized_mutual_info_score, homogeneity_score, completeness_score,
+    v_measure_score, fowlkes_mallows_score, adjusted_mutual_info_score)
+import numpy as np
+a = [0,0,1,1,2,2]
+b = [0,0,1,2,1,2]
+for fn in [mutual_info_score, adjusted_rand_score, normalized_mutual_info_score,
+           homogeneity_score, completeness_score, v_measure_score,
+           fowlkes_mallows_score, adjusted_mutual_info_score]:
+    print(fn.__name__, fn(a,b))
+print('--- string labels ---')
+sa = np.array(['x','x','y','y','z','z'])
+sb = np.array(['x','x','y','z','y','z'])
+for fn in [mutual_info_score, adjusted_rand_score, normalized_mutual_info_score,
+           homogeneity_score, completeness_score, v_measure_score,
+           fowlkes_mallows_score, adjusted_mutual_info_score]:
+    try:
+        print(fn.__name__, fn(sa,sb))
+    except Exception as e:
+        print(fn.__name__, 'ERR', type(e).__name__, e)
+"
+```2026_09_21_10_35_17899869192026_09_21_10_35_17899869192026_09_21_10_35_1789986920
+executing输出 mutual_info_score 0.6365141682948126
+adjusted_rand_score 0.16666666666666669
+normalized_mutual_info_score 0.5793801642856948
+homogeneity_score 0.5793801642856948
+completeness_score 0.5793801642856948
+v_measure_score 0.5793801642856948
+fowlkes_mallows_score 0.3333333333333333
+adjusted_mutual_info_score 0.16666666666666688
+--- string labels ---
+mutual_info_score 0.6365141682948126
+adjusted_rand_score 0.16666666666666669
+normalized_mutual_info_score 0.5793801642856948
+homogeneity_score 0.5793801642856948
+completeness_score 0.5793801642856948
+v_measure_score 0.5793801642856948
+fowlkes_mallows_score 0.3333333333333333
+adjusted_mutual_info_score 0.16666666666666688
+
+
+Numeric and string labels produce identical results. Now let me check if there's a similar error pattern elsewhere in the file—the `check_array` calls at line 622 for contingency is intentional (it's a numeric matrix), so that's fine. Let me grep for other `check_array` calls with the same pattern in the metrics cluster module.
+
+```bash-action
+cd /testbed && grep -rn "check_array" sklearn/metrics/cluster/*.py
+```2026_09_21_10_35_17899869212026_09_21_10_35_17899869212026_09_21_10_35_17899869222026_09_21_10_35_17899869212026_09_21_10_35_1789986922
+executing输出 sklearn/metrics/cluster/_bicluster.py:4:from ...utils.validation import check_consistent_length, check_array
+sklearn/metrics/cluster/_bicluster.py:13:    checks = lambda x: check_array(x, ensure_2d=False)
+sklearn/metrics/cluster/_supervised.py:24:from ...utils.validation import check_array, check_consistent_length
+sklearn/metrics/cluster/_supervised.py:45:    labels_true = check_array(
+sklearn/metrics/cluster/_supervised.py:48:    labels_pred = check_array(
+sklearn/metrics/cluster/_supervised.py:622:        contingency = check_array(contingency,
+
+
+Let me check `_bicluster.py` - `consensus_score` uses `check_array` with default numeric dtype. This could have the same issue for string labels.
+
+```bash-action
+cd /testbed && sed -n '1,60p' sklearn/metrics/cluster/_bicluster.py
+```2026_09_21_10_35_17899869222026_09_21_10_35_17899869222026_09_21_10_35_17899869222026_09_21_10_35_17899869232026_09_21_10_35_1789986923
+executing输出 import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+from ...utils.validation import check_consistent_length, check_array
+
+__all__ = ["consensus_score"]
+
+
+def _check_rows_and_columns(a, b):
+    """Unpacks the row and column arrays and checks their shape."""
+    check_consistent_length(*a)
+    check_consistent_length(*b)
+    checks = lambda x: check_array(x, ensure_2d=False)
+    a_rows, a_cols = map(checks, a)
+    b_rows, b_cols = map(checks, b)
+    return a_rows, a_cols, b_rows, b_cols
+
+
+def _jaccard(a_rows, a_cols, b_rows, b_cols):
+    """Jaccard coefficient on the elements of the two biclusters."""
+    intersection = ((a_rows * b_rows).sum() *
+                    (a_cols * b_cols).sum())
+
+    a_size = a_rows.sum() * a_cols.sum()
+    b_size = b_rows.sum() * b_cols.sum()
+
+    return intersection / (a_size + b_size - intersection)
+
+
+def _pairwise_similarity(a, b, similarity):
+    """Computes pairwise similarity matrix.
+
+    result[i, j] is the Jaccard coefficient of a's bicluster i and b's
+    bicluster j.
+
+    """
+    a_rows, a_cols, b_rows, b_cols = _check_rows_and_columns(a, b)
+    n_a = a_rows.shape[0]
+    n_b = b_rows.shape[0]
+    result = np.array(list(list(similarity(a_rows[i], a_cols[i],
+                                           b_rows[j], b_cols[j])
+                                for j in range(n_b))
+                           for i in range(n_a)))
+    return result
+
+
+def consensus_score(a, b, similarity="jaccard"):
+    """The similarity of two sets of biclusters.
+
+    Similarity between individual biclusters is computed. Then the
+    best matching between sets is found using the Hungarian algorithm.
+    The final score is the sum of similarities divided by the size of
+    the larger set.
+
+    Read more in the :ref:`User Guide <biclustering>`.
+
+    Parameters
+    ----------
+    a : (rows, columns)
+        Tuple of row and column indicators for a set of biclusters.
+
+
+`_bicluster.py`'s `consensus_score` deals with boolean/int indicator matrices (rows/cols indicators) and does arithmetic (`a_rows * b_rows`), so strings wouldn't make sense there anyway. This is a genuine numeric usage, not the same bug. I'll leave it alone—only fixing the necessary source.
+
+Now let me run the existing tests for the cluster metrics module.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest sklearn/metrics/cluster/tests/test_supervised.py -q 2>&1 | tail -25
+```2026_09_21_10_35_17899869232026_09_21_10_35_17899869232026_09_21_10_35_17899869242026_09_21_10_35_17899869242026_09_21_10_35_1789986924
+executing输出 ...................                                                      [100%]
+19 passed in 0.30s
+
+
+Let me run the full cluster tests directory to be safe.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest sklearn/metrics/cluster/tests/ -q 2>&1 | tail -15
+```2026_09_21_10_35_17899869262026_09_21_10_35_17899869262026_09_21_10_35_1789986927
+executing输出 ........................................................................ [ 77%]
+.....................                                                    [100%]
+93 passed, 1 warning in 0.64s
+
+
+All tests pass. Now let me confirm the diff.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_10_35_17899869282026_09_21_10_35_17899869282026_09_21_10_35_17899869282026_09_21_10_35_17899869292026_09_21_10_35_1789986929
+executing输出 diff --git a/sklearn/metrics/cluster/_supervised.py b/sklearn/metrics/cluster/_supervised.py
+index 4bddae35c..146a7338b 100755
+--- a/sklearn/metrics/cluster/_supervised.py
++++ b/sklearn/metrics/cluster/_supervised.py
+@@ -43,10 +43,10 @@ def check_clusterings(labels_true, labels_pred):
+         The predicted labels.
+     """
+     labels_true = check_array(
+-        labels_true, ensure_2d=False, ensure_min_samples=0
++        labels_true, ensure_2d=False, ensure_min_samples=0, dtype=None,
+     )
+     labels_pred = check_array(
+-        labels_pred, ensure_2d=False, ensure_min_samples=0
++        labels_pred, ensure_2d=False, ensure_min_samples=0, dtype=None,
+     )
+ 
+     # input checks
+
+
+The diff is exactly as intended—a minimal change to `check_clusterings` that preserves the input dtype (allowing string/object labels) instead of forcing numeric conversion. Verified:
+- Bug reproduced (object/string labels raised `ValueError`).
+- After fix: object and string labels work without warnings; numeric behavior unchanged; all clustering metrics give identical results for numeric vs string labels.
+- All 93 existing cluster metric tests pass.
+
+```bash-action
+exit
+```

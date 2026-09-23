@@ -1,0 +1,613 @@
+plan-unwanted
+我需要先看一下相关的源码。让我先了解 autodoc 中处理 `__all__` 的逻辑。
+
+```bash-action
+cd /testbed && grep -rn "__all__" sphinx/ext/autodoc/ | head -50
+```
+executing输出 sphinx/ext/autodoc/mock.py:86:        self.__all__ = []  # type: List[str]
+sphinx/ext/autodoc/__init__.py:788:                # forcedly skipped member (ex. a module attribute not defined in __all__)
+sphinx/ext/autodoc/__init__.py:992:        self.__all__ = None  # type: Optional[Sequence[str]]
+sphinx/ext/autodoc/__init__.py:1020:                self.__all__ = inspect.getall(self.object)
+sphinx/ext/autodoc/__init__.py:1022:            # __all__ raises an error.
+sphinx/ext/autodoc/__init__.py:1023:            logger.warning(__('%s.__all__ raises an error. Ignored: %r'),
+sphinx/ext/autodoc/__init__.py:1026:            # invalid __all__ found.
+sphinx/ext/autodoc/__init__.py:1027:            logger.warning(__('__all__ should be a list of strings, not %r '
+sphinx/ext/autodoc/__init__.py:1028:                              '(in module %s) -- ignoring __all__') %
+sphinx/ext/autodoc/__init__.py:1077:            if not self.__all__:
+sphinx/ext/autodoc/__init__.py:1083:                    if member.__name__ not in self.__all__:
+sphinx/ext/autodoc/__init__.py:1102:        if order == 'bysource' and self.__all__:
+sphinx/ext/autodoc/__init__.py:1103:            # Sort alphabetically first (for members not listed on the __all__)
+sphinx/ext/autodoc/__init__.py:1106:            # Sort by __all__
+sphinx/ext/autodoc/__init__.py:1109:                if name in self.__all__:
+sphinx/ext/autodoc/__init__.py:1110:                    return self.__all__.index(name)
+sphinx/ext/autodoc/__init__.py:1112:                    return len(self.__all__)
+
+
+Let me look at the relevant code sections.
+
+```bash-action
+cd /testbed && sed -n '1010,1095p' sphinx/ext/autodoc/__init__.py
+```2026_09_21_10_40_1789987239
+executing输出             logger.warning(__('signature arguments or return annotation '
+                              'given for automodule %s') % self.fullname,
+                           type='autodoc')
+        return ret
+
+    def import_object(self, raiseerror: bool = False) -> bool:
+        ret = super().import_object(raiseerror)
+
+        try:
+            if not self.options.ignore_module_all:
+                self.__all__ = inspect.getall(self.object)
+        except AttributeError as exc:
+            # __all__ raises an error.
+            logger.warning(__('%s.__all__ raises an error. Ignored: %r'),
+                           (self.fullname, exc), type='autodoc')
+        except ValueError as exc:
+            # invalid __all__ found.
+            logger.warning(__('__all__ should be a list of strings, not %r '
+                              '(in module %s) -- ignoring __all__') %
+                           (exc.args[0], self.fullname), type='autodoc')
+
+        return ret
+
+    def add_directive_header(self, sig: str) -> None:
+        Documenter.add_directive_header(self, sig)
+
+        sourcename = self.get_sourcename()
+
+        # add some module-specific options
+        if self.options.synopsis:
+            self.add_line('   :synopsis: ' + self.options.synopsis, sourcename)
+        if self.options.platform:
+            self.add_line('   :platform: ' + self.options.platform, sourcename)
+        if self.options.deprecated:
+            self.add_line('   :deprecated:', sourcename)
+
+    def get_module_members(self) -> Dict[str, ObjectMember]:
+        """Get members of target module."""
+        if self.analyzer:
+            attr_docs = self.analyzer.attr_docs
+        else:
+            attr_docs = {}
+
+        members = {}  # type: Dict[str, ObjectMember]
+        for name in dir(self.object):
+            try:
+                value = safe_getattr(self.object, name, None)
+                docstring = attr_docs.get(('', name), [])
+                members[name] = ObjectMember(name, value, docstring="\n".join(docstring))
+            except AttributeError:
+                continue
+
+        # annotation only member (ex. attr: int)
+        try:
+            for name in inspect.getannotations(self.object):
+                if name not in members:
+                    docstring = attr_docs.get(('', name), [])
+                    members[name] = ObjectMember(name, INSTANCEATTR,
+                                                 docstring="\n".join(docstring))
+        except AttributeError:
+            pass
+
+        return members
+
+    def get_object_members(self, want_all: bool) -> Tuple[bool, ObjectMembers]:
+        members = self.get_module_members()
+        if want_all:
+            if not self.__all__:
+                # for implicit module members, check __module__ to avoid
+                # documenting imported objects
+                return True, list(members.values())
+            else:
+                for member in members.values():
+                    if member.__name__ not in self.__all__:
+                        member.skipped = True
+
+                return False, list(members.values())
+        else:
+            memberlist = self.options.members or []
+            ret = []
+            for name in memberlist:
+                if name in members:
+                    ret.append(members[name])
+                else:
+                    logger.warning(__('missing attribute mentioned in :members: option: '
+                                      'module %s, attribute %s') %
+
+
+I found the bug. In `get_object_members`, `if not self.__all__:` treats both `None` (no `__all__` defined) and `[]` (empty `__all__`) the same way. When `__all__` is an empty list, it should result in no members being shown, but the code falls into the "show all" branch.
+
+The fix: distinguish between `None` (no `__all__`) and an empty list.
+
+```bash-action
+cd /testbed && python -c "
+import inspect
+import sys
+sys.path.insert(0, '.')
+from sphinx.ext.autodoc import inspect as _i
+import types
+m = types.ModuleType('example')
+m.__all__ = []
+m.foo = lambda: None
+print(repr(_i.getall(m)))
+" 2>&1 | head; grep -n "def getall" sphinx/pycode/__init__.py
+```2026_09_21_10_40_1789987241
+executing输出 Traceback (most recent call last):
+  File "<string>", line 5, in <module>
+  File "/testbed/sphinx/ext/autodoc/__init__.py", line 20, in <module>
+    from docutils.statemachine import StringList
+ModuleNotFoundError: No module named 'docutils'
+
+
+Let me find `getall` definition directly.
+
+```bash-action
+cd /testbed && grep -rn "def getall" sphinx/
+```2026_09_21_10_40_1789987241
+executing输出 sphinx/util/inspect.py:144:def getall(obj: Any) -> Optional[Sequence[str]]:
+
+
+```bash-action
+cd /testbed && sed -n '144,160p' sphinx/util/inspect.py
+```
+executing输出 def getall(obj: Any) -> Optional[Sequence[str]]:
+    """Get __all__ attribute of the module as dict.
+
+    Return None if given *obj* does not have __all__.
+    Raises AttributeError if given *obj* raises an error on accessing __all__.
+    Raises ValueError if given *obj* have invalid __all__.
+    """
+    __all__ = safe_getattr(obj, '__all__', None)
+    if __all__ is None:
+        return None
+    else:
+        if (isinstance(__all__, (list, tuple)) and all(isinstance(e, str) for e in __all__)):
+            return __all__
+        else:
+            raise ValueError(__all__)
+
+
+
+
+So `getall` returns `None` when there's no `__all__`, and returns `[]` when `__all__ = []`. The bug is in `get_object_members` which uses `if not self.__all__:` — this treats `[]` like `None`.
+
+The fix is to check for `None` explicitly.
+
+```bash-action
+cd /testbed && sed -n '1073,1090p' sphinx/ext/autodoc/__init__.py
+```2026_09_21_10_40_1789987243
+executing输出 
+    def get_object_members(self, want_all: bool) -> Tuple[bool, ObjectMembers]:
+        members = self.get_module_members()
+        if want_all:
+            if not self.__all__:
+                # for implicit module members, check __module__ to avoid
+                # documenting imported objects
+                return True, list(members.values())
+            else:
+                for member in members.values():
+                    if member.__name__ not in self.__all__:
+                        member.skipped = True
+
+                return False, list(members.values())
+        else:
+            memberlist = self.options.members or []
+            ret = []
+            for name in memberlist:
+
+
+Now let me write a minimal reproduction script to confirm the bug. First let me check if there's a test environment I can use.
+
+```bash-action
+cd /testbed && python -c "import sphinx; print(sphinx.__version__)" 2>&1 | tail -3
+```2026_09_21_10_40_1789987244
+executing输出 3.5.0
+
+
+Good, sphinx imports fine in the default python. Earlier failure was because I ran from within a directory and used a different python path hack. Let me write a minimal reproduction using the ModuleDocumenter logic directly.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import types
+from sphinx.ext.autodoc import ModuleDocumenter
+
+# Simulate a module with empty __all__
+mod = types.ModuleType('example')
+mod.__all__ = []
+exec("def foo():\n    'docstring'\n\ndef bar():\n    'docstring'\n", mod.__dict__)
+
+from sphinx.util.inspect import getall
+print("getall returns:", repr(getall(mod)))
+
+# Check the logic in get_object_members
+all_ = getall(mod)
+# current buggy logic
+if not all_:
+    print("BUG: empty __all__ treated as no __all__ -> all members shown")
+else:
+    print("OK: empty __all__ -> no members shown")
+EOF
+python /tmp/repro.py
+```2026_09_21_10_40_17899872452026_09_21_10_40_1789987245
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 2, in <module>
+    from sphinx.ext.autodoc import ModuleDocumenter
+ModuleNotFoundError: No module named 'sphinx'
+
+
+The `/tmp/repro.py` runs from `/tmp`, not `/testbed`. Let me set PYTHONPATH.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_10_40_17899872462026_09_21_10_40_1789987247
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 2, in <module>
+    from sphinx.ext.autodoc import ModuleDocumenter
+  File "/testbed/sphinx/ext/autodoc/__init__.py", line 20, in <module>
+    from docutils.statemachine import StringList
+ModuleNotFoundError: No module named 'docutils'
+
+
+The default `python` doesn't have docutils. The task said the current shell's python is the configured test environment. Let me check which python has the deps.
+
+```bash-action
+cd /testbed && which python python3; python -c "import docutils" 2>&1; python3 -c "import docutils; print('py3 ok')" 2>&1
+```2026_09_21_10_40_1789987248
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python3
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'docutils'
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'docutils'
+
+
+Let me find the right environment.
+
+```bash-action
+cd /testbed && ls /opt/miniconda3/envs/ 2>/dev/null; find / -name "docutils" -maxdepth 6 -type d 2>/dev/null | head
+```2026_09_21_10_40_17899872502026_09_21_10_40_1789987250
+executing输出 testbed
+
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "import sphinx, docutils; print('ok', sphinx.__version__)"
+```2026_09_21_10_40_17899872512026_09_21_10_40_17899872512026_09_21_10_40_1789987252
+executing输出 ok 3.5.0
+
+
+Now let me run the reproduction with the correct environment.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_10_40_17899872512026_09_21_10_40_17899872522026_09_21_10_40_1789987252
+executing输出 getall returns: []
+BUG: empty __all__ treated as no __all__ -> all members shown
+
+
+Bug confirmed. Now let me fix the source code. The condition `if not self.__all__:` needs to distinguish `None` from `[]`.
+
+```bash-action
+cd /testbed && sed -n '1074,1086p' sphinx/ext/autodoc/__init__.py
+```2026_09_21_10_40_1789987253
+executing输出     def get_object_members(self, want_all: bool) -> Tuple[bool, ObjectMembers]:
+        members = self.get_module_members()
+        if want_all:
+            if not self.__all__:
+                # for implicit module members, check __module__ to avoid
+                # documenting imported objects
+                return True, list(members.values())
+            else:
+                for member in members.values():
+                    if member.__name__ not in self.__all__:
+                        member.skipped = True
+
+                return False, list(members.values())
+
+
+Now I'll apply the fix. When `self.__all__` is `None` (no `__all__`), show all members. When it's an empty list, show none.
+
+The correct behavior: if `__all__` is defined (not None), then filter members by membership in `__all__`. If `__all__` is `[]`, all get skipped. Let me restructure:
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+path = "sphinx/ext/autodoc/__init__.py"
+with open(path) as f:
+    src = f.read()
+
+old = '''        if want_all:
+            if not self.__all__:
+                # for implicit module members, check __module__ to avoid
+                # documenting imported objects
+                return True, list(members.values())
+            else:
+                for member in members.values():
+                    if member.__name__ not in self.__all__:
+                        member.skipped = True
+
+                return False, list(members.values())'''
+
+new = '''        if want_all:
+            if self.__all__ is None:
+                # for implicit module members, check __module__ to avoid
+                # documenting imported objects
+                return True, list(members.values())
+            else:
+                for member in members.values():
+                    if member.__name__ not in self.__all__:
+                        member.skipped = True
+
+                return False, list(members.values())'''
+
+assert old in src, "old block not found"
+src = src.replace(old, new)
+with open(path, "w") as f:
+    f.write(src)
+print("patched")
+EOF
+```
+executing输出 patched
+
+
+Now let me update the reproduction to test the actual fixed logic, and run a real integration test.
+
+```bash-action
+cd /testbed && cat > /tmp/repro2.py <<'EOF'
+import types
+from unittest.mock import Mock
+from sphinx.ext.autodoc import ModuleDocumenter
+from sphinx.util.inspect import getall
+
+mod = types.ModuleType('example')
+mod.__all__ = []
+exec("def foo():\n    'docstring'\n\ndef bar():\n    'docstring'\n", mod.__dict__)
+
+d = ModuleDocumenter(Mock(), 'example')
+d.object = mod
+d.__all__ = getall(mod)
+
+want_all, members = d.get_object_members(True)
+print("want_all:", want_all)
+print("non-skipped members:", [m.__name__ for m in members if not m.skipped])
+assert [m.__name__ for m in members if not m.skipped] == [], "FAIL: members shown for empty __all__"
+print("PASS: empty __all__ -> no members shown")
+
+# also check no __all__ still shows all
+mod2 = types.ModuleType('example2')
+exec("def foo():\n    'docstring'\n\ndef bar():\n    'docstring'\n", mod2.__dict__)
+d2 = ModuleDocumenter(Mock(), 'example2')
+d2.object = mod2
+d2.__all__ = getall(mod2)
+want_all, members = d2.get_object_members(True)
+names = [m.__name__ for m in members if not m.skipped]
+print("no __all__, want_all:", want_all, "members:", names)
+assert want_all is True
+print("PASS: no __all__ -> all members shown")
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro2.py
+```2026_09_21_10_40_17899872572026_09_21_10_40_17899872582026_09_21_10_40_1789987258
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro2.py", line 10, in <module>
+    d = ModuleDocumenter(Mock(), 'example')
+  File "/testbed/sphinx/ext/autodoc/__init__.py", line 991, in __init__
+    merge_members_option(self.options)
+  File "/testbed/sphinx/ext/autodoc/__init__.py", line 177, in merge_members_option
+    if key in options and options[key] not in (ALL, None):
+TypeError: argument of type 'Mock' is not iterable
+
+
+Let me construct the documenter properly with an Options object. Easier to just test the logic branch directly since instantiating is complex.
+
+```bash-action
+cd /testbed && cat > /tmp/repro3.py <<'EOF'
+import types
+from sphinx.util.inspect import getall
+from sphinx.ext.autodoc import ModuleDocumenter, ObjectMember, INSTANCEATTR
+
+# Build a real-ish documenter without running __init__
+d = ModuleDocumenter.__new__(ModuleDocumenter)
+
+mod = types.ModuleType('example')
+mod.__all__ = []
+exec("def foo():\n    'docstring'\n\ndef bar():\n    'docstring'\n", mod.__dict__)
+d.object = mod
+d.__all__ = getall(mod)
+
+def fake_members():
+    return {n: ObjectMember(n, None) for n in ('foo', 'bar')}
+d.get_module_members = fake_members
+
+want_all, members = d.get_object_members(True)
+shown = [m.__name__ for m in members if not m.skipped]
+print("empty __all__ -> shown:", shown)
+assert shown == [], "FAIL"
+print("PASS: empty __all__ -> no members shown")
+
+# no __all__
+mod2 = types.ModuleType('example2')
+mod2.__all__ = None  # getall returns None for missing
+d2 = ModuleDocumenter.__new__(ModuleDocumenter)
+d2.object = mod2
+d2.__all__ = None
+d2.get_module_members = fake_members
+want_all, members = d2.get_object_members(True)
+shown = [m.__name__ for m in members if not m.skipped]
+print("no __all__ -> want_all:", want_all, "shown:", shown)
+assert want_all is True and set(shown) == {'foo', 'bar'}
+print("PASS: no __all__ -> all members shown")
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro3.py
+```2026_09_21_10_40_17899872592026_09_21_10_40_17899872592026_09_21_10_40_17899872592026_09_21_10_40_1789987260
+executing输出 empty __all__ -> shown: []
+PASS: empty __all__ -> no members shown
+no __all__ -> want_all: True shown: ['foo', 'bar']
+PASS: no __all__ -> all members shown
+
+
+Fix confirmed. Now let me check for the same bug pattern elsewhere (grep for `__all__` truthiness checks).
+
+```bash-action
+cd /testbed && grep -rn "not self.__all__\|if self.__all__\|__all__" sphinx/ext/autodoc/__init__.py | grep -v "getall\|__all__ raises\|should be a list\|member.__name__\|in self.__all__\|len(self.__all__)"
+```2026_09_21_10_41_1789987261
+executing输出 788:                # forcedly skipped member (ex. a module attribute not defined in __all__)
+992:        self.__all__ = None  # type: Optional[Sequence[str]]
+1026:            # invalid __all__ found.
+1028:                              '(in module %s) -- ignoring __all__') %
+1077:            if self.__all__ is None:
+1102:        if order == 'bysource' and self.__all__:
+1103:            # Sort alphabetically first (for members not listed on the __all__)
+1106:            # Sort by __all__
+1110:                    return self.__all__.index(name)
+
+
+Line 1102 (`if order == 'bysource' and self.__all__:`) is about sorting order — for an empty `__all__` it just falls back to alphabetical, which is harmless (nothing to sort by anyway). The bug was only about member selection. That's fine to leave.
+
+Now let me run the existing test suite for autodoc to check for regressions. Let me find relevant tests.
+
+```bash-action
+cd /testbed && grep -rln "__all__" tests/ | head
+```2026_09_21_10_41_17899872622026_09_21_10_41_17899872622026_09_21_10_41_1789987263
+executing输出 tests/roots/test-root/autodoc_target.py
+tests/roots/test-ext-viewcode/spam/mod3.py
+tests/roots/test-ext-autodoc/target/__init__.py
+tests/roots/test-ext-autodoc/target/sort_by_all.py
+tests/test_ext_autodoc_events.py
+
+
+The relevant test module for this is `tests/test_ext_autodoc.py` (about module members). Let me find tests covering module `__all__` and members.
+
+```bash-action
+cd /testbed && grep -rn "__all__\|def test_" tests/test_ext_autodoc.py | grep -i "all\|module_members\|sort_by_all" | head -30
+```2026_09_21_10_41_17899872642026_09_21_10_41_1789987264
+executing输出 718:def test_autodoc_ignore_module_all(app):
+
+
+Let me look at that test and the sort_by_all target to find tests exercising `__all__`.
+
+```bash-action
+cd /testbed && sed -n '718,745p' tests/test_ext_autodoc.py; echo ---; grep -rn "sort_by_all\|__all__" tests/test_ext_autodoc.py
+```2026_09_21_10_41_17899872652026_09_21_10_41_1789987266
+executing输出 def test_autodoc_ignore_module_all(app):
+    # default (no-ignore-module-all)
+    options = {"members": None}
+    actual = do_autodoc(app, 'module', 'target', options)
+    assert list(filter(lambda l: 'class::' in l, actual)) == [
+        '.. py:class:: Class(arg)',
+    ]
+
+    # ignore-module-all
+    options = {"members": None,
+               "ignore-module-all": None}
+    actual = do_autodoc(app, 'module', 'target', options)
+    assert list(filter(lambda l: 'class::' in l, actual)) == [
+        '.. py:class:: Class(arg)',
+        '.. py:class:: CustomDict',
+        '.. py:class:: InnerChild()',
+        '.. py:class:: InstAttCls()',
+        '.. py:class:: Outer()',
+        '   .. py:class:: Outer.Inner()',
+        '.. py:class:: StrRepr'
+    ]
+
+
+@pytest.mark.sphinx('html', testroot='ext-autodoc')
+def test_autodoc_noindex(app):
+    options = {"noindex": True}
+    actual = do_autodoc(app, 'module', 'target', options)
+    assert list(actual) == [
+---
+994:    actual = do_autodoc(app, 'module', 'target.sort_by_all', options)
+996:        '.. py:module:: target.sort_by_all',
+1010:    actual = do_autodoc(app, 'module', 'target.sort_by_all', options)
+1012:        '.. py:module:: target.sort_by_all',
+
+
+Let me run the full autodoc test file to ensure no regression.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest tests/test_ext_autodoc.py -q 2>&1 | tail -20
+```2026_09_21_10_41_17899872672026_09_21_10_41_17899872682026_09_21_10_41_17899872682026_09_21_10_41_1789987268
+executing输出 tests/test_ext_autodoc.py::test_autodoc
+    for node in self.document.traverse(addnodes.highlightlang):
+
+tests/test_ext_autodoc.py::test_autodoc
+    for lbnode in self.document.traverse(nodes.literal_block):  # type: nodes.literal_block
+
+tests/test_ext_autodoc.py::test_autodoc
+    for dbnode in self.document.traverse(nodes.doctest_block):  # type: nodes.doctest_block
+
+tests/test_ext_autodoc.py::test_autodoc
+    for toctreenode in doctree.traverse(addnodes.toctree):
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_ext_autodoc.py::test_autodoc - AssertionError: assert '\x1b...
+1 failed, 67 passed, 42 warnings in 3.23s
+
+
+Let me check if this failure is pre-existing (unrelated to my change) by stashing my change and re-running just that test.
+
+```bash-action
+cd /testbed && git stash && /opt/miniconda3/envs/testbed/bin/python -m pytest tests/test_ext_autodoc.py::test_autodoc -q 2>&1 | tail -5; git stash pop
+```2026_09_21_10_41_17899872732026_09_21_10_41_17899872732026_09_21_10_41_17899872732026_09_21_10_41_1789987274
+executing输出 Saved working directory and index state WIP on master: 9d57ddaa2 SWE-bench
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_ext_autodoc.py::test_autodoc - AssertionError: assert '\x1b...
+1 failed, 42 warnings in 0.26s
+On branch master
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   sphinx/ext/autodoc/__init__.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Dropped refs/stash@{0} (8253a58ffcf36afc8818a207a28164991ab3acec)
+
+
+`test_autodoc` fails even without my change — it's pre-existing and unrelated. All other 67 tests pass.
+
+Now let me confirm the git diff of my change.
+
+```bash-action
+cd /testbed && git diff sphinx/ext/autodoc/__init__.py
+```2026_09_21_10_41_17899872742026_09_21_10_41_17899872752026_09_21_10_41_1789987275
+executing输出 diff --git a/sphinx/ext/autodoc/__init__.py b/sphinx/ext/autodoc/__init__.py
+index d85d79617..c9f90acca 100755
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -1074,7 +1074,7 @@ class ModuleDocumenter(Documenter):
+     def get_object_members(self, want_all: bool) -> Tuple[bool, ObjectMembers]:
+         members = self.get_module_members()
+         if want_all:
+-            if not self.__all__:
++            if self.__all__ is None:
+                 # for implicit module members, check __module__ to avoid
+                 # documenting imported objects
+                 return True, list(members.values())
+
+
+The change is minimal and correct:
+
+- `sphinx/ext/autodoc/__init__.py` — in `ModuleDocumenter.get_object_members`, changed `if not self.__all__:` to `if self.__all__ is None:` so that an empty `__all__` (which `getall` returns as `[]`) is distinguished from a missing `__all__` (which returns `None`).
+
+Verification results:
+- Bug reproduced before fix, and the minimal fix script confirms: empty `__all__` → no members shown; missing `__all__` → all members shown.
+- Existing autodoc test suite: 67 passed, the single `test_autodoc` failure is pre-existing (fails identically without my change).
+
+```bash-action
+exit
+```
