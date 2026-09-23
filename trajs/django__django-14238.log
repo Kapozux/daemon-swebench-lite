@@ -1,0 +1,249 @@
+plan-unwanted
+I'll start by examining the relevant source code.
+
+```bash-action
+cat /testbed/django/db/models/fields/__init__.py | grep -n "AutoFieldMeta" -A 30 | head -60
+```
+executing输出 2502:class AutoFieldMeta(type):
+2503-    """
+2504-    Metaclass to maintain backward inheritance compatibility for AutoField.
+2505-
+2506-    It is intended that AutoFieldMixin become public API when it is possible to
+2507-    create a non-integer automatically-generated field using column defaults
+2508-    stored in the database.
+2509-
+2510-    In many areas Django also relies on using isinstance() to check for an
+2511-    automatically-generated field as a subclass of AutoField. A new flag needs
+2512-    to be implemented on Field to be used instead.
+2513-
+2514-    When these issues have been addressed, this metaclass could be used to
+2515-    deprecate inheritance from AutoField and use of isinstance() with AutoField
+2516-    for detecting automatically-generated fields.
+2517-    """
+2518-
+2519-    @property
+2520-    def _subclasses(self):
+2521-        return (BigAutoField, SmallAutoField)
+2522-
+2523-    def __instancecheck__(self, instance):
+2524-        return isinstance(instance, self._subclasses) or super().__instancecheck__(instance)
+2525-
+2526-    def __subclasscheck__(self, subclass):
+2527-        return subclass in self._subclasses or super().__subclasscheck__(subclass)
+2528-
+2529-
+2530:class AutoField(AutoFieldMixin, IntegerField, metaclass=AutoFieldMeta):
+2531-
+2532-    def get_internal_type(self):
+2533-        return 'AutoField'
+2534-
+2535-    def rel_db_type(self, connection):
+2536-        return IntegerField().db_type(connection=connection)
+2537-
+2538-
+2539-class BigAutoField(AutoFieldMixin, BigIntegerField):
+2540-
+2541-    def get_internal_type(self):
+2542-        return 'BigAutoField'
+2543-
+2544-    def rel_db_type(self, connection):
+2545-        return BigIntegerField().db_type(connection=connection)
+2546-
+2547-
+2548-class SmallAutoField(AutoFieldMixin, SmallIntegerField):
+2549-
+2550-    def get_internal_type(self):
+2551-        return 'SmallAutoField'
+2552-
+2553-    def rel_db_type(self, connection):
+2554-        return SmallIntegerField().db_type(connection=connection)
+
+
+The bug is clear: `__subclasscheck__` uses `subclass in self._subclasses` (identity/membership) rather than checking subclass relationships. So `MyBigAutoField` (a subclass of `BigAutoField`) fails. Let me fix it.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'django/db/models/fields/__init__.py'
+s = open(p).read()
+old = """    def __subclasscheck__(self, subclass):
+        return subclass in self._subclasses or super().__subclasscheck__(subclass)"""
+new = """    def __subclasscheck__(self, subclass):
+        return issubclass(subclass, self._subclasses) or super().__subclasscheck__(subclass)"""
+assert old in s
+s = s.replace(old, new)
+open(p, 'w').write(s)
+print("done")
+EOF
+```2026_09_21_09_51_1789984306
+executing输出 done
+
+
+Now let me write a minimal reproduction script to confirm the fix (this verifies the original bug scenario).
+
+```bash-action
+cd /testbed && python - <<'EOF'
+from django.db import models
+
+class MyBigAutoField(models.BigAutoField):
+    pass
+
+class MySmallAutoField(models.SmallAutoField):
+    pass
+
+# This is the check performed in options._get_default_pk_class
+print("BigAutoField subclass check:", issubclass(MyBigAutoField, models.AutoField))
+print("SmallAutoField subclass check:", issubclass(MySmallAutoField, models.AutoField))
+print("instance check:", isinstance(MyBigAutoField(), models.AutoField))
+print("plain AutoField subclass check:", issubclass(models.AutoField, models.AutoField))
+print("BigAutoField check:", issubclass(models.BigAutoField, models.AutoField))
+EOF
+```2026_09_21_09_51_1789984307
+executing输出 Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+  File "/testbed/django/db/__init__.py", line 2, in <module>
+    from django.db.utils import (
+  File "/testbed/django/db/utils.py", line 7, in <module>
+    from django.utils.connection import ConnectionDoesNotExist  # NOQA: F401
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/utils/connection.py", line 1, in <module>
+    from asgiref.local import Local
+ModuleNotFoundError: No module named 'asgiref'
+
+
+Wrong python environment. Let me find the configured one.
+
+```bash-action
+cd /testbed && ls && which python && python -c "import sys; print(sys.executable)" && find / -name "asgiref" -maxdepth 8 -type d 2>/dev/null | head
+```2026_09_21_09_51_17899843092026_09_21_09_51_1789984310
+executing输出 AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+django
+docs
+extras
+js_tests
+llm.py
+package.json
+pyproject.toml
+scripts
+setup.cfg
+setup.py
+system_prompt.txt
+tests
+tox.ini
+/opt/miniconda3/bin/python
+/opt/miniconda3/bin/python
+/opt/miniconda3/envs/testbed/lib/python3.8/site-packages/asgiref
+
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python - <<'EOF'
+from django.db import models
+
+class MyBigAutoField(models.BigAutoField):
+    pass
+
+class MySmallAutoField(models.SmallAutoField):
+    pass
+
+print("BigAutoField subclass check:", issubclass(MyBigAutoField, models.AutoField))
+print("SmallAutoField subclass check:", issubclass(MySmallAutoField, models.AutoField))
+print("instance check:", isinstance(MyBigAutoField(), models.AutoField))
+print("AutoField subclass check:", issubclass(models.AutoField, models.AutoField))
+print("BigAutoField check:", issubclass(models.BigAutoField, models.AutoField))
+print("SmallAutoField check:", issubclass(models.SmallAutoField, models.AutoField))
+EOF
+```2026_09_21_09_51_17899843102026_09_21_09_51_1789984311
+executing输出 BigAutoField subclass check: True
+SmallAutoField subclass check: True
+instance check: True
+AutoField subclass check: True
+BigAutoField check: True
+SmallAutoField check: True
+
+
+The fix works. Now let me run the existing tests covering AutoField behavior.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py model_fields --settings=test_sqlite -v1 2>&1 | tail -20
+```2026_09_21_09_51_17899843112026_09_21_09_51_1789984313
+executing输出 Ran 422 tests in 0.171s
+
+OK (skipped=10)
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+Let me also run the model_options and model tests which cover the DEFAULT_AUTO_FIELD logic.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py model_options --settings=test_sqlite -v1 2>&1 | tail -5
+```2026_09_21_09_51_17899843132026_09_21_09_51_17899843152026_09_21_09_51_1789984314
+executing输出 OK (skipped=3)
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+Now let me verify the diff.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_51_17899843152026_09_21_09_51_17899843172026_09_21_09_51_1789984316
+executing输出 diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 0f53d9c30b..0ce7de02c6 100755
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -2524,7 +2524,7 @@ class AutoFieldMeta(type):
+         return isinstance(instance, self._subclasses) or super().__instancecheck__(instance)
+ 
+     def __subclasscheck__(self, subclass):
+-        return subclass in self._subclasses or super().__subclasscheck__(subclass)
++        return issubclass(subclass, self._subclasses) or super().__subclasscheck__(subclass)
+ 
+ 
+ class AutoField(AutoFieldMixin, IntegerField, metaclass=AutoFieldMeta):
+
+
+The diff is exactly what I intended — a single-line fix.
+
+**Root cause:** `AutoFieldMeta.__subclasscheck__` used `subclass in self._subclasses`, which is a membership/identity check against the tuple `(BigAutoField, SmallAutoField)`. A subclass like `MyBigAutoField` is not *in* that tuple even though it *is a subclass* of one of its elements. Using `issubclass(subclass, self._subclasses)` correctly returns True for any subclass of `BigAutoField`/`SmallAutoField` (and `issubclass` accepts a tuple of classes natively, matching the `_subclasses` tuple format).
+
+**Verification:**
+- Minimal reproduction script confirms `issubclass(MyBigAutoField, models.AutoField)` and `isinstance(MyBigAutoField(), models.AutoField)` now return `True` (previously they'd return `False`, causing the `ValueError` in `options._get_default_pk_class`).
+- `model_fields` tests: 422 passed (10 skipped).
+- `model_options` tests: passed (3 skipped).
+
+The fix is minimal and confined to the source file.
+
+```bash-action
+exit
+```

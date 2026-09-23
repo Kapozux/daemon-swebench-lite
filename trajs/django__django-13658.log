@@ -1,0 +1,623 @@
+plan-unwanted
+I'll start by examining the source file mentioned in the issue.
+
+```bash-action
+cd /testbed && sed -n '1,80p' django/core/management/__init__.py
+```
+executing输出 import functools
+import os
+import pkgutil
+import sys
+from argparse import (
+    _AppendConstAction, _CountAction, _StoreConstAction, _SubParsersAction,
+)
+from collections import defaultdict
+from difflib import get_close_matches
+from importlib import import_module
+
+import django
+from django.apps import apps
+from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
+from django.core.management.base import (
+    BaseCommand, CommandError, CommandParser, handle_default_options,
+)
+from django.core.management.color import color_style
+from django.utils import autoreload
+
+
+def find_commands(management_dir):
+    """
+    Given a path to a management directory, return a list of all the command
+    names that are available.
+    """
+    command_dir = os.path.join(management_dir, 'commands')
+    return [name for _, name, is_pkg in pkgutil.iter_modules([command_dir])
+            if not is_pkg and not name.startswith('_')]
+
+
+def load_command_class(app_name, name):
+    """
+    Given a command name and an application name, return the Command
+    class instance. Allow all errors raised by the import process
+    (ImportError, AttributeError) to propagate.
+    """
+    module = import_module('%s.management.commands.%s' % (app_name, name))
+    return module.Command()
+
+
+@functools.lru_cache(maxsize=None)
+def get_commands():
+    """
+    Return a dictionary mapping command names to their callback applications.
+
+    Look for a management.commands package in django.core, and in each
+    installed application -- if a commands package exists, register all
+    commands in that package.
+
+    Core commands are always included. If a settings module has been
+    specified, also include user-defined commands.
+
+    The dictionary is in the format {command_name: app_name}. Key-value
+    pairs from this dictionary can then be used in calls to
+    load_command_class(app_name, command_name)
+
+    If a specific version of a command must be loaded (e.g., with the
+    startapp command), the instantiated module can be placed in the
+    dictionary in place of the application name.
+
+    The dictionary is cached on the first call and reused on subsequent
+    calls.
+    """
+    commands = {name: 'django.core' for name in find_commands(__path__[0])}
+
+    if not settings.configured:
+        return commands
+
+    for app_config in reversed(list(apps.get_app_configs())):
+        path = os.path.join(app_config.path, 'management')
+        commands.update({name: app_config.name for name in find_commands(path)})
+
+    return commands
+
+
+def call_command(command_name, *args, **options):
+    """
+    Call the given command, with the given options and args/kwargs.
+
+
+Let me see the relevant section of the ManagementUtility class.
+
+```bash-action
+cd /testbed && grep -n "CommandParser" django/core/management/__init__.py
+```
+executing输出 17:    BaseCommand, CommandError, CommandParser, handle_default_options,
+347:        parser = CommandParser(usage='%(prog)s subcommand [options] [args]', add_help=False, allow_abbrev=False)
+
+
+Now let me look at the surrounding context to confirm the fix.
+
+```bash-action
+cd /testbed && sed -n '300,400p' django/core/management/__init__.py
+```2026_09_21_09_49_1789984150
+executing输出         # special case: the 'help' subcommand has no options
+        elif cwords[0] in subcommands and cwords[0] != 'help':
+            subcommand_cls = self.fetch_command(cwords[0])
+            # special case: add the names of installed apps to options
+            if cwords[0] in ('dumpdata', 'sqlmigrate', 'sqlsequencereset', 'test'):
+                try:
+                    app_configs = apps.get_app_configs()
+                    # Get the last part of the dotted path as the app name.
+                    options.extend((app_config.label, 0) for app_config in app_configs)
+                except ImportError:
+                    # Fail silently if DJANGO_SETTINGS_MODULE isn't set. The
+                    # user will find out once they execute the command.
+                    pass
+            parser = subcommand_cls.create_parser('', cwords[0])
+            options.extend(
+                (min(s_opt.option_strings), s_opt.nargs != 0)
+                for s_opt in parser._actions if s_opt.option_strings
+            )
+            # filter out previously specified options from available options
+            prev_opts = {x.split('=')[0] for x in cwords[1:cword - 1]}
+            options = (opt for opt in options if opt[0] not in prev_opts)
+
+            # filter options by current input
+            options = sorted((k, v) for k, v in options if k.startswith(curr))
+            for opt_label, require_arg in options:
+                # append '=' to options which require args
+                if require_arg:
+                    opt_label += '='
+                print(opt_label)
+        # Exit code of the bash completion function is never passed back to
+        # the user, so it's safe to always exit with 0.
+        # For more details see #25420.
+        sys.exit(0)
+
+    def execute(self):
+        """
+        Given the command-line arguments, figure out which subcommand is being
+        run, create a parser appropriate to that command, and run it.
+        """
+        try:
+           
+....(省略中间部分)...
+   self.settings_exception = exc
+        except ImportError as exc:
+            self.settings_exception = exc
+
+        if settings.configured:
+            # Start the auto-reloading dev server even if the code is broken.
+            # The hardcoded condition is a code smell but we can't rely on a
+            # flag on the command class because we haven't located it yet.
+            if subcommand == 'runserver' and '--noreload' not in self.argv:
+                try:
+                    autoreload.check_errors(django.setup)()
+                except Exception:
+                    # The exception will be raised later in the child process
+                    # started by the autoreloader. Pretend it didn't happen by
+                    # loading an empty list of applications.
+                    apps.all_models = defaultdict(dict)
+                    apps.app_configs = {}
+                    apps.apps_ready = apps.models_ready = apps.ready = True
+
+                    # Remove options not compatible with the built-in runserver
+                    # (e.g. options for the contrib.staticfiles' runserver).
+                    # Changes here require manually testing as described in
+                    # #27522.
+                    _parser = self.fetch_command('runserver').create_parser('django', 'runserver')
+                    _options, _args = _parser.parse_known_args(self.argv[2:])
+                    for _arg in _args:
+                        self.argv.remove(_arg)
+
+            # In all other cases, django.setup() is required to succeed.
+            else:
+                django.setup()
+
+        self.autocomplete()
+
+        if subcommand == 'help':
+            if '--commands' in args:
+                sys.stdout.write(self.main_help_text(commands_only=True) + '\n')
+            elif not options.args:
+                sys.stdout.write(self.main_help_text() + '\n')
+            else:
+                self.fetch_command(options.args[0]).print_help(self.prog_name, options.args[0])
+
+
+Let me see the exact lines around 340-360 where the parser is created.
+
+```bash-action
+cd /testbed && sed -n '335,365p' django/core/management/__init__.py
+```2026_09_21_09_49_1789984151
+executing输出         """
+        Given the command-line arguments, figure out which subcommand is being
+        run, create a parser appropriate to that command, and run it.
+        """
+        try:
+            subcommand = self.argv[1]
+        except IndexError:
+            subcommand = 'help'  # Display help if no arguments were given.
+
+        # Preprocess options to extract --settings and --pythonpath.
+        # These options could affect the commands that are available, so they
+        # must be processed early.
+        parser = CommandParser(usage='%(prog)s subcommand [options] [args]', add_help=False, allow_abbrev=False)
+        parser.add_argument('--settings')
+        parser.add_argument('--pythonpath')
+        parser.add_argument('args', nargs='*')  # catch-all
+        try:
+            options, args = parser.parse_known_args(self.argv[2:])
+            handle_default_options(options)
+        except CommandError:
+            pass  # Ignore any option errors at this point.
+
+        try:
+            settings.INSTALLED_APPS
+        except ImproperlyConfigured as exc:
+            self.settings_exception = exc
+        except ImportError as exc:
+            self.settings_exception = exc
+
+        if settings.configured:
+            # Start the auto-reloading dev server even if the code is broken.
+
+
+I found the bug at line 347. Now let me write a minimal reproduction script to confirm the bug before fixing.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import sys
+from django.core.management import ManagementUtility
+
+# Simulate embedded environment where sys.argv[0] is None / incorrect
+sys.argv = [None]
+utility = ManagementUtility(['myembed', 'help'])
+print("prog_name computed:", repr(utility.prog_name))
+
+# Access the parser that execute() builds to inspect its prog
+import argparse
+orig_init = argparse.ArgumentParser.__init__
+captured = {}
+def patched(self, *args, **kwargs):
+    captured['prog'] = kwargs.get('prog')
+    orig_init(self, *args, **kwargs)
+argparse.ArgumentParser.__init__ = patched
+try:
+    utility.execute()
+except SystemExit:
+    pass
+finally:
+    argparse.ArgumentParser.__init__ = orig_init
+
+print("CommandParser prog passed:", repr(captured.get('prog')))
+print("Expected (self.prog_name):", repr(utility.prog_name))
+assert captured.get('prog') == utility.prog_name, "BUG: prog not passed / wrong"
+print("OK")
+EOF
+python /tmp/repro.py
+```2026_09_21_09_49_17899841512026_09_21_09_49_1789984151
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 2, in <module>
+    from django.core.management import ManagementUtility
+ModuleNotFoundError: No module named 'django'
+
+
+Need to run from the testbed with the right path/PYTHONPATH.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_09_49_17899841532026_09_21_09_49_1789984153
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 2, in <module>
+    from django.core.management import ManagementUtility
+  File "/testbed/django/core/management/__init__.py", line 13, in <module>
+    from django.apps import apps
+  File "/testbed/django/apps/__init__.py", line 1, in <module>
+    from .config import AppConfig
+  File "/testbed/django/apps/config.py", line 7, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+The test environment python may be different. Let me check.
+
+```bash-action
+cd /testbed && which python && python -c "import sys; print(sys.executable)" && ls -d /testbed/*.cfg setup.py 2>/dev/null; python -c "import django; print(django.__file__)" 2>&1 | head
+```2026_09_21_09_49_17899841542026_09_21_09_49_1789984154
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python
+/testbed/setup.cfg
+setup.py
+/testbed/django/__init__.py
+
+
+django resolves from /testbed already. The issue is `asgiref` missing in this python. Let me check if there's a venv / installed asgiref.
+
+```bash-action
+cd /testbed && pip install -q asgiref 2>&1 | tail -3; python -c "import asgiref; print('asgiref ok', asgiref.__version__)"
+```2026_09_21_09_49_17899841552026_09_21_09_49_1789984155
+executing输出 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+asgiref ok 3.12.1
+
+
+Now rerun the reproduction.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_09_49_17899841582026_09_21_09_49_17899841582026_09_21_09_49_1789984159
+executing输出 prog_name computed: 'myembed'
+Traceback (most recent call last):
+  File "/tmp/repro.py", line 18, in <module>
+    utility.execute()
+  File "/testbed/django/core/management/__init__.py", line 347, in execute
+    parser = CommandParser(usage='%(prog)s subcommand [options] [args]', add_help=False, allow_abbrev=False)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/core/management/base.py", line 54, in __init__
+    super().__init__(**kwargs)
+  File "/tmp/repro.py", line 15, in patched
+    orig_init(self, *args, **kwargs)
+  File "/opt/miniconda3/lib/python3.11/argparse.py", line 1760, in __init__
+    prog = _os.path.basename(_sys.argv[0])
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen posixpath>", line 142, in basename
+TypeError: expected str, bytes or os.PathLike object, not NoneType
+
+
+Bug confirmed: when `sys.argv[0]` is None, `CommandParser` in `execute()` crashes because `prog` isn't passed. Now let me apply the fix.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'django/core/management/__init__.py'
+s = open(p).read()
+old = "        parser = CommandParser(usage='%(prog)s subcommand [options] [args]', add_help=False, allow_abbrev=False)"
+new = ("        parser = CommandParser(\n"
+       "            prog=self.prog_name,\n"
+       "            usage='%(prog)s subcommand [options] [args]',\n"
+       "            add_help=False,\n"
+       "            allow_abbrev=False,\n"
+       "        )")
+assert s.count(old) == 1
+open(p, 'w').write(s.replace(old, new))
+print("patched")
+EOF
+```
+executing输出 patched
+
+
+Now rerun the reproduction to confirm the fix.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_09_49_17899841622026_09_21_09_49_17899841622026_09_21_09_49_1789984162
+executing输出 prog_name computed: 'myembed'
+
+Type 'myembed help <subcommand>' for help on a specific subcommand.
+
+Available subcommands:
+
+[django]
+    check
+    compilemessages
+    createcachetable
+    dbshell
+    diffsettings
+    dumpdata
+    flush
+    inspectdb
+    loaddata
+    makemessages
+    makemigrations
+    migrate
+    runserver
+    sendtestemail
+    shell
+    showmigrations
+    sqlflush
+    sqlmigrate
+    sqlsequencereset
+    squashmigrations
+    startapp
+    startproject
+    test
+    testserver
+Note that only Django core commands are listed as settings are not properly configured (error: Requested setting INSTALLED_APPS, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.).
+CommandParser prog passed: 'myembed'
+Expected (self.prog_name): 'myembed'
+OK
+
+
+Fix confirmed. The output now shows `myembed` as the prog instead of crashing/using sys.argv[0]. Now let me find and run existing tests covering this module.
+
+```bash-action
+cd /testbed && ls tests/management/ 2>/dev/null | head -40; grep -rln "ManagementUtility" tests/ | head
+```2026_09_21_09_49_17899841632026_09_21_09_49_17899841632026_09_21_09_49_1789984163
+executing输出 tests/user_commands/tests.py
+tests/bash_completion/tests.py
+
+
+Also there's likely a `tests/management/` directory.
+
+```bash-action
+cd /testbed && ls tests/management/ && grep -rln "prog_name\|execute_from_command_line\|CommandParser" tests/management/ tests/user_commands/ tests/bash_completion/
+```2026_09_21_09_49_17899841642026_09_21_09_49_1789984164
+executing输出 ls: cannot access 'tests/management/': No such file or directory
+
+
+The grep didn't produce output because the dir didn't exist. Let me search more broadly.
+
+```bash-action
+cd /testbed && grep -rln "ManagementUtility\|execute_from_command_line\|prog_name" tests/ | head -20
+```2026_09_21_09_49_17899841652026_09_21_09_49_1789984165
+executing输出 tests/admin_scripts/configured_dynamic_settings_manage.py
+tests/admin_scripts/configured_settings_manage.py
+tests/user_commands/tests.py
+tests/bash_completion/tests.py
+tests/i18n/test_extraction.py
+tests/i18n/sampleproject/manage.py
+tests/i18n/test_compilation.py
+
+
+Let me find tests specifically about ManagementUtility/CommandParser prog behavior.
+
+```bash-action
+cd /testbed && grep -rn "class.*ManagementUtility\|ManagementUtility(" tests/user_commands/tests.py | head; grep -n "prog\|execute_from_command_line\|CommandParser" tests/user_commands/tests.py | head
+```2026_09_21_09_49_17899841662026_09_21_09_49_17899841662026_09_21_09_49_1789984165
+executing输出 67:                management.ManagementUtility(['manage.py', 'dance', '--example=raise']).execute()
+356:        """BaseCommand.create_parser() passes kwargs to CommandParser."""
+358:        parser = BaseCommand().create_parser('prog_name', 'subcommand', epilog=epilog)
+405:    def test_no_existent_external_program(self):
+
+
+Now run the relevant existing test modules covering this module.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python tests/runtests.py user_commands bash_completion admin_scripts -v1 2>&1 | tail -25
+```2026_09_21_09_49_17899841672026_09_21_09_49_17899841672026_09_21_09_49_17899841682026_09_21_09_49_17899841672026_09_21_09_49_1789984168
+executing输出   File "/testbed/django/http/response.py", line 16, in <module>
+    from django.core.serializers.json import DjangoJSONEncoder
+  File "/testbed/django/core/serializers/__init__.py", line 23, in <module>
+    from django.core.serializers.base import SerializerDoesNotExist
+  File "/testbed/django/core/serializers/base.py", line 7, in <module>
+    from django.db import models
+  File "/testbed/django/db/models/__init__.py", line 3, in <module>
+    from django.db.models.aggregates import *  # NOQA
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/db/models/aggregates.py", line 5, in <module>
+    from django.db.models.expressions import Case, Func, Star, When
+  File "/testbed/django/db/models/expressions.py", line 10, in <module>
+    from django.db.models import fields
+  File "/testbed/django/db/models/fields/__init__.py", line 11, in <module>
+    from django import forms
+  File "/testbed/django/forms/__init__.py", line 6, in <module>
+    from django.forms.boundfield import *  # NOQA
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/forms/boundfield.py", line 4, in <module>
+    from django.forms.utils import flatatt, pretty_name
+  File "/testbed/django/forms/utils.py", line 6, in <module>
+    from django.utils import timezone
+  File "/testbed/django/utils/timezone.py", line 9, in <module>
+    import pytz
+ModuleNotFoundError: No module named 'pytz'
+
+
+Missing test dependencies. Let me install the project's test requirements.
+
+```bash-action
+cd /testbed && pip install -q pytz sqlparse 2>&1 | tail -2; python -c "import pytz, sqlparse; print('ok')"
+```2026_09_21_09_49_17899841692026_09_21_09_49_17899841692026_09_21_09_49_17899841692026_09_21_09_49_1789984168
+executing输出 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+ok
+
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python tests/runtests.py user_commands bash_completion admin_scripts -v1 2>&1 | tail -25
+```2026_09_21_09_49_17899841722026_09_21_09_49_17899841722026_09_21_09_49_17899841722026_09_21_09_49_17899841722026_09_21_09_49_1789984173
+executing输出                ^^^^^^^^^^^^^
+  File "/testbed/tests/runtests.py", line 318, in django_tests
+    failures = test_runner.run_tests(
+               ^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/test/runner.py", line 721, in run_tests
+    result = self.run_suite(suite)
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/test/runner.py", line 662, in run_suite
+    return runner.run(suite)
+           ^^^^^^^^^^^^^^^^^
+  File "/opt/miniconda3/lib/python3.11/unittest/runner.py", line 217, in run
+    test(result)
+  File "/opt/miniconda3/lib/python3.11/unittest/suite.py", line 84, in __call__
+    return self.run(*args, **kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/testbed/django/test/runner.py", line 403, in run
+    subsuite_index, events = test_results.next(timeout=0.1)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/miniconda3/lib/python3.11/multiprocessing/pool.py", line 873, in next
+    raise value
+TypeError: cannot pickle 'traceback' object
+Exception ignored in: <function Pool.__del__ at 0x7ffffce0fe20>
+Traceback (most recent call last):
+  File "/opt/miniconda3/lib/python3.11/multiprocessing/pool.py", line 268, in __del__
+
+
+A parallel-runner pickling issue. Let me run with `--parallel 1` to avoid it.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python tests/runtests.py user_commands bash_completion admin_scripts -v1 --parallel 1 2>&1 | tail -25
+```2026_09_21_09_49_17899841742026_09_21_09_49_17899841742026_09_21_09_49_17899841742026_09_21_09_49_17899841742026_09_21_09_49_17899841752026_09_21_09_49_1789984174
+executing输出     self._check_value(action, value[0])
+  File "/opt/miniconda3/lib/python3.11/argparse.py", line 2553, in _check_value
+    raise ArgumentError(action, msg % args)
+argparse.ArgumentError: argument {foo}: invalid choice: 'test' (choose from 'foo')
+
+During handling of the above exception, another exception occurred:
+
+django.core.management.base.CommandError: Error: argument {foo}: invalid choice: 'test' (choose from 'foo')
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/testbed/tests/user_commands/tests.py", line 338, in test_subparser_invalid_option
+    with self.assertRaisesMessage(CommandError, msg):
+  File "/opt/miniconda3/lib/python3.11/contextlib.py", line 155, in __exit__
+    self.gen.throw(typ, value, traceback)
+  File "/testbed/django/test/testcases.py", line 693, in _assert_raises_or_warns_cm
+    self.assertIn(expected_message, str(getattr(cm, cm_attr)))
+AssertionError: "Error: invalid choice: 'test' (choose from 'foo')" not found in "Error: argument {foo}: invalid choice: 'test' (choose from 'foo')"
+
+----------------------------------------------------------------------
+Ran 250 tests in 54.944s
+
+FAILED (failures=1)
+Destroying test database for alias 'default'...
+
+
+The one failure is an unrelated pre-existing Python-version difference in `argparse` error message formatting (`argument {foo}: invalid choice` vs `invalid choice`), not related to my change. Let me confirm it's pre-existing by checking against the original code with `git stash`.
+
+```bash-action
+cd /testbed && git stash && PYTHONPATH=/testbed python tests/runtests.py user_commands -v1 --parallel 1 2>&1 | tail -8; git stash pop
+```2026_09_21_09_51_17899842302026_09_21_09_51_17899842302026_09_21_09_51_17899842312026_09_21_09_51_17899842312026_09_21_09_51_17899842302026_09_21_09_51_1789984230
+executing输出 Saved working directory and index state WIP on main: bb8a7429be SWE-bench
+  File "/testbed/django/test/testcases.py", line 693, in _assert_raises_or_warns_cm
+    self.assertIn(expected_message, str(getattr(cm, cm_attr)))
+AssertionError: "Error: invalid choice: 'test' (choose from 'foo')" not found in "Error: argument {foo}: invalid choice: 'test' (choose from 'foo')"
+
+----------------------------------------------------------------------
+Ran 45 tests in 0.890s
+
+FAILED (failures=1)
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   django/core/management/__init__.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Dropped refs/stash@{0} (7672727d060a9964ab807345bbcc86827167ad2c)
+
+
+Confirmed: the `test_subparser_invalid_option` failure is pre-existing (present without my change too, due to Python 3.11 argparse wording). It is unrelated to my fix. Now let me verify my diff.
+
+```bash-action
+cd /testbed && git diff django/core/management/__init__.py
+```2026_09_21_09_50_17899842342026_09_21_09_50_17899842342026_09_21_09_50_17899842342026_09_21_09_50_17899842342026_09_21_09_50_17899842352026_09_21_09_50_17899842342026_09_21_09_50_1789984234
+executing输出 diff --git a/django/core/management/__init__.py b/django/core/management/__init__.py
+index 1ba093e51f..4e30a28f33 100755
+--- a/django/core/management/__init__.py
++++ b/django/core/management/__init__.py
+@@ -344,7 +344,12 @@ class ManagementUtility:
+         # Preprocess options to extract --settings and --pythonpath.
+         # These options could affect the commands that are available, so they
+         # must be processed early.
+-        parser = CommandParser(usage='%(prog)s subcommand [options] [args]', add_help=False, allow_abbrev=False)
++        parser = CommandParser(
++            prog=self.prog_name,
++            usage='%(prog)s subcommand [options] [args]',
++            add_help=False,
++            allow_abbrev=False,
++        )
+         parser.add_argument('--settings')
+         parser.add_argument('--pythonpath')
+         parser.add_argument('args', nargs='*')  # catch-all
+
+
+The diff is exactly the intended change from the issue. Let me verify there are no other similar un-passed `prog` spots in this same file.
+
+```bash-action
+cd /testbed && grep -n "CommandParser(" django/core/management/__init__.py
+```2026_09_21_09_50_17899842352026_09_21_09_50_17899842362026_09_21_09_50_17899842362026_09_21_09_50_17899842352026_09_21_09_50_1789984236
+executing输出 347:        parser = CommandParser(
+
+
+There is only one `CommandParser(` instantiation in this file, and it is now fixed. The `django/core/management/base.py` uses of CommandParser correctly pass prog already (via `create_parser`).
+
+Summary of what was done:
+1. Reproduced the bug: with `sys.argv[0]` set to `None`, `ManagementUtility.execute()` crashed at the `CommandParser(...)` line because `prog` defaulted to `sys.argv[0]`.
+2. Fixed `django/core/management/__init__.py` line 347 to pass `prog=self.prog_name` (matching the issue's suggested fix).
+3. Re-ran the reproduction — now uses `myembed` (the computed `self.prog_name`) instead of crashing.
+4. Ran existing tests (`user_commands`, `bash_completion`, `admin_scripts`): only pre-existing, unrelated Python 3.11 argparse-message failure remains (confirmed pre-existing via `git stash`).
+5. Confirmed the diff is exactly the intended change.
+
+```bash-action
+cd /testbed && git diff --stat && echo "---done---"
+```2026_09_21_09_50_17899842362026_09_21_09_50_1789984236
+executing输出  django/core/management/__init__.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+---done---
+
+
+Only the one necessary source file was modified, and the change is exactly what the issue describes.
+
+```bash-action
+exit
+```

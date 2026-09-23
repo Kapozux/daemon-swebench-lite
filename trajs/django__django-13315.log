@@ -1,0 +1,1272 @@
+plan-unwanted
+我先确认一下当前的 bug 是否存在，需要先看看 issue 里描述的场景。让我先探索一下相关源码。
+
+```bash-action
+cd /testbed && git log --oneline -3 && python -c "import django; print(django.get_version())"
+```
+
+Now let me look at the relevant source code for `limit_choices_to` in form fields.
+
+```bash-action
+cd /testbed && grep -rn "limit_choices_to" django/db/models/fields/related.py | head -30
+```
+
+Let me create a minimal reproduction script to confirm the bug.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'repro_app'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+)
+django.setup()
+EOF
+echo "placeholder"
+```
+
+Let me first look at the formfield code for ForeignKey.
+
+```bash-action
+cd /testbed && grep -n "def formfield" django/db/models/fields/related.py
+```
+
+Now let me read the formfield method and the ModelChoiceField/ModelMultipleChoiceField code.
+
+```bash-action
+cd /testbed && sed -n '950,1050p' django/db/models/fields/related.py
+```
+
+Let me write a proper reproduction. First let me look at how limit_choices_to filter is applied in formfield.
+
+```bash-action
+cd /testbed && sed -n '980,1030p' django/db/models/fields/related.py
+```
+
+Now I understand. The `limit_choices_to` Q is applied to the queryset. When it involves a join, the queryset may produce duplicates because the join multiplies rows. The fix is to add `.distinct()`.
+
+Let me check the exact code region.
+
+```bash-action
+cd /testbed && sed -n '1000,1030p' django/db/models/fields/related.py
+```
+
+Let me write a full reproduction script with an app.
+
+```bash-action
+cd /testbed && mkdir -p /tmp/repro_app && cat > /tmp/repro_app/__init__.py << 'EOF'
+EOF
+cat > /tmp/repro_app/models.py << 'EOF'
+from django.db import models
+
+class Author(models.Model):
+    name = models.CharField(max_length=100)
+
+class Book(models.Model):
+    title = models.CharField(max_length=100)
+    author = models.ForeignKey(Author, on_delete=models.CASCADE)
+
+class Chapter(models.Model):
+    book = models.ForeignKey(Book, on_delete=models.CASCADE, limit_choices_to=models.Q(book__author__name='x'))
+
+    class Meta:
+        app_label = 'repro_app'
+EOF
+echo done
+```
+
+Let me actually run a real reproduction using the Django test infrastructure.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+)
+django.setup()
+
+from django.db import models, connection
+from django.db.models import Q
+
+class Author(models.Model):
+    name = models.CharField(max_length=100)
+    class Meta:
+        app_label = 'auth'
+
+class Book(models.Model):
+    title = models.CharField(max_length=100)
+    author = models.ForeignKey(Author, on_delete=models.CASCADE, related_name='books')
+    class Meta:
+        app_label = 'auth'
+
+class Chapter(models.Model):
+    book = models.ForeignKey(Book, on_delete=models.CASCADE, limit_choices_to=Q(book__author__name='x'), related_name='chapters')
+    class Meta:
+        app_label = 'auth'
+
+with connection.schema_editor() as se:
+    se.create_model(Author)
+    se.create_model(Book)
+    se.create_model(Chapter)
+
+a = Author.objects.create(name='x')
+b1 = Book.objects.create(title='b1', author=a)
+b2 = Book.objects.create(title='b2', author=a)
+c = Chapter.objects.create(book=b1)
+
+field = Chapter._meta.get_field('book')
+formfield = field.formfield()
+qs = formfield.queryset
+print("count:", qs.count())
+print("ids:", list(qs.values_list('id', flat=True)))
+print("SQL:", qs.query)
+EOF
+python /tmp/repro.py 2>&1 | tail -20
+```
+
+The count should be 2 but likely shows more due to join. Let me check more carefully - with the Q on book__author__name, the join is on author table (one-to-many from author to book). Actually the queryset is for `Book` objects. limit_choices_to Q(book__author__name='x') - wait, the field is on Chapter.book, so the Q relates to... Let me think.
+
+Actually `limit_choices_to` on the `book` FK means the Q filters Book objects. Q(book__author__name='x')... hmm, that references `book` from Book's perspective which is a reverse relation. This is getting complex. Let me make it cleaner: the Q should filter the target model (Book). To involve a join, we need something like `Q(author__name='x')` — but that's a single join, no duplicate.
+
+Duplicates happen with a reverse/many-to-many join. E.g. `limit_choices_to=Q(chapters__something=...)`. Actually from the issue: "involving a join". Let me reconsider.
+
+Let me set up: A FK on model X pointing to Author with limit_choices_to=Q(book__title='...') where Author has many Books. This makes a reverse many join -> duplicates.
+
+Let me redo the repro so the FK target model has a reverse one-to-many join in the Q.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+)
+django.setup()
+
+from django.db import models, connection
+from django.db.models import Q
+
+class Author(models.Model):
+    name = models.CharField(max_length=100)
+    class Meta:
+        app_label = 'auth'
+
+class Book(models.Model):
+    title = models.CharField(max_length=100)
+    author = models.ForeignKey(Author, on_delete=models.CASCADE, related_name='books')
+    class Meta:
+        app_label = 'auth'
+
+class Favorite(models.Model):
+    author = models.ForeignKey(Author, on_delete=models.CASCADE,
+                               limit_choices_to=Q(books__title='b1'))
+    class Meta:
+        app_label = 'auth'
+
+with connection.schema_editor() as se:
+    se.create_model(Author)
+    se.create_model(Book)
+    se.create_model(Favorite)
+
+a = Author.objects.create(name='x')
+Book.objects.create(title='b1', author=a)
+Book.objects.create(title='b2', author=a)
+
+field = Favorite._meta.get_field('author')
+formfield = field.formfield()
+qs = formfield.queryset
+print("count:", qs.count())
+print("ids:", list(qs.values_list('id', flat=True)))
+EOF
+python /tmp/repro.py 2>&1 | tail -20
+```
+
+This should show duplicate ids (the author appears twice). Wait, but the Q filters books__title='b1', which only matches one book, so no duplicate. I need the Q to match multiple books so the author joins multiple times.
+
+```bash-action
+cd /testbed && sed -i "s/books__title='b1'/books__title__startswith='b'/" /tmp/repro.py && python /tmp/repro.py 2>&1 | tail -20
+```
+
+Now I should see count 2 with ids [1, 1] (duplicates). Let me confirm the output. Let me re-run with clearer output.
+
+```bash-action
+cd /testbed && python /tmp/repro.py 2>&1
+```
+
+The bug is confirmed if count > 1 with duplicate ids. Let me check the actual output.
+
+Let me now look at the formfield method precisely.
+
+```bash-action
+cd /testbed && sed -n '995,1015p' django/db/models/fields/related.py
+```
+
+Now I'll apply the fix — add `.distinct()` when limit_choices_to is set.
+
+```bash-action
+cd /testbed && sed -n '1000,1020p' django/db/models/fields/related.py
+```
+
+Let me apply the fix.
+
+```bash-action
+cd /testbed && python - << 'EOF'
+import re
+p = 'django/db/models/fields/related.py'
+s = open(p).read()
+old = """        if self.remote_field.limit_choices_to:
+            queryset = queryset.complex_filter(self.remote_field.limit_choices_to)
+            if self.remote_field.limit_choices_to:
+                queryset = queryset.distinct()"""
+print(old in s)
+EOF
+```
+
+Let me actually view the exact code first before editing.
+
+```bash-action
+cd /testbed && sed -n '995,1025p' django/db/models/fields/related.py
+```
+
+Now I'll make the fix.
+
+```bash-action
+cd /testbed && sed -n '1000,1015p' django/db/models/fields/related.py
+```
+
+Let me just view the formfield method fully.
+
+```bash-action
+cd /testbed && awk '/    def formfield\(self, \*\*kwargs\):/,/return super\(\).formfield/' django/db/models/fields/related.py | head -60
+```
+
+I'll now make the edit adding `.distinct()`.
+
+```bash-action
+cd /testbed && python - << 'EOF'
+p = 'django/db/models/fields/related.py'
+s = open(p).read()
+old = "            queryset = queryset.complex_filter(self.remote_field.limit_choices_to)"
+new = "            queryset = queryset.complex_filter(self.remote_field.limit_choices_to)\n            queryset = queryset.distinct()"
+print("occurrences:", s.count(old))
+EOF
+```
+
+Let me look at the exact context.
+
+```bash-action
+cd /testbed && grep -n "complex_filter" django/db/models/fields/related.py
+```
+
+```bash-action
+cd /testbed && sed -n '1005,1030p' django/db/models/fields/related.py
+```
+
+Let me view lines around 1010-1025.
+
+```bash-action
+cd /testbed && sed -n '1004,1024p' django/db/models/fields/related.py
+```
+
+I now have enough context. Let me apply the edit.
+
+```bash-action
+cd /testbed && python - << 'PYEOF'
+p = 'django/db/models/fields/related.py'
+s = open(p).read()
+old = """        if self.remote_field.limit_choices_to:
+            queryset = queryset.complex_filter(self.remote_field.limit_choices_to)"""
+new = """        if self.remote_field.limit_choices_to:
+            queryset = queryset.complex_filter(self.remote_field.limit_choices_to)
+            queryset = queryset.distinct()"""
+assert s.count(old) == 1, s.count(old)
+s = s.replace(old, new)
+open(p, 'w').write(s)
+print("done")
+PYEOF
+```
+
+Now let me re-run the reproduction to confirm.
+
+```bash-action
+cd /testbed && python /tmp/repro.py 2>&1
+```
+
+Let me check the output showed duplicates before; now it should be deduped. Let me confirm the diff.
+
+```bash-action
+cd /testbed && git diff
+```
+
+Now let me find the existing tests covering related fields formfield.
+
+```bash-action
+cd /testbed && grep -rln "limit_choices_to" tests/
+```
+
+Let me find relevant test files.
+
+```bash-action
+cd /testbed && grep -rln "limit_choices_to" tests/ | head
+```
+
+Let me run the model_fields tests related to limit_choices_to.
+
+```bash-action
+cd /testbed && grep -rln "limit_choices_to" tests/model_fields/ tests/forms_tests/ tests/many_to_one/ 2>/dev/null
+```
+
+Let me run the relevant tests.
+
+```bash-action
+cd /testbed && python tests/runtests.py model_fields many_to_one forms_tests --parallel=1 2>&1 | tail -20
+```
+
+Let me confirm which test files reference limit_choices_to and run them.
+
+```bash-action
+cd /testbed && grep -rln "limit_choices_to" tests/ 
+```
+
+```bash-action
+cd /testbed && python -m pytest tests/model_fields/test_field_related_limit_choices_to.py -q 2>&1 | tail -20 || python tests/runtests.py model_fields -v1 2>&1 | tail -20
+```
+
+Let me find the file containing limit_choices_to tests.
+
+```bash-action
+cd /testbed && for f in $(grep -rln "limit_choices_to" tests/); do echo "== $f"; done
+```
+
+Let me run those tests.
+
+```bash-action
+cd /testbed && python tests/runtests.py model_fields.test_foreignkey forms_tests.tests.test_modelchoicefield 2>&1 | tail -20
+```
+
+Let me just run model_fields and forms_tests.
+
+```bash-action
+cd /testbed && python tests/runtests.py model_fields forms_tests --parallel=1 2>&1 | tail -15
+```
+
+Let me look for the specific test file.
+
+```bash-action
+cd /testbed && ls tests/model_fields/ | grep -i limit
+```
+
+Let me search harder.
+
+```bash-action
+cd /testbed && grep -rln "limit_choices_to" tests/ | cat
+```
+
+```bash-action
+cd /testbed && grep -rln "limit_choices_to" tests/*.py tests/**/*.py 2>/dev/null | head -50
+```
+
+Now let me run the test suite that covers this.
+
+```bash-action
+cd /testbed && python tests/runtests.py limit_choices_to 2>&1 | tail -20; echo "---"; ls tests/ | grep -i limit
+```
+
+Let me find tests referencing the exact field.
+
+```bash-action
+cd /testbed && grep -rln "limit_choices_to" tests/ --include=*.py | head
+```
+
+Let me proceed to run tests matching the module:
+
+```bash-action
+cd /testbed && python tests/runtests.py model_fields.test_field_related --parallel=1 2>&1 | tail -20
+```
+
+Let me just run the full model_fields tests.
+
+```bash-action
+cd /testbed && python tests/runtests.py model_fields --parallel=1 2>&1 | tail -20
+```
+
+Now confirm the change is correct and run the model_fields + forms_tests.
+
+```bash-action
+cd /testbed && python tests/runtests.py model_fields forms_tests --parallel=1 2>&1 | tail -15
+```
+
+Let me verify with git diff and confirm the fix once more, then exit.
+
+```bash-action
+cd /testbed && git diff && echo "===REPRO===" && python /tmp/repro.py 2>&1
+```
+
+The task is complete. My change adds `.distinct()` when `limit_choices_to` is applied, deduplicating rows produced by joins. Let me confirm the diff is minimal.
+
+```bash-action
+cd /testbed && git diff --stat && git diff
+```
+
+The fix is in place. Let me run relevant tests one more time to be sure.
+
+```bash-action
+cd /testbed && python tests/runtests.py model_fields --parallel=1 -v0 2>&1 | tail -5
+```
+
+Now exiting.
+
+```bash-action
+exit
+```
+executing输出 9fb26674b1 SWE-bench
+36bc47069c Fixed #32127 -- Fixed admin change-form textarea layout for mid-sized displays.
+e17ee44688 Fixed #32128 -- Added asgiref 3.3 compatibility.
+3.2
+
+
+The bug is confirmed to be a real issue. Let me look at the current state of my edit and continue.
+
+```bash-action
+cd /testbed && git diff
+```
+executing输出 
+
+Let me check the current state of the file after my earlier edit.
+
+```bash-action
+cd /testbed && git diff && echo "====" && grep -n "complex_filter" django/db/models/fields/related.py
+```
+executing输出 ====
+924:        qs = qs.complex_filter(self.get_limit_choices_to())
+
+
+My earlier edit didn't actually persist (git diff is empty, and the `formfield` code I tried to edit isn't at line 1000). Let me look at the actual formfield code path.
+
+```bash-action
+cd /testbed && sed -n '900,960p' django/db/models/fields/related.py
+```
+executing输出         """Get path from the related model to this field's model."""
+        opts = self.model._meta
+        from_opts = self.remote_field.model._meta
+        return [PathInfo(
+            from_opts=from_opts,
+            to_opts=opts,
+            target_fields=(opts.pk,),
+            join_field=self.remote_field,
+            m2m=not self.unique,
+            direct=False,
+            filtered_relation=filtered_relation,
+        )]
+
+    def validate(self, value, model_instance):
+        if self.remote_field.parent_link:
+            return
+        super().validate(value, model_instance)
+        if value is None:
+            return
+
+        using = router.db_for_read(self.remote_field.model, instance=model_instance)
+        qs = self.remote_field.model._base_manager.using(using).filter(
+            **{self.remote_field.field_name: value}
+        )
+        qs = qs.complex_filter(self.get_limit_choices_to())
+        if not qs.exists():
+            raise exceptions.ValidationError(
+                self.error_messages['invalid'],
+                code='invalid',
+                params={
+                    'model': self.remote_field.model._meta.verbose_name, 'pk': value,
+                    'field': self.remote_field.field_name, 'value': value,
+                },  # 'pk' is included for backwards compatibility
+            )
+
+    def resolve_related_fields(self):
+        related_fields = super().resolve_related_fields()
+        for from_field, to_field in related_fields:
+            if to_field and to_field.model != self.remote_field.model._meta.concrete_model:
+                raise exceptions.FieldError(
+                    "'%s.%s' refers to field '%s' which is not local to model "
+                    "'%s'." % (
+                        self.model._meta.label,
+                        self.name,
+                        to_field.name,
+                        self.remote_field.model._meta.concrete_model._meta.label,
+                    )
+                )
+        return related_fields
+
+    def get_attname(self):
+        return '%s_id' % self.name
+
+    def get_attname_column(self):
+        attname = self.get_attname()
+        column = self.db_column or attname
+        return attname, column
+
+    def get_default(self):
+        """Return the to_field if the default value is an object."""
+        field_default = super().get_default()
+
+
+That's the `validate` method. Let me find the actual `formfield` method.
+
+```bash-action
+cd /testbed && grep -n "def formfield" django/db/models/fields/related.py
+```
+executing输出 401:    def formfield(self, **kwargs):
+984:    def formfield(self, *, using=None, **kwargs):
+1057:    def formfield(self, **kwargs):
+1672:    def formfield(self, *, using=None, **kwargs):
+
+
+```bash-action
+cd /testbed && sed -n '984,1057p' django/db/models/fields/related.py
+```
+executing输出     def formfield(self, *, using=None, **kwargs):
+        if isinstance(self.remote_field.model, str):
+            raise ValueError("Cannot create form field for %r yet, because "
+                             "its related model %r has not been loaded yet" %
+                             (self.name, self.remote_field.model))
+        return super().formfield(**{
+            'form_class': forms.ModelChoiceField,
+            'queryset': self.remote_field.model._default_manager.using(using),
+            'to_field_name': self.remote_field.field_name,
+            **kwargs,
+            'blank': self.blank,
+        })
+
+    def db_check(self, connection):
+        return []
+
+    def db_type(self, connection):
+        return self.target_field.rel_db_type(connection=connection)
+
+    def db_parameters(self, connection):
+        return {"type": self.db_type(connection), "check": self.db_check(connection)}
+
+    def convert_empty_strings(self, value, expression, connection):
+        if (not value) and isinstance(value, str):
+            return None
+        return value
+
+    def get_db_converters(self, connection):
+        converters = super().get_db_converters(connection)
+        if connection.features.interprets_empty_strings_as_nulls:
+            converters += [self.convert_empty_strings]
+        return converters
+
+    def get_col(self, alias, output_field=None):
+        if output_field is None:
+            output_field = self.target_field
+            while isinstance(output_field, ForeignKey):
+                output_field = output_field.target_field
+                if output_field is self:
+                    raise ValueError('Cannot resolve output_field.')
+        return super().get_col(alias, output_field)
+
+
+class OneToOneField(ForeignKey):
+    """
+    A OneToOneField is essentially the same as a ForeignKey, with the exception
+    that it always carries a "unique" constraint with it and the reverse
+    relation always returns the object pointed to (since there will only ever
+    be one), rather than returning a list.
+    """
+
+    # Field flags
+    many_to_many = False
+    many_to_one = False
+    one_to_many = False
+    one_to_one = True
+
+    related_accessor_class = ReverseOneToOneDescriptor
+    forward_related_accessor_class = ForwardOneToOneDescriptor
+    rel_class = OneToOneRel
+
+    description = _("One-to-one relationship")
+
+    def __init__(self, to, on_delete, to_field=None, **kwargs):
+        kwargs['unique'] = True
+        super().__init__(to, on_delete, to_field=to_field, **kwargs)
+
+    def deconstruct(self):
+        name, path, args, kwargs = super().deconstruct()
+        if "unique" in kwargs:
+            del kwargs['unique']
+        return name, path, args, kwargs
+
+    def formfield(self, **kwargs):
+
+
+The `formfield` here at line 984 is for `ForeignKey` but doesn't apply `limit_choices_to`; that happens in `ManyToManyField.formfield` (line 1672). Let me check the `ForeignKey.formfield` — actually the demultiplexing happens via `get_limit_choices_to`. Let me look at the M2M formfield.
+
+```bash-action
+cd /testbed && sed -n '1672,1720p' django/db/models/fields/related.py
+```
+executing输出     def formfield(self, *, using=None, **kwargs):
+        defaults = {
+            'form_class': forms.ModelMultipleChoiceField,
+            'queryset': self.remote_field.model._default_manager.using(using),
+            **kwargs,
+        }
+        # If initial is passed in, it's a list of related objects, but the
+        # MultipleChoiceField takes a list of IDs.
+        if defaults.get('initial') is not None:
+            initial = defaults['initial']
+            if callable(initial):
+                initial = initial()
+            defaults['initial'] = [i.pk for i in initial]
+        return super().formfield(**defaults)
+
+    def db_check(self, connection):
+        return None
+
+    def db_type(self, connection):
+        # A ManyToManyField is not represented by a single column,
+        # so return None.
+        return None
+
+    def db_parameters(self, connection):
+        return {"type": None, "check": None}
+
+
+So M2M also doesn't apply limit_choices_to here. The `limit_choices_to` is applied by the admin/form machinery via `get_limit_choices_to()` and `ForeignKey.get_limit_choices_to`. Let me find where formfield querysets get the limit_choices_to applied.
+
+```bash-action
+cd /testbed && grep -rn "limit_choices_to" django/db/models/fields/related.py django/forms/ django/contrib/admin/
+```2026_09_21_09_47_1789984071
+executing输出 django/db/models/fields/related.py:322:        if self.remote_field.limit_choices_to:
+django/db/models/fields/related.py:323:            kwargs['limit_choices_to'] = self.remote_field.limit_choices_to
+django/db/models/fields/related.py:390:    def get_limit_choices_to(self):
+django/db/models/fields/related.py:392:        Return ``limit_choices_to`` for this model field.
+django/db/models/fields/related.py:397:        if callable(self.remote_field.limit_choices_to):
+django/db/models/fields/related.py:398:            return self.remote_field.limit_choices_to()
+django/db/models/fields/related.py:399:        return self.remote_field.limit_choices_to
+django/db/models/fields/related.py:403:        Pass ``limit_choices_to`` to the field being constructed.
+django/db/models/fields/related.py:414:            limit_choices_to = self.remote_field.limit_choices_to
+django/db/models/fields/related.py:416:                'limit_choices_to': limit_choices_to,
+django/db/models/fields/related.py:461:                 related_query_name=None, limit_choices_to=None, parent_link=False,
+django/db/models/fields/related.py:469:                limit_choices_to=limit_choices_to,
+django/db/models/fields/related.py:755:            # While 'limit_choices_to' might be a callable, simply pass
+django/db/models/fields/related.py:758:            if self.remote_field.limit_choices_to:
+django/db/models/fields/related.py:759:                cls._meta.related_fkey_lookups.append(self.remote_field.limit_choices_to)
+django/db/models/fields/related.py:795:                 limit_choices_to=None, parent_link=False, to_field=None,
+django/db/models/fields/related.py:819:            limit_choices_to=limit_choices_to,
+django/db/models/fields/related.py:924:        qs = qs.complex_filter(self.get_limit_choices_to())
+django/db/models/fields/related.py:1145:                 limit_choices_to=None, symmetrical=None, through=None,
+django/db/models/fields/related.py:1169:            limit_choices_to=limit_choices_to,
+djan
+....(省略中间部分)...
+s.py:109:                     field_classes=None, *, apply_limit_choices_to=True):
+django/forms/models.py:137:    ``apply_limit_choices_to`` is a boolean indicating if limit_choices_to
+django/forms/models.py:182:            if apply_limit_choices_to:
+django/forms/models.py:183:                apply_limit_choices_to_to_formfield(formfield)
+django/forms/models.py:257:                # limit_choices_to will be applied during ModelForm.__init__().
+django/forms/models.py:258:                apply_limit_choices_to=False,
+django/forms/models.py:308:            apply_limit_choices_to_to_formfield(formfield)
+django/forms/models.py:1192:                 help_text='', to_field_name=None, limit_choices_to=None,
+django/forms/models.py:1208:        self.limit_choices_to = limit_choices_to   # limit the queryset later.
+django/forms/models.py:1211:    def get_limit_choices_to(self):
+django/forms/models.py:1213:        Return ``limit_choices_to`` for this form field.
+django/forms/models.py:1217:        if callable(self.limit_choices_to):
+django/forms/models.py:1218:            return self.limit_choices_to()
+django/forms/models.py:1219:        return self.limit_choices_to
+django/contrib/admin/options.py:382:        # ForeignKeyRawIdWidget, on the basis of ForeignKey.limit_choices_to,
+django/contrib/admin/options.py:385:            # As ``limit_choices_to`` can be a callable, invoke it here.
+django/contrib/admin/filters.py:431:        return field.get_choices(include_blank=False, limit_choices_to={'pk__in': pk_qs}, ordering=ordering)
+django/contrib/admin/widgets.py:102:    Convert the type of lookups specified in a ForeignKey limit_choices_to
+django/contrib/admin/widgets.py:162:        limit_choices_to = self.rel.limit_choices_to
+django/contrib/admin/widgets.py:163:        if callable(limit_choices_to):
+django/contrib/admin/widgets.py:164:            limit_choices_to = limit_choices_to()
+django/contrib/admin/widgets.py:165:        return url_params_from_lookup_dict(limit_choices_to)
+
+
+Found it. Let me look at `django/forms/models.py` around line 1192 (`ModelChoiceField.get_limit_choices_to` and its queryset usage).
+
+```bash-action
+cd /testbed && sed -n '1180,1250p' django/forms/models.py
+```2026_09_21_09_47_1789984072
+executing输出 class ModelChoiceField(ChoiceField):
+    """A ChoiceField whose choices are a model QuerySet."""
+    # This class is a subclass of ChoiceField for purity, but it doesn't
+    # actually use any of ChoiceField's implementation.
+    default_error_messages = {
+        'invalid_choice': _('Select a valid choice. That choice is not one of'
+                            ' the available choices.'),
+    }
+    iterator = ModelChoiceIterator
+
+    def __init__(self, queryset, *, empty_label="---------",
+                 required=True, widget=None, label=None, initial=None,
+                 help_text='', to_field_name=None, limit_choices_to=None,
+                 blank=False, **kwargs):
+        # Call Field instead of ChoiceField __init__() because we don't need
+        # ChoiceField.__init__().
+        Field.__init__(
+            self, required=required, widget=widget, label=label,
+            initial=initial, help_text=help_text, **kwargs
+        )
+        if (
+            (required and initial is not None) or
+            (isinstance(self.widget, RadioSelect) and not blank)
+        ):
+            self.empty_label = None
+        else:
+            self.empty_label = empty_label
+        self.queryset = queryset
+        self.limit_choices_to = limit_choices_to   # limit the queryset later.
+        self.to_field_name = to_field_name
+
+    def get_limit_choices_to(self):
+        """
+        Return ``limit_choices_to`` for this form field.
+
+        If it is a callable, invoke it and return the result.
+        """
+        if callable(self.limit_choices_to):
+            return self.limit_choices_to()
+        return self.limit_choices_to
+
+    def __deepcopy__(self, memo):
+        result = super(ChoiceField, self).__deepcopy__(memo)
+        # Need to force a new ModelChoiceIterator to be created, bug #11183
+        if self.queryset is not None:
+            result.queryset = self.queryset.all()
+        return result
+
+    def _get_queryset(self):
+        return self._queryset
+
+    def _set_queryset(self, queryset):
+        self._queryset = None if queryset is None else queryset.all()
+        self.widget.choices = self.choices
+
+    queryset = property(_get_queryset, _set_queryset)
+
+    # this method will be used to create object labels by the QuerySetIterator.
+    # Override it to customize the label.
+    def label_from_instance(self, obj):
+        """
+        Convert objects into strings and generate the labels for the choices
+        presented by this object. Subclasses can override this method to
+        customize the display of the choices.
+        """
+        return str(obj)
+
+    def _get_choices(self):
+        # If self._choices is set, then somebody must have manually set
+        # the property self.choices. In this case, just return self._choices.
+        if hasattr(self, '_choices'):
+
+
+Now let me find where `get_limit_choices_to` is used to filter the queryset.
+
+```bash-action
+cd /testbed && grep -n "get_limit_choices_to\|complex_filter\|apply_limit_choices_to_to_formfield" django/forms/models.py
+```2026_09_21_09_47_17899840732026_09_21_09_47_1789984073
+executing输出 98:def apply_limit_choices_to_to_formfield(formfield):
+100:    if hasattr(formfield, 'queryset') and hasattr(formfield, 'get_limit_choices_to'):
+101:        limit_choices_to = formfield.get_limit_choices_to()
+103:            formfield.queryset = formfield.queryset.complex_filter(limit_choices_to)
+183:                apply_limit_choices_to_to_formfield(formfield)
+308:            apply_limit_choices_to_to_formfield(formfield)
+1211:    def get_limit_choices_to(self):
+
+
+Found the exact spot.
+
+```bash-action
+cd /testbed && sed -n '96,106p' django/forms/models.py
+```2026_09_21_09_47_1789984074
+executing输出 
+
+def apply_limit_choices_to_to_formfield(formfield):
+    """Apply limit_choices_to to the formfield's queryset if needed."""
+    if hasattr(formfield, 'queryset') and hasattr(formfield, 'get_limit_choices_to'):
+        limit_choices_to = formfield.get_limit_choices_to()
+        if limit_choices_to is not None:
+            formfield.queryset = formfield.queryset.complex_filter(limit_choices_to)
+
+
+def fields_for_model(model, fields=None, exclude=None, widgets=None,
+
+
+This is the root cause. When `limit_choices_to` involves a join, `complex_filter` can produce duplicate rows. The fix is to add `.distinct()`.
+
+Let me confirm the bug first with a reproduction that exercises this code path (a ModelForm), then apply the fix.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'repro_app'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+)
+django.setup()
+
+from django.db import models, connection
+from django.db.models import Q
+from django import forms
+
+class Author(models.Model):
+    name = models.CharField(max_length=100)
+    class Meta:
+        app_label = 'repro_app'
+
+class Book(models.Model):
+    title = models.CharField(max_length=100)
+    author = models.ForeignKey(Author, on_delete=models.CASCADE, related_name='books')
+    class Meta:
+        app_label = 'repro_app'
+
+class Favorite(models.Model):
+    author = models.ForeignKey(
+        Author, on_delete=models.CASCADE,
+        limit_choices_to=Q(books__title__startswith='b'),
+    )
+    class Meta:
+        app_label = 'repro_app'
+
+class FavoriteForm(forms.ModelForm):
+    class Meta:
+        model = Favorite
+        fields = '__all__'
+
+with connection.schema_editor() as se:
+    se.create_model(Author)
+    se.create_model(Book)
+    se.create_model(Favorite)
+
+a = Author.objects.create(name='x')
+Book.objects.create(title='b1', author=a)
+Book.objects.create(title='b2', author=a)
+
+form = FavoriteForm()
+qs = form.fields['author'].queryset
+print("count:", qs.count())
+print("ids:", list(qs.values_list('id', flat=True)))
+EOF
+mkdir -p /tmp/repro_app && touch /tmp/repro_app/__init__.py
+PYTHONPATH=/tmp python /tmp/repro.py 2>&1 | tail -10
+```2026_09_21_09_47_17899840752026_09_21_09_47_1789984075
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+PYTHONPATH override broke the django import. Let me put the app package inside /testbed temporarily (as a directory) or set PYTHONPATH to append.
+
+```bash-action
+cd /testbed && PYTHONPATH="/testbed:/tmp" python /tmp/repro.py 2>&1 | tail -10
+```2026_09_21_09_47_17899840782026_09_21_09_47_17899840782026_09_21_09_47_1789984078
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 2, in <module>
+    from django.conf import settings
+  File "/testbed/django/conf/__init__.py", line 19, in <module>
+    from django.core.validators import URLValidator
+  File "/testbed/django/core/validators.py", line 9, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+The test environment python is preconfigured. Let me check which python/pip is set up.
+
+```bash-action
+cd /testbed && which python && python -c "import asgiref" 2>&1; echo "---"; python -c "import django; print(django.__file__)" 2>&1
+```2026_09_21_09_47_17899840792026_09_21_09_47_17899840792026_09_21_09_47_17899840792026_09_21_09_47_1789984079
+executing输出 /opt/miniconda3/bin/python
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'asgiref'
+---
+/testbed/django/__init__.py
+
+
+asgiref isn't installed in the base conda python. Let me find the right environment.
+
+```bash-action
+cd /testbed && ls /opt/miniconda3/envs/ 2>/dev/null; echo "---"; for p in /opt/miniconda3/envs/*/bin/python; do echo "$p:"; $p -c "import asgiref, django; print(django.__file__)" 2>&1 | head -1; done
+```2026_09_21_09_48_17899840812026_09_21_09_48_17899840812026_09_21_09_48_17899840812026_09_21_09_48_17899840812026_09_21_09_48_1789984081
+executing输出 testbed
+---
+/opt/miniconda3/envs/testbed/bin/python:
+/testbed/django/__init__.py
+
+
+The testbed environment is at `/opt/miniconda3/envs/testbed/bin/python`. Let me use that.
+
+```bash-action
+cd /testbed && PYTHONPATH="/testbed:/tmp" /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py 2>&1 | tail -10
+```2026_09_21_09_48_17899840822026_09_21_09_48_17899840822026_09_21_09_48_17899840822026_09_21_09_48_17899840822026_09_21_09_48_17899840822026_09_21_09_48_1789984082
+executing输出 count: 2
+ids: [1, 1]
+
+
+Bug confirmed: the author appears twice (`ids: [1, 1]`) due to join duplicates. Now let me apply the fix.
+
+```bash-action
+cd /testbed && python - << 'PYEOF'
+p = 'django/forms/models.py'
+s = open(p).read()
+old = """        if limit_choices_to is not None:
+            formfield.queryset = formfield.queryset.complex_filter(limit_choices_to)"""
+new = """        if limit_choices_to is not None:
+            formfield.queryset = formfield.queryset.complex_filter(limit_choices_to).distinct()"""
+assert s.count(old) == 1, s.count(old)
+s = s.replace(old, new)
+open(p, 'w').write(s)
+print("patched")
+PYEOF
+```2026_09_21_09_48_17899840852026_09_21_09_48_17899840852026_09_21_09_48_17899840852026_09_21_09_48_17899840852026_09_21_09_48_17899840852026_09_21_09_48_17899840852026_09_21_09_48_17899840852026_09_21_09_48_1789984086
+executing输出 patched
+
+
+```bash-action
+cd /testbed && PYTHONPATH="/testbed:/tmp" /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py 2>&1 | tail -5
+```2026_09_21_09_48_17899840872026_09_21_09_48_17899840872026_09_21_09_48_17899840872026_09_21_09_48_17899840872026_09_21_09_48_17899840872026_09_21_09_48_17899840872026_09_21_09_48_17899840872026_09_21_09_48_17899840882026_09_21_09_48_1789984088
+executing输出 count: 1
+ids: [1]
+
+
+Fixed: count is now 1 with a single id. Let me confirm the diff is exactly what I want.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_48_17899840892026_09_21_09_48_17899840892026_09_21_09_48_17899840892026_09_21_09_48_17899840892026_09_21_09_48_17899840892026_09_21_09_48_17899840892026_09_21_09_48_17899840892026_09_21_09_48_17899840902026_09_21_09_48_17899840902026_09_21_09_48_17899840902026_09_21_09_48_1789984089
+executing输出 diff --git a/django/forms/models.py b/django/forms/models.py
+index 5d115458a1..f993bb9c98 100755
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -100,7 +100,7 @@ def apply_limit_choices_to_to_formfield(formfield):
+     if hasattr(formfield, 'queryset') and hasattr(formfield, 'get_limit_choices_to'):
+         limit_choices_to = formfield.get_limit_choices_to()
+         if limit_choices_to is not None:
+-            formfield.queryset = formfield.queryset.complex_filter(limit_choices_to)
++            formfield.queryset = formfield.queryset.complex_filter(limit_choices_to).distinct()
+ 
+ 
+ def fields_for_model(model, fields=None, exclude=None, widgets=None,
+
+
+The diff is exactly the minimal fix. Now let me find and run the existing tests that cover this module (`limit_choices_to` formfield behavior).
+
+```bash-action
+cd /testbed && grep -rln "limit_choices_to" tests/ --include=*.py
+```2026_09_21_09_48_17899840912026_09_21_09_48_17899840912026_09_21_09_48_17899840912026_09_21_09_48_17899840912026_09_21_09_48_17899840912026_09_21_09_48_17899840912026_09_21_09_48_17899840912026_09_21_09_48_17899840912026_09_21_09_48_17899840922026_09_21_09_48_17899840912026_09_21_09_48_17899840912026_09_21_09_48_17899840912026_09_21_09_48_1789984091
+executing输出 tests/model_forms/models.py
+tests/model_forms/tests.py
+tests/model_fields/tests.py
+tests/invalid_models_tests/test_relative_fields.py
+tests/field_deconstruction/tests.py
+tests/or_lookups/tests.py
+tests/admin_views/models.py
+tests/admin_views/tests.py
+tests/validation/models.py
+tests/validation/tests.py
+tests/queryset_pickle/models.py
+tests/schema/tests.py
+tests/schema/fields.py
+tests/admin_widgets/models.py
+tests/admin_widgets/tests.py
+
+
+The most relevant is `tests/model_forms/tests.py` (covers `apply_limit_choices_to_to_formfield`). Let me find the specific test class.
+
+```bash-action
+cd /testbed && grep -n "limit_choices_to" tests/model_forms/tests.py
+```2026_09_21_09_48_17899840932026_09_21_09_48_17899840932026_09_21_09_48_17899840932026_09_21_09_48_17899840932026_09_21_09_48_17899840932026_09_21_09_48_17899840932026_09_21_09_48_17899840932026_09_21_09_48_17899840932026_09_21_09_48_17899840932026_09_21_09_48_17899840942026_09_21_09_48_17899840942026_09_21_09_48_17899840932026_09_21_09_48_17899840932026_09_21_09_48_17899840932026_09_21_09_48_17899840932026_09_21_09_48_1789984092
+executing输出 2783:    Tests the functionality of ``limit_choices_to``.
+2796:    def test_limit_choices_to_callable_for_fk_rel(self):
+2798:        A ForeignKey can use limit_choices_to as a callable (#2554).
+2803:    def test_limit_choices_to_callable_for_m2m_rel(self):
+2805:        A ManyToManyField can use limit_choices_to as a callable (#2554).
+2810:    def test_custom_field_with_queryset_but_no_limit_choices_to(self):
+2812:        A custom field with a `queryset` attribute but no `limit_choices_to`
+2818:    def test_fields_for_model_applies_limit_choices_to(self):
+2824:        with mock.patch.object(field, 'limit_choices_to') as today_callable_dict:
+
+
+```bash-action
+cd /testbed && sed -n '2780,2840p' tests/model_forms/tests.py
+```2026_09_21_09_48_17899840952026_09_21_09_48_17899840952026_09_21_09_48_17899840952026_09_21_09_48_17899840952026_09_21_09_48_17899840952026_09_21_09_48_17899840952026_09_21_09_48_17899840952026_09_21_09_48_17899840952026_09_21_09_48_17899840962026_09_21_09_48_17899840962026_09_21_09_48_17899840952026_09_21_09_48_17899840952026_09_21_09_48_17899840952026_09_21_09_48_17899840952026_09_21_09_48_17899840962026_09_21_09_48_1789984095
+executing输出 
+class LimitChoicesToTests(TestCase):
+    """
+    Tests the functionality of ``limit_choices_to``.
+    """
+    @classmethod
+    def setUpTestData(cls):
+        cls.threepwood = Character.objects.create(
+            username='threepwood',
+            last_action=datetime.datetime.today() + datetime.timedelta(days=1),
+        )
+        cls.marley = Character.objects.create(
+            username='marley',
+            last_action=datetime.datetime.today() - datetime.timedelta(days=1),
+        )
+
+    def test_limit_choices_to_callable_for_fk_rel(self):
+        """
+        A ForeignKey can use limit_choices_to as a callable (#2554).
+        """
+        stumpjokeform = StumpJokeForm()
+        self.assertSequenceEqual(stumpjokeform.fields['most_recently_fooled'].queryset, [self.threepwood])
+
+    def test_limit_choices_to_callable_for_m2m_rel(self):
+        """
+        A ManyToManyField can use limit_choices_to as a callable (#2554).
+        """
+        stumpjokeform = StumpJokeForm()
+        self.assertSequenceEqual(stumpjokeform.fields['most_recently_fooled'].queryset, [self.threepwood])
+
+    def test_custom_field_with_queryset_but_no_limit_choices_to(self):
+        """
+        A custom field with a `queryset` attribute but no `limit_choices_to`
+        works (#23795).
+        """
+        f = StumpJokeWithCustomFieldForm()
+        self.assertEqual(f.fields['custom'].queryset, 42)
+
+    def test_fields_for_model_applies_limit_choices_to(self):
+        fields = fields_for_model(StumpJoke, ['has_fooled_today'])
+        self.assertSequenceEqual(fields['has_fooled_today'].queryset, [self.threepwood])
+
+    def test_callable_called_each_time_form_is_instantiated(self):
+        field = StumpJokeForm.base_fields['most_recently_fooled']
+        with mock.patch.object(field, 'limit_choices_to') as today_callable_dict:
+            StumpJokeForm()
+            self.assertEqual(today_callable_dict.call_count, 1)
+            StumpJokeForm()
+            self.assertEqual(today_callable_dict.call_count, 2)
+            StumpJokeForm()
+            self.assertEqual(today_callable_dict.call_count, 3)
+
+
+class FormFieldCallbackTests(SimpleTestCase):
+
+    def test_baseform_with_widgets_in_meta(self):
+        """Regression for #13095: Using base forms with widgets defined in Meta should not raise errors."""
+        widget = forms.Textarea()
+
+        class BaseForm(forms.ModelForm):
+            class Meta:
+
+
+Let me run the `LimitChoicesToTests` and related model_forms tests.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py model_forms.tests.LimitChoicesToTests -v2 2>&1 | tail -20
+```2026_09_21_09_48_17899840962026_09_21_09_48_17899840962026_09_21_09_48_17899840962026_09_21_09_48_17899840962026_09_21_09_48_17899840962026_09_21_09_48_17899840962026_09_21_09_48_17899840962026_09_21_09_48_17899840962026_09_21_09_48_17899840972026_09_21_09_48_17899840972026_09_21_09_48_17899840962026_09_21_09_48_17899840962026_09_21_09_48_17899840962026_09_21_09_48_17899840962026_09_21_09_48_17899840972026_09_21_09_48_17899840962026_09_21_09_48_17899840952026_09_21_09_48_1789984095
+executing输出     Running deferred SQL...
+Running migrations:
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying sites.0001_initial... OK
+  Applying sites.0002_alter_domain_unique... OK
+Creating test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+System check identified no issues (0 silenced).
+test_callable_called_each_time_form_is_instantiated (model_forms.tests.LimitChoicesToTests) ... ok
+test_custom_field_with_queryset_but_no_limit_choices_to (model_forms.tests.LimitChoicesToTests) ... ok
+test_fields_for_model_applies_limit_choices_to (model_forms.tests.LimitChoicesToTests) ... ok
+test_limit_choices_to_callable_for_fk_rel (model_forms.tests.LimitChoicesToTests) ... ok
+test_limit_choices_to_callable_for_m2m_rel (model_forms.tests.LimitChoicesToTests) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.007s
+
+OK
+Destroying test database for alias 'default' ('file:memorydb_default?mode=memory&cache=shared')...
+
+
+All 5 tests pass. Let me also run the broader model_forms test suite to make sure nothing else broke.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py model_forms --parallel=1 2>&1 | tail -8
+```2026_09_21_09_48_17899840982026_09_21_09_48_17899840982026_09_21_09_48_17899840982026_09_21_09_48_17899840982026_09_21_09_48_17899840982026_09_21_09_48_17899840982026_09_21_09_48_17899840982026_09_21_09_48_17899840982026_09_21_09_48_17899840992026_09_21_09_48_17899840992026_09_21_09_48_17899840982026_09_21_09_48_17899840982026_09_21_09_48_17899840982026_09_21_09_48_17899840982026_09_21_09_48_17899840992026_09_21_09_48_17899840982026_09_21_09_48_17899840972026_09_21_09_48_17899840972026_09_21_09_48_1789984098
+executing输出 Creating test database for alias 'default'...
+System check identified no issues (0 silenced).
+..............................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 174 tests in 0.354s
+
+OK
+Destroying test database for alias 'default'...
+
+
+All 174 model_forms tests pass. Now let me check for the same error pattern wherever else `complex_filter(limit_choices_to)` / limit_choices_to querysets are applied, per the requirement to fix identical patterns in the same area. Let me grep the whole codebase.
+
+```bash-action
+cd /testbed && grep -rn "complex_filter" django/ 
+```2026_09_21_09_48_17899841002026_09_21_09_48_17899841002026_09_21_09_48_17899841002026_09_21_09_48_17899841002026_09_21_09_48_17899841002026_09_21_09_48_17899841002026_09_21_09_48_17899841002026_09_21_09_48_17899841002026_09_21_09_48_17899841012026_09_21_09_48_17899841012026_09_21_09_48_17899841002026_09_21_09_48_17899841002026_09_21_09_48_17899841002026_09_21_09_48_17899841002026_09_21_09_48_17899841012026_09_21_09_48_17899841002026_09_21_09_48_17899840992026_09_21_09_48_17899840992026_09_21_09_48_17899841002026_09_21_09_48_1789984100
+executing输出 django/db/models/query.py:968:    def complex_filter(self, filter_obj):
+django/db/models/fields/reverse_related.py:153:        qs = self.related_model._default_manager.complex_filter(limit_choices_to)
+django/db/models/fields/related.py:924:        qs = qs.complex_filter(self.get_limit_choices_to())
+django/db/models/fields/__init__.py:883:        qs = rel_model._default_manager.complex_filter(limit_choices_to)
+grep: django/db/models/fields/__pycache__/__init__.cpython-36.pyc: binary file matches
+grep: django/db/models/fields/__pycache__/related.cpython-36.pyc: binary file matches
+grep: django/db/models/fields/__pycache__/reverse_related.cpython-36.pyc: binary file matches
+grep: django/db/models/__pycache__/query.cpython-36.pyc: binary file matches
+django/forms/models.py:103:            formfield.queryset = formfield.queryset.complex_filter(limit_choices_to).distinct()
+grep: django/forms/__pycache__/models.cpython-36.pyc: binary file matches
+
+
+Let me examine the other three `complex_filter` call sites to see if they have the same duplicate-options potential in a user-facing context.
+
+```bash-action
+cd /testbed && sed -n '145,160p' django/db/models/fields/reverse_related.py && echo "=== fields/__init__.py ===" && sed -n '875,890p' django/db/models/fields/__init__.py
+```2026_09_21_09_48_17899841022026_09_21_09_48_17899841022026_09_21_09_48_17899841022026_09_21_09_48_17899841022026_09_21_09_48_17899841022026_09_21_09_48_17899841022026_09_21_09_48_17899841022026_09_21_09_48_17899841022026_09_21_09_48_17899841022026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841022026_09_21_09_48_17899841022026_09_21_09_48_17899841022026_09_21_09_48_17899841022026_09_21_09_48_1789984103
+executing输出         """
+        Return choices with a default blank choices included, for use
+        as <select> choices for this field.
+
+        Analog of django.db.models.fields.Field.get_choices(), provided
+        initially for utilization by RelatedFieldListFilter.
+        """
+        limit_choices_to = limit_choices_to or self.limit_choices_to
+        qs = self.related_model._default_manager.complex_filter(limit_choices_to)
+        if ordering:
+            qs = qs.order_by(*ordering)
+        return (blank_choice if include_blank else []) + [
+            (x.pk, str(x)) for x in qs
+        ]
+
+    def is_hidden(self):
+=== fields/__init__.py ===
+            return choices
+        rel_model = self.remote_field.model
+        limit_choices_to = limit_choices_to or self.get_limit_choices_to()
+        choice_func = operator.attrgetter(
+            self.remote_field.get_related_field().attname
+            if hasattr(self.remote_field, 'get_related_field')
+            else 'pk'
+        )
+        qs = rel_model._default_manager.complex_filter(limit_choices_to)
+        if ordering:
+            qs = qs.order_by(*ordering)
+        return (blank_choice if include_blank else []) + [
+            (choice_func(x), str(x)) for x in qs
+        ]
+
+    def value_to_string(self, obj):
+
+
+These two are `get_choices()` methods that also build `<select>` choices from a `limit_choices_to`-filtered queryset, so they share the exact same duplicate-options flaw in user-facing contexts. Both should also apply `.distinct()`.
+
+The `related.py:924` occurrence is in `validate()` where only `.exists()` is called, so duplicates are harmless and should be left alone.
+
+Let me apply `.distinct()` to the two `get_choices` sites.
+
+```bash-action
+cd /testbed && python - << 'PYEOF'
+# reverse_related.py
+p = 'django/db/models/fields/reverse_related.py'
+s = open(p).read()
+old = "        qs = self.related_model._default_manager.complex_filter(limit_choices_to)"
+new = "        qs = self.related_model._default_manager.complex_filter(limit_choices_to).distinct()"
+assert s.count(old) == 1, ('reverse', s.count(old))
+open(p, 'w').write(s.replace(old, new))
+
+# fields/__init__.py
+p = 'django/db/models/fields/__init__.py'
+s = open(p).read()
+old = "        qs = rel_model._default_manager.complex_filter(limit_choices_to)"
+new = "        qs = rel_model._default_manager.complex_filter(limit_choices_to).distinct()"
+assert s.count(old) == 1, ('init', s.count(old))
+open(p, 'w').write(s.replace(old, new))
+print("patched both")
+PYEOF
+```2026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841042026_09_21_09_48_17899841042026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841032026_09_21_09_48_17899841042026_09_21_09_48_1789984103
+executing输出 patched both
+
+
+Now let me verify the full diff and re-run the tests plus my repro.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_48_17899841062026_09_21_09_48_17899841062026_09_21_09_48_17899841062026_09_21_09_48_17899841062026_09_21_09_48_17899841062026_09_21_09_48_17899841062026_09_21_09_48_17899841062026_09_21_09_48_17899841062026_09_21_09_48_17899841062026_09_21_09_48_17899841072026_09_21_09_48_17899841072026_09_21_09_48_17899841062026_09_21_09_48_17899841062026_09_21_09_48_17899841062026_09_21_09_48_17899841062026_09_21_09_48_17899841072026_09_21_09_48_17899841062026_09_21_09_48_17899841042026_09_21_09_48_1789984104
+executing输出 diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 2bce85beef..aaaf4f2002 100755
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -880,7 +880,7 @@ class Field(RegisterLookupMixin):
+             if hasattr(self.remote_field, 'get_related_field')
+             else 'pk'
+         )
+-        qs = rel_model._default_manager.complex_filter(limit_choices_to)
++        qs = rel_model._default_manager.complex_filter(limit_choices_to).distinct()
+         if ordering:
+             qs = qs.order_by(*ordering)
+         return (blank_choice if include_blank else []) + [
+diff --git a/django/db/models/fields/reverse_related.py b/django/db/models/fields/reverse_related.py
+index 12160add7f..29bfc8e8e3 100755
+--- a/django/db/models/fields/reverse_related.py
++++ b/django/db/models/fields/reverse_related.py
+@@ -150,7 +150,7 @@ class ForeignObjectRel(FieldCacheMixin):
+         initially for utilization by RelatedFieldListFilter.
+         """
+         limit_choices_to = limit_choices_to or self.limit_choices_to
+-        qs = self.related_model._default_manager.complex_filter(limit_choices_to)
++        qs = self.related_model._default_manager.complex_filter(limit_choices_to).distinct()
+         if ordering:
+             qs = qs.order_by(*ordering)
+         return (blank_choice if include_blank else []) + [
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 5d115458a1..f993bb9c98 100755
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -100,7 +100,7 @@ def apply_limit_choices_to_to_formfield(formfield):
+     if hasattr(formfield, 'queryset') and hasattr(formfield, 'get_limit_choices_to'):
+         limit_choices_to = formfield.get_limit_choices_to()
+         if limit_choices_to is not None:
+-            formfield.queryset = formfield.queryset.complex_filter(limit_choices_to)
++            formfield.queryset = formfield.queryset.complex_filter(limit_choices_to).distinct()
+ 
+ 
+ def fields_for_model(model, fields=None, exclude=None, widgets=None,
+
+
+Now let me re-run the repro and the relevant test suites (model_forms, model_fields, admin_widgets).
+
+```bash-action
+cd /testbed && PYTHONPATH="/testbed:/tmp" /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py 2>&1 | tail -3 && echo "=== TESTS ===" && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py model_forms model_fields admin_widgets --parallel=1 2>&1 | tail -8
+```2026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841092026_09_21_09_48_17899841092026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841092026_09_21_09_48_17899841082026_09_21_09_48_17899841072026_09_21_09_48_17899841072026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841092026_09_21_09_48_17899841092026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_17899841082026_09_21_09_48_1789984108
+executing输出 count: 1
+ids: [1]
+=== TESTS ===
+Creating test database for alias 'default'...
+System check identified no issues (3 silenced).
+.........................................................................................................................................................................................................................s.....................................................................................................s............ss.sss.s.................s.........s...........................................................................................................................................................................................................................................................................ss........sssssss..sssss.......
+----------------------------------------------------------------------
+Ran 666 tests in 0.992s
+
+OK (skipped=24)
+Destroying test database for alias 'default'...
+
+
+All 666 tests pass (24 skipped, normal), and the repro now yields a single option.
+
+Summary of the fix — the root cause was that `limit_choices_to` filtered querysets could contain duplicate rows when the Q object involved a join (e.g. a reverse FK), and those duplicates leaked into user-facing choice lists. I added `.distinct()` at all three sites that build choice/option lists from a `limit_choices_to`-filtered queryset:
+
+- `django/forms/models.py` — `apply_limit_choices_to_to_formfield()` (ModelChoiceField/ModelMultipleChoiceField formfields)
+- `django/db/models/fields/__init__.py` — `Field.get_choices()`
+- `django/db/models/fields/reverse_related.py` — `ForeignObjectRel.get_choices()` (used by admin `RelatedFieldListFilter`)
+
+The `related.py:924` use was left unchanged since it only calls `.exists()` and duplicates are harmless there.
+
+Verification done:
+- Minimal repro confirmed the bug (duplicate author id `[1, 1]`) before fix and `[1]` after.
+- `git diff` confirms only the intended 3-line changes.
+- Existing tests (`model_forms`, `model_fields`, `admin_widgets` — 666 tests) pass.
+
+```bash-action
+exit
+```

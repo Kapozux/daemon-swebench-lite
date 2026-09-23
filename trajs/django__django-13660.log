@@ -1,0 +1,484 @@
+plan-unwanted
+I'll start by examining the issue and locating the problematic source code.
+
+```bash-action
+cd /testbed && cat django/core/management/commands/shell.py
+```
+executing输出 import os
+import select
+import sys
+import traceback
+
+from django.core.management import BaseCommand, CommandError
+from django.utils.datastructures import OrderedSet
+
+
+class Command(BaseCommand):
+    help = (
+        "Runs a Python interactive interpreter. Tries to use IPython or "
+        "bpython, if one of them is available. Any standard input is executed "
+        "as code."
+    )
+
+    requires_system_checks = []
+    shells = ['ipython', 'bpython', 'python']
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--no-startup', action='store_true',
+            help='When using plain Python, ignore the PYTHONSTARTUP environment variable and ~/.pythonrc.py script.',
+        )
+        parser.add_argument(
+            '-i', '--interface', choices=self.shells,
+            help='Specify an interactive interpreter interface. Available options: "ipython", "bpython", and "python"',
+        )
+        parser.add_argument(
+            '-c', '--command',
+            help='Instead of opening an interactive shell, run a command as Django and exit.',
+        )
+
+    def ipython(self, options):
+        from IPython import start_ipython
+        start_ipython(argv=[])
+
+    def bpython(self, options):
+        import bpython
+        bpython.embed()
+
+    def python(self, options):
+        import code
+
+        # Set up a dictionary to serve as the environment for the shell, so
+        # that tab completion works on objects that are imported at runtime.
+        imported_objects = {}
+        try:  # Try activating rlcompleter, because it's handy.
+            import readline
+        except ImportError:
+            pass
+        else:
+            # We don't have to wrap the following import in a 'try', because
+            # we already know 'readline' was imported successfully.
+            import rlcompleter
+            readline.set_completer(rlcompleter.Completer(imported_objects).complete)
+            # Enable tab completion on systems using libedit (e.g. macOS).
+   
+....(省略中间部分)...
+opied from Python's Lib/site.py.
+            readline_doc = getattr(readline, '__doc__', '')
+            if readline_doc is not None and 'libedit' in readline_doc:
+                readline.parse_and_bind("bind ^I rl_complete")
+            else:
+                readline.parse_and_bind("tab:complete")
+
+        # We want to honor both $PYTHONSTARTUP and .pythonrc.py, so follow system
+        # conventions and get $PYTHONSTARTUP first then .pythonrc.py.
+        if not options['no_startup']:
+            for pythonrc in OrderedSet([os.environ.get("PYTHONSTARTUP"), os.path.expanduser('~/.pythonrc.py')]):
+                if not pythonrc:
+                    continue
+                if not os.path.isfile(pythonrc):
+                    continue
+                with open(pythonrc) as handle:
+                    pythonrc_code = handle.read()
+                # Match the behavior of the cpython shell where an error in
+                # PYTHONSTARTUP prints an exception and continues.
+                try:
+                    exec(compile(pythonrc_code, pythonrc, 'exec'), imported_objects)
+                except Exception:
+                    traceback.print_exc()
+
+        code.interact(local=imported_objects)
+
+    def handle(self, **options):
+        # Execute the command and exit.
+        if options['command']:
+            exec(options['command'])
+            return
+
+        # Execute stdin if it has anything to read and exit.
+        # Not supported on Windows due to select.select() limitations.
+        if sys.platform != 'win32' and not sys.stdin.isatty() and select.select([sys.stdin], [], [], 0)[0]:
+            exec(sys.stdin.read())
+            return
+
+        available_shells = [options['interface']] if options['interface'] else self.shells
+
+        for shell in available_shells:
+            try:
+                return getattr(self, shell)(options)
+            except ImportError:
+                pass
+        raise CommandError("Couldn't import {} interface.".format(shell))
+
+
+I can see the issue clearly. The `exec()` calls in `handle()` use the default local namespace, which causes the NameError. Let me first verify the bug with a minimal reproduction script.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import os
+import django
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "tests.test_sqlite")
+from django.core.management.commands.shell import Command
+cmd = Command()
+code = "import django\ndef f():\n    print(django.__version__)\nf()"
+try:
+    cmd.handle(command=code, no_startup=True, interface=None)
+    print("PASS")
+except NameError as e:
+    print("BUG REPRODUCED:", e)
+EOF
+python /tmp/repro.py 2>&1 | tail -5
+```2026_09_21_09_49_1789984200
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 2, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+Need to run from within the testbed with correct path.
+
+```bash-action
+cd /testbed && python -c "import django; print(django.__file__)"
+```2026_09_21_09_50_1789984201
+executing输出 /testbed/django/__init__.py
+
+
+Django is importable. The issue is `/tmp/repro.py` runs with a different sys.path. Let me put the repro in the testbed directory or set PYTHONPATH.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py 2>&1 | tail -5
+```2026_09_21_09_50_17899842022026_09_21_09_51_1789984202
+executing输出   File "/testbed/django/apps/config.py", line 7, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+asgiref missing when invoked differently. Let me check how the tests run and use a simpler direct approach replicating the exec bug.
+
+```bash-action
+cd /testbed && python -c "
+code = 'import django\ndef f():\n    print(django.__version__)\nf()'
+try:
+    exec(code)
+    print('DEFAULT-exec: PASS')
+except NameError as e:
+    print('DEFAULT-exec: BUG REPRODUCED:', e)
+g = {}
+try:
+    exec(code, g)
+    print('EMPTY-GLOBALS-exec: PASS')
+except NameError as e:
+    print('EMPTY-GLOBALS-exec: BUG:', e)
+" 2>&1 | tail -5
+```2026_09_21_09_50_17899842032026_09_21_09_51_1789984203
+executing输出 3.2
+DEFAULT-exec: PASS
+3.2
+EMPTY-GLOBALS-exec: PASS
+
+
+Both passed because the parent scope has `django`... let me think. Actually `exec(code)` at module level works. The bug is inside a function scope where `exec` makes a copy of locals. Let me reproduce the exact scenario from shell.py's `handle`.
+
+```bash-action
+cd /testbed && python -c "
+def handle():
+    code = 'import django\ndef f():\n    print(django.__version__)\nf()'
+    try:
+        exec(code)
+        print('DEFAULT-exec (in func): PASS')
+    except NameError as e:
+        print('DEFAULT-exec (in func): BUG REPRODUCED:', e)
+handle()
+" 2>&1 | tail -5
+```2026_09_21_09_50_17899842042026_09_21_09_51_17899842042026_09_21_09_50_1789984204
+executing输出 DEFAULT-exec (in func): BUG REPRODUCED: name 'django' is not defined
+
+
+Bug reproduced. When `exec()` is called inside a function without an explicit globals dict, CPython uses the function's local scope snapshot as globals, so `import django` goes into a temporary dict that the nested function doesn't see as a global.
+
+The fix per the issue: pass a new empty dict as the second argument to `exec`.
+
+```bash-action
+cd /testbed && grep -n "exec(" django/core/management/commands/shell.py
+```2026_09_21_09_50_17899842062026_09_21_09_51_1789984206
+executing输出 78:                    exec(compile(pythonrc_code, pythonrc, 'exec'), imported_objects)
+87:            exec(options['command'])
+93:            exec(sys.stdin.read())
+
+
+Lines 87 and 93 are the fix targets. Let me apply the fix.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = "django/core/management/commands/shell.py"
+s = open(p).read()
+s = s.replace("            exec(options['command'])\n", "            exec(options['command'], {})\n")
+s = s.replace("            exec(sys.stdin.read())\n", "            exec(sys.stdin.read(), {})\n")
+open(p, "w").write(s)
+print("done")
+EOF
+git diff
+```2026_09_21_09_50_17899842072026_09_21_09_51_17899842072026_09_21_09_50_1789984207
+executing输出 done
+diff --git a/django/core/management/commands/shell.py b/django/core/management/commands/shell.py
+index 2b306a579e..571d120467 100755
+--- a/django/core/management/commands/shell.py
++++ b/django/core/management/commands/shell.py
+@@ -84,13 +84,13 @@ class Command(BaseCommand):
+     def handle(self, **options):
+         # Execute the command and exit.
+         if options['command']:
+-            exec(options['command'])
++            exec(options['command'], {})
+             return
+ 
+         # Execute stdin if it has anything to read and exit.
+         # Not supported on Windows due to select.select() limitations.
+         if sys.platform != 'win32' and not sys.stdin.isatty() and select.select([sys.stdin], [], [], 0)[0]:
+-            exec(sys.stdin.read())
++            exec(sys.stdin.read(), {})
+             return
+ 
+         available_shells = [options['interface']] if options['interface'] else self.shells
+
+
+Now let me verify the fix with the reproduction script simulating the handle() scope.
+
+```bash-action
+cd /testbed && python -c "
+def handle():
+    code = 'import django\ndef f():\n    print(django.__version__)\nf()'
+    exec(code, {})
+    print('FIX VERIFIED: PASS')
+handle()
+" 2>&1 | tail -5
+```2026_09_21_09_50_17899842092026_09_21_09_51_17899842092026_09_21_09_50_1789984209
+executing输出 3.2
+FIX VERIFIED: PASS
+
+
+The fix works. Now let me find and run the existing tests that cover the shell command.
+
+```bash-action
+cd /testbed && find . -path ./node_modules -prune -o -name "*.py" -print | xargs grep -l "shell" 2>/dev/null | grep -i test | grep shell
+```2026_09_21_09_50_17899842102026_09_21_09_51_17899842102026_09_21_09_50_17899842102026_09_21_09_50_1789984210
+executing输出 ./tests/shell/tests.py
+./tests/dbshell/test_oracle.py
+./tests/dbshell/test_mysql.py
+./tests/dbshell/tests.py
+./tests/dbshell/test_sqlite.py
+./tests/dbshell/test_postgresql.py
+
+
+```bash-action
+cd /testbed && cat tests/shell/tests.py
+```2026_09_21_09_50_17899842112026_09_21_09_51_17899842112026_09_21_09_51_1789984211
+executing输出 import sys
+import unittest
+from unittest import mock
+
+from django import __version__
+from django.core.management import CommandError, call_command
+from django.test import SimpleTestCase
+from django.test.utils import captured_stdin, captured_stdout
+
+
+class ShellCommandTestCase(SimpleTestCase):
+
+    def test_command_option(self):
+        with self.assertLogs('test', 'INFO') as cm:
+            call_command(
+                'shell',
+                command=(
+                    'import django; from logging import getLogger; '
+                    'getLogger("test").info(django.__version__)'
+                ),
+            )
+        self.assertEqual(cm.records[0].getMessage(), __version__)
+
+    @unittest.skipIf(sys.platform == 'win32', "Windows select() doesn't support file descriptors.")
+    @mock.patch('django.core.management.commands.shell.select')
+    def test_stdin_read(self, select):
+        with captured_stdin() as stdin, captured_stdout() as stdout:
+            stdin.write('print(100)\n')
+            stdin.seek(0)
+            call_command('shell')
+        self.assertEqual(stdout.getvalue().strip(), '100')
+
+    @mock.patch('django.core.management.commands.shell.select.select')  # [1]
+    @mock.patch.dict('sys.modules', {'IPython': None})
+    def test_shell_with_ipython_not_installed(self, select):
+        select.return_value = ([], [], [])
+        with self.assertRaisesMessage(CommandError, "Couldn't import ipython interface."):
+            call_command('shell', interface='ipython')
+
+    @mock.patch('django.core.management.commands.shell.select.select')  # [1]
+    @mock.patch.dict('sys.modules', {'bpython': None})
+    def test_shell_with_bpython_not_installed(self, select):
+        select.return_value = ([], [], [])
+        with self.assertRaisesMessage(CommandError, "Couldn't import bpython interface."):
+            call_command('shell', interface='bpython')
+
+    # [1] Patch select to prevent tests failing when when the test suite is run
+    # in parallel mode. The tests are run in a subprocess and the subprocess's
+    # stdin is closed and replaced by /dev/null. Reading from /dev/null always
+    # returns EOF and so select always shows that sys.stdin is ready to read.
+    # This causes problems because of the call to select.select() towards the
+    # end of shell's handle() method.
+
+
+Now let me run the existing shell tests to confirm no regressions.
+
+```bash-action
+cd /testbed && python -m pytest tests/shell/tests.py -v 2>&1 | tail -20
+```2026_09_21_09_50_17899842132026_09_21_09_51_17899842132026_09_21_09_50_17899842132026_09_21_09_50_17899842132026_09_21_09_50_1789984214
+executing输出 /opt/miniconda3/bin/python: No module named pytest
+
+
+```bash-action
+cd /testbed && python -m django test tests.shell --settings=tests.test_sqlite 2>&1 | tail -20
+```2026_09_21_09_50_17899842142026_09_21_09_51_17899842142026_09_21_09_50_17899842142026_09_21_09_50_17899842142026_09_21_09_50_17899842142026_09_21_09_50_1789984214
+executing输出 Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/testbed/django/__main__.py", line 6, in <module>
+    from django.core import management
+  File "/testbed/django/core/management/__init__.py", line 13, in <module>
+    from django.apps import apps
+  File "/testbed/django/apps/__init__.py", line 1, in <module>
+    from .config import AppConfig
+  File "/testbed/django/apps/config.py", line 7, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+asgiref isn't installed. Let me check the environment and locate the right python.
+
+```bash-action
+cd /testbed && which python && python --version && pip list 2>/dev/null | grep -i asgiref; ls /opt/miniconda3/envs 2>/dev/null
+```2026_09_21_09_50_17899842152026_09_21_09_51_17899842152026_09_21_09_50_17899842152026_09_21_09_50_17899842152026_09_21_09_50_17899842152026_09_21_09_50_17899842152026_09_21_09_50_1789984216
+executing输出 /opt/miniconda3/bin/python
+Python 3.11.5
+testbed
+
+
+There's a `testbed` conda env. Let me use it.
+
+```bash-action
+cd /testbed && source activate testbed && python --version && pip list 2>/dev/null | grep -i asgiref
+```2026_09_21_09_50_17899842172026_09_21_09_51_17899842172026_09_21_09_50_17899842172026_09_21_09_50_17899842172026_09_21_09_50_17899842172026_09_21_09_50_17899842172026_09_21_09_50_17899842172026_09_21_09_50_1789984217
+executing输出 /bin/sh: 1: source: not found
+
+
+```bash-action
+cd /testbed && ls /opt/miniconda3/envs/testbed/bin/python && /opt/miniconda3/envs/testbed/bin/python --version && /opt/miniconda3/envs/testbed/bin/pip list 2>/dev/null | grep -i asgiref
+```2026_09_21_09_50_17899842182026_09_21_09_51_17899842182026_09_21_09_50_17899842182026_09_21_09_50_17899842182026_09_21_09_50_17899842182026_09_21_09_50_17899842182026_09_21_09_50_17899842182026_09_21_09_50_17899842182026_09_21_09_50_1789984219
+executing输出 /opt/miniconda3/envs/testbed/bin/python
+Python 3.6.13 :: Anaconda, Inc.
+asgiref              3.4.1
+
+
+The testbed env has asgiref. Let me run the shell tests with it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m django test tests.shell --settings=tests.test_sqlite 2>&1 | tail -20
+```2026_09_21_09_50_17899842202026_09_21_09_51_17899842202026_09_21_09_50_17899842202026_09_21_09_50_17899842202026_09_21_09_50_17899842202026_09_21_09_50_17899842202026_09_21_09_50_17899842202026_09_21_09_50_17899842202026_09_21_09_50_17899842202026_09_21_09_50_17899842212026_09_21_09_50_1789984220
+executing输出     utility.execute()
+  File "/testbed/django/core/management/__init__.py", line 413, in execute
+    self.fetch_command(subcommand).run_from_argv(self.argv)
+  File "/testbed/django/core/management/commands/test.py", line 23, in run_from_argv
+    super().run_from_argv(argv)
+  File "/testbed/django/core/management/base.py", line 354, in run_from_argv
+    self.execute(*args, **cmd_options)
+  File "/testbed/django/core/management/base.py", line 398, in execute
+    output = self.handle(*args, **options)
+  File "/testbed/django/core/management/commands/test.py", line 55, in handle
+    failures = test_runner.run_tests(test_labels)
+  File "/testbed/django/test/runner.py", line 714, in run_tests
+    suite = self.build_suite(test_labels, extra_tests)
+  File "/testbed/django/test/runner.py", line 600, in build_suite
+    tests = self.test_loader.discover(start_dir=label, **kwargs)
+  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/loader.py", line 332, in discover
+    self._get_directory_containing_module(top_part)
+  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/loader.py", line 346, in _get_directory_containing_module
+    full_path = os.path.abspath(module.__file__)
+AttributeError: module 'tests' has no attribute '__file__'
+
+
+Need to run from tests dir or use the right settings module.
+
+```bash-action
+cd /testbed/tests && /opt/miniconda3/envs/testbed/bin/python -m django test shell --settings=test_sqlite 2>&1 | tail -20
+```2026_09_21_09_50_17899842222026_09_21_09_51_17899842222026_09_21_09_50_17899842222026_09_21_09_50_17899842222026_09_21_09_50_17899842222026_09_21_09_50_17899842222026_09_21_09_50_17899842222026_09_21_09_50_17899842222026_09_21_09_50_17899842222026_09_21_09_50_17899842222026_09_21_09_50_17899842222026_09_21_09_50_17899842222026_09_21_09_50_17899842222026_09_21_09_50_1789984223
+executing输出 System check identified no issues (0 silenced).
+....
+----------------------------------------------------------------------
+Ran 4 tests in 0.005s
+
+OK
+
+
+All 4 existing shell tests pass. Let me also verify the already-passing `test_command_option` test actually exercises the fixed code path — and confirm the fix by running the reproduction through `call_command` inside the testbed env.
+
+```bash-action
+cd /testbed/tests && /opt/miniconda3/envs/testbed/bin/python -c "
+import django, os
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
+django.setup()
+from django.core.management import call_command
+code = 'import django\ndef f():\n    print(django.__version__)\nf()'
+call_command('shell', command=code, no_startup=True)
+print('call_command FIX VERIFIED')
+" 2>&1 | tail -5
+```2026_09_21_09_50_17899842242026_09_21_09_51_17899842242026_09_21_09_50_17899842242026_09_21_09_50_17899842242026_09_21_09_50_17899842242026_09_21_09_50_17899842242026_09_21_09_50_17899842242026_09_21_09_50_17899842242026_09_21_09_50_17899842242026_09_21_09_50_17899842242026_09_21_09_50_17899842242026_09_21_09_50_17899842242026_09_21_09_50_17899842242026_09_21_09_50_17899842252026_09_21_09_50_1789984224
+executing输出 3.2
+call_command FIX VERIFIED
+
+
+The fix is verified end-to-end. Let me do a final `git diff` confirmation.
+
+```bash-action
+cd /testbed && git diff && git status --short
+```2026_09_21_09_50_17899842262026_09_21_09_51_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_1789984226
+executing输出 diff --git a/django/core/management/commands/shell.py b/django/core/management/commands/shell.py
+index 2b306a579e..571d120467 100755
+--- a/django/core/management/commands/shell.py
++++ b/django/core/management/commands/shell.py
+@@ -84,13 +84,13 @@ class Command(BaseCommand):
+     def handle(self, **options):
+         # Execute the command and exit.
+         if options['command']:
+-            exec(options['command'])
++            exec(options['command'], {})
+             return
+ 
+         # Execute stdin if it has anything to read and exit.
+         # Not supported on Windows due to select.select() limitations.
+         if sys.platform != 'win32' and not sys.stdin.isatty() and select.select([sys.stdin], [], [], 0)[0]:
+-            exec(sys.stdin.read())
++            exec(sys.stdin.read(), {})
+             return
+ 
+         available_shells = [options['interface']] if options['interface'] else self.shells
+ M django/core/management/commands/shell.py
+?? My_agent.py
+?? actions.py
+?? chat_export.py
+?? chat_history/
+?? llm.py
+?? system_prompt.txt
+
+
+The diff shows exactly the intended fix, and the untracked files are not mine (agent scaffolding, unrelated to the source fix).
+
+Summary of what was done:
+1. **Root cause**: `shell.py`'s `handle()` called `exec(code)` without an explicit globals dict. Inside a function scope, CPython treats the function's local snapshot as globals, so `import django` at the top level of the passed code lands in a temporary dict that a nested function `f()` cannot see — causing `NameError: name 'django' is not defined`.
+2. **Fix**: Pass a fresh empty dict as the second argument to both `exec()` calls (the `-c/--command` branch and the stdin branch), matching how `python -c` behaves.
+3. **Verification**: Reproduced the bug with a minimal script, applied the fix, confirmed it passes; ran the existing test suite (`tests/shell`, 4 tests) — all pass; verified end-to-end via `call_command('shell', command=...)`.
+
+```bash-action
+exit
+```

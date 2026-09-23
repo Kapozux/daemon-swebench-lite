@@ -1,0 +1,423 @@
+plan-unwanted
+I'll start by looking at the relevant source file to confirm the bug.
+
+```bash-action
+cd /testbed && cat django/contrib/messages/storage/cookie.py
+```
+executing输出 import binascii
+import json
+
+from django.conf import settings
+from django.contrib.messages.storage.base import BaseStorage, Message
+from django.core import signing
+from django.http import SimpleCookie
+from django.utils.safestring import SafeData, mark_safe
+
+
+class MessageEncoder(json.JSONEncoder):
+    """
+    Compactly serialize instances of the ``Message`` class as JSON.
+    """
+    message_key = '__json_message'
+
+    def default(self, obj):
+        if isinstance(obj, Message):
+            # Using 0/1 here instead of False/True to produce more compact json
+            is_safedata = 1 if isinstance(obj.message, SafeData) else 0
+            message = [self.message_key, is_safedata, obj.level, obj.message]
+            if obj.extra_tags:
+                message.append(obj.extra_tags)
+            return message
+        return super().default(obj)
+
+
+class MessageDecoder(json.JSONDecoder):
+    """
+    Decode JSON that includes serialized ``Message`` instances.
+    """
+
+    def process_messages(self, obj):
+        if isinstance(obj, list) and obj:
+            if obj[0] == MessageEncoder.message_key:
+                if obj[1]:
+                    obj[3] = mark_safe(obj[3])
+                return Message(*obj[2:])
+            return [self.process_messages(item) for item in obj]
+        if isinstance(obj, dict):
+            return {key: self.process_messages(value)
+                    for key, value in obj.items()}
+        return obj
+
+    def decode(self, s, **kwargs):
+        decoded = super().decode(s, **kwargs)
+        return self.process_messages(decoded)
+
+
+class MessageSerializer:
+    def dumps(self, obj):
+        return json.dumps(
+            obj,
+            separators=(',', ':'),
+            cls=MessageEncoder,
+        ).encode('latin-1')
+
+    def loads(self, data):
+        return json.loads(data.decode('latin-1'), cls=MessageDecoder)
+
+
+class CookieStorage(BaseStorage):
+    """
+    Store messages in a cookie.
+    """
+    cookie_name = 'messages'
+    # uwsgi's default
+....(省略中间部分)...
+    unstored_messages = []
+        encoded_data = self._encode(messages)
+        if self.max_cookie_size:
+            # data is going to be stored eventually by SimpleCookie, which
+            # adds its own overhead, which we must account for.
+            cookie = SimpleCookie()  # create outside the loop
+
+            def stored_length(val):
+                return len(cookie.value_encode(val)[1])
+
+            while encoded_data and stored_length(encoded_data) > self.max_cookie_size:
+                if remove_oldest:
+                    unstored_messages.append(messages.pop(0))
+                else:
+                    unstored_messages.insert(0, messages.pop())
+                encoded_data = self._encode(messages + [self.not_finished],
+                                            encode_empty=unstored_messages)
+        self._update_cookie(encoded_data, response)
+        return unstored_messages
+
+    def _encode(self, messages, encode_empty=False):
+        """
+        Return an encoded version of the messages list which can be stored as
+        plain text.
+
+        Since the data will be retrieved from the client-side, the encoded data
+        also contains a hash to ensure that the data was not tampered with.
+        """
+        if messages or encode_empty:
+            return self.signer.sign_object(messages, serializer=MessageSerializer, compress=True)
+
+    def _decode(self, data):
+        """
+        Safely decode an encoded text stream back into a list of messages.
+
+        If the encoded text stream contained an invalid hash or was in an
+        invalid format, return None.
+        """
+        if not data:
+            return None
+        try:
+            return self.signer.unsign_object(data, serializer=MessageSerializer)
+        except (signing.BadSignature, binascii.Error, json.JSONDecodeError):
+            pass
+        # Mark the data as used (so it gets removed) since something was wrong
+        # with the data.
+        self.used = True
+        return None
+
+
+The bug is confirmed: `if obj.extra_tags:` treats empty string as falsy, so it's dropped from serialization, and on decode `Message(*obj[2:])` gets only 3 args making `extra_tags` default to `None`. Let me write a minimal reproduction script first.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+from django.conf import settings
+settings.configure()
+from django.contrib.messages.storage.base import Message
+from django.contrib.messages.storage.cookie import MessageEncoder, MessageDecoder
+original_message = Message(10, "Here is a message", extra_tags="")
+encoded_message = MessageEncoder().encode(original_message)
+decoded_message = MessageDecoder().decode(encoded_message)
+print("original extra_tags:", repr(original_message.extra_tags))
+print("decoded extra_tags: ", repr(decoded_message.extra_tags))
+assert original_message.extra_tags == ""
+assert decoded_message.extra_tags == "", "BUG: extra_tags became %r" % decoded_message.extra_tags
+print("OK")
+EOF
+python /tmp/repro.py
+```
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    from django.conf import settings
+ModuleNotFoundError: No module named 'django'
+
+
+The current python isn't finding django. Let me check the environment.
+
+```bash-action
+cd /testbed && which python && python -c "import sys; print(sys.path)" && ls
+```2026_09_21_09_57_1789984631
+executing输出 /opt/miniconda3/bin/python
+['', '/opt/miniconda3/lib/python311.zip', '/opt/miniconda3/lib/python3.11', '/opt/miniconda3/lib/python3.11/lib-dynload', '/opt/miniconda3/lib/python3.11/site-packages']
+AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+django
+docs
+extras
+js_tests
+llm.py
+package.json
+pyproject.toml
+scripts
+setup.cfg
+setup.py
+system_prompt.txt
+tests
+tox.ini
+
+
+Django is importable from cwd but my script's cwd was /tmp. Let me run with /testbed in path.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_09_57_1789984631
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    from django.conf import settings
+  File "/testbed/django/conf/__init__.py", line 19, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+The conda python lacks dependencies. The task says the configured test environment's python should work. Let me check for a venv or the right interpreter.
+
+```bash-action
+cd /testbed && ls -la && python -m pip list 2>/dev/null | head -30 && ls /opt/miniconda3/envs 2>/dev/null
+```2026_09_21_09_57_1789984632
+executing输出 total 224
+drwxrwxrwx   1 root root     4096 Sep 21 09:57 .
+drwxr-xr-x   1 root root     4096 Sep 21 09:57 ..
+-rwxrwxrwx   1 root root      807 Aug 15 06:17 .editorconfig
+-rwxrwxrwx   1 root root      120 Aug 15 06:17 .eslintignore
+-rwxrwxrwx   1 root root     1407 Aug 15 06:17 .eslintrc
+drwxrwxrwx   8 root root     4096 Aug 15 06:18 .git
+-rwxrwxrwx   1 root root      297 Aug 15 06:17 .gitattributes
+drwxrwxrwx   3 root root     4096 Aug 15 06:17 .github
+-rwxrwxrwx   1 root root      353 Aug 15 06:17 .gitignore
+-rwxrwxrwx   1 root root      281 Aug 15 06:17 .pre-commit-config.yaml
+-rwxrwxrwx   1 root root      385 Aug 15 06:17 .readthedocs.yml
+drwxrwxrwx   2 root root     4096 Aug 15 06:17 .tx
+-rwxrwxrwx   1 root root    40072 Aug 15 06:17 AUTHORS
+-rwxrwxrwx   1 root root     1115 Aug 15 06:17 CONTRIBUTING.rst
+drwxr-xr-x   2 root root     4096 Aug 15 06:18 Django.egg-info
+-rwxrwxrwx   1 root root      369 Aug 15 06:17 Gruntfile.js
+-rwxrwxrwx   1 root root      236 Aug 15 06:17 INSTALL
+-rwxrwxrwx   1 root root     1552 Aug 15 06:17 LICENSE
+-rwxrwxrwx   1 root root    14383 Aug 15 06:17 LICENSE.python
+-rwxrwxrwx   1 root root      276 Aug 15 06:17 MANIFEST.in
+-rw-r--r--   1  501 dialout  7726 Sep 21 09:02 My_agent.py
+-rwxrwxrwx   1 root root     2122 Aug 15 06:17 README.rst
+drwxr-xr-x   2 root root     4096 Sep 21 09:57 __pycache__
+-rw-r--r--   1  501 dialout  1472 Sep 21 07:06 actions.py
+-rw-r--r--   1  501 dialout   871 Sep 20 02:52 chat_export.py
+drwxr-xr-x   2 root root     4096 Sep 21 09:57 chat_history
+drwxrwxrwx   1 root root     4096 Aug 15 06:18 django
+drwxrwxrwx  13 root root     4096 Aug 15 06:17 docs
+drwxrwxrwx   2 root root     4096 Aug 15 06:17 extras
+drwxrwxrwx   4 root root     4096 Aug 15 06:17 js_tests
+-rw-r--r--   1  501 dialout  3360 Sep 21 05:57 llm.py
+-rwxrwxrwx   1 root root      334 Aug 15 06:17 package.json
+-rwxrwxrwx   1 root root      109 Aug 15 06:17 pyproject.toml
+drwxrwxrwx   2 root root     4096 Aug 15 06:17 scripts
+-rwxrwxrwx   1 root root     2167 Aug 15 06:17 setup.cfg
+-rwxrwxrwx   1 root root     1611 Aug 15 06:17 setup.py
+-rw-r--r--   1  501 dialout  1024 Sep 21 09:25 system_prompt.txt
+drwxrwxrwx 213 root root    12288 Aug 15 06:17 tests
+-rwxrwxrwx   1 root root     1555 Aug 15 06:17 tox.ini
+Package                 Version
+----------------------- ----------
+annotated-types         0.8.0
+anyio                   4.15.1
+archspec                0.2.1
+boltons                 23.0.0
+Brotli                  1.0.9
+certifi                 2023.11.17
+cffi                    1.16.0
+charset-normalizer      2.0.4
+conda                   23.11.0
+conda-content-trust     0.2.0
+conda-libmamba-solver   23.12.0
+conda-package-handling  2.2.0
+conda_package_streaming 0.9.0
+cryptography            41.0.7
+distro                  1.8.0
+h11                     0.16.0
+httpcore                1.0.9
+httpx                   0.28.1
+idna                    3.4
+jiter                   0.17.0
+jsonpatch               1.32
+jsonpointer             2.1
+libmambapy              1.5.3
+menuinst                2.0.1
+openai                  2.48.0
+packaging               23.1
+pip                     23.3.1
+platformdirs            3.10.0
+testbed
+
+
+There's a `testbed` conda env. Let me use it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "import django, asgiref; print(django.get_version())"
+```2026_09_21_09_57_17899846342026_09_21_09_57_1789984635
+executing输出 4.1.dev20260815061844
+
+
+The testbed env works. Let me run the repro with it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_57_17899846352026_09_21_09_57_1789984636
+executing输出 original extra_tags: ''
+decoded extra_tags:  None
+Traceback (most recent call last):
+  File "/tmp/repro.py", line 11, in <module>
+    assert decoded_message.extra_tags == "", "BUG: extra_tags became %r" % decoded_message.extra_tags
+AssertionError: BUG: extra_tags became None
+
+
+Bug confirmed. Now check the other storage backend for the same pattern as well.
+
+```bash-action
+cd /testbed && grep -rn "extra_tags" django/contrib/messages/storage/
+```2026_09_21_09_57_17899846372026_09_21_09_57_17899846372026_09_21_09_57_1789984637
+executing输出 django/contrib/messages/storage/cookie.py:22:            if obj.extra_tags:
+django/contrib/messages/storage/cookie.py:23:                message.append(obj.extra_tags)
+django/contrib/messages/storage/base.py:14:    def __init__(self, level, message, extra_tags=None):
+django/contrib/messages/storage/base.py:17:        self.extra_tags = extra_tags
+django/contrib/messages/storage/base.py:22:        and ``extra_tags`` to str in case they are lazy translations.
+django/contrib/messages/storage/base.py:25:        self.extra_tags = str(self.extra_tags) if self.extra_tags is not None else None
+django/contrib/messages/storage/base.py:37:        return ' '.join(tag for tag in [self.extra_tags, self.level_tag] if tag)
+django/contrib/messages/storage/base.py:133:    def add(self, level, message, extra_tags=''):
+django/contrib/messages/storage/base.py:148:        message = Message(level, message, extra_tags=extra_tags)
+grep: django/contrib/messages/storage/__pycache__/cookie.cpython-39.pyc: binary file matches
+grep: django/contrib/messages/storage/__pycache__/base.cpython-39.pyc: binary file matches
+
+
+Only one occurrence. The fix is to change `if obj.extra_tags:` to `if obj.extra_tags is not None:`.
+
+```bash-action
+cd /testbed && sed -n '18,26p' django/contrib/messages/storage/cookie.py
+```2026_09_21_09_57_17899846382026_09_21_09_57_1789984638
+executing输出         if isinstance(obj, Message):
+            # Using 0/1 here instead of False/True to produce more compact json
+            is_safedata = 1 if isinstance(obj.message, SafeData) else 0
+            message = [self.message_key, is_safedata, obj.level, obj.message]
+            if obj.extra_tags:
+                message.append(obj.extra_tags)
+            return message
+        return super().default(obj)
+
+
+
+Now the fix:
+
+```bash-action
+cd /testbed && sed -i 's/            if obj.extra_tags:/            if obj.extra_tags is not None:/' django/contrib/messages/storage/cookie.py && sed -n '18,26p' django/contrib/messages/storage/cookie.py
+```
+executing输出         if isinstance(obj, Message):
+            # Using 0/1 here instead of False/True to produce more compact json
+            is_safedata = 1 if isinstance(obj.message, SafeData) else 0
+            message = [self.message_key, is_safedata, obj.level, obj.message]
+            if obj.extra_tags is not None:
+                message.append(obj.extra_tags)
+            return message
+        return super().default(obj)
+
+
+
+Now rerun the repro to confirm the fix.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_57_17899846402026_09_21_09_57_1789984640
+executing输出 original extra_tags: ''
+decoded extra_tags:  ''
+OK
+
+
+Fixed. Now find and run existing tests covering this module.
+
+```bash-action
+cd /testbed && ls tests/messages_tests/ && grep -rln "MessageEncoder\|extra_tags=\"\"\|extra_tags=''" tests/messages_tests/
+```2026_09_21_09_57_17899846412026_09_21_09_57_17899846412026_09_21_09_57_1789984641
+executing输出 __init__.py
+base.py
+models.py
+test_api.py
+test_cookie.py
+test_fallback.py
+test_middleware.py
+test_mixins.py
+test_session.py
+tests.py
+urls.py
+tests/messages_tests/test_cookie.py
+tests/messages_tests/test_api.py
+
+
+Run the cookie storage test module.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py messages_tests.test_cookie messages_tests.test_api -v1 2>&1 | tail -20
+```2026_09_21_09_57_17899846422026_09_21_09_57_17899846422026_09_21_09_57_1789984642
+executing输出 Testing against Django installed in '/testbed/django' with up to 16 processes
+Found 37 test(s).
+System check identified no issues (0 silenced).
+.....................................
+----------------------------------------------------------------------
+Ran 37 tests in 0.110s
+
+OK
+
+
+All 37 tests pass. Now verify the diff.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_57_17899846432026_09_21_09_57_17899846432026_09_21_09_57_1789984643
+executing输出 diff --git a/django/contrib/messages/storage/cookie.py b/django/contrib/messages/storage/cookie.py
+index 1d390c71dd..e48d4edb08 100755
+--- a/django/contrib/messages/storage/cookie.py
++++ b/django/contrib/messages/storage/cookie.py
+@@ -19,7 +19,7 @@ class MessageEncoder(json.JSONEncoder):
+             # Using 0/1 here instead of False/True to produce more compact json
+             is_safedata = 1 if isinstance(obj.message, SafeData) else 0
+             message = [self.message_key, is_safedata, obj.level, obj.message]
+-            if obj.extra_tags:
++            if obj.extra_tags is not None:
+                 message.append(obj.extra_tags)
+             return message
+         return super().default(obj)
+
+
+The diff shows exactly the intended one-line change: `if obj.extra_tags:` → `if obj.extra_tags is not None:`, so empty-string `extra_tags` is now serialized and preserved through decode, while `None` still omits the field.
+
+Summary:
+- **Root cause**: `MessageEncoder.default()` checked the truthiness of `extra_tags`, dropping `""`; on decode `Message(*obj[2:])` then defaulted `extra_tags` to `None`.
+- **Fix**: changed to an explicit `is not None` check (only one occurrence in the codebase, so no other identical patterns to fix).
+- **Verified**: minimal repro now preserves `""`; existing `messages_tests.test_cookie` + `messages_tests.test_api` (37 tests) pass.
+
+```bash-action
+exit
+```

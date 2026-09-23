@@ -1,0 +1,753 @@
+plan-unwanted
+I'll start by exploring the issue. Let me first look at the relevant source code for RenameModel.
+
+```bash-action
+grep -rn "class RenameModel" /testbed/django/db/migrations/operations/models.py
+```
+
+Wait, let me plan first.
+
+**Plan:**
+1. Locate `RenameModel` in `django/db/migrations/operations/models.py`.
+2. Understand `database_forwards` and `state_forwards` — the issue is that when `db_table` is set (in `options` or via `Meta.db_table`), a rename should be a noop because the table name is explicitly defined and doesn't depend on the model name.
+3. Add a check: if the model's `db_table` is already defined (either in `self.options` or in `state` model options), the rename doesn't affect the actual table name, so no SQL should be issued. Also `state_forwards` should still rename the model so that the state remains correct, but `database_forwards` should be a noop.
+4. Verify with existing tests + git diff.
+
+Let me confirm this plan is acceptable before proceeding.
+
+**Plan:**
+- Modify `RenameModel.database_forwards` to detect when `db_table` is defined (via options passed to the operation OR the model's Meta options in from_state) and return early (noop), preventing unnecessary DB operations.
+- Handle the `allow_migrate_model` / not allowing migrate models logic.
+- Run existing migration tests covering `RenameModel`.
+
+Shall I proceed?
+executing输出 289:class RenameModel(ModelOperation):
+
+
+I'll proceed with the plan. Let me examine the `RenameModel` class.
+
+```bash-action
+sed -n '289,400p' /testbed/django/db/migrations/operations/models.py
+```
+executing输出 class RenameModel(ModelOperation):
+    """Rename a model."""
+
+    def __init__(self, old_name, new_name):
+        self.old_name = old_name
+        self.new_name = new_name
+        super().__init__(old_name)
+
+    @cached_property
+    def old_name_lower(self):
+        return self.old_name.lower()
+
+    @cached_property
+    def new_name_lower(self):
+        return self.new_name.lower()
+
+    def deconstruct(self):
+        kwargs = {
+            'old_name': self.old_name,
+            'new_name': self.new_name,
+        }
+        return (
+            self.__class__.__qualname__,
+            [],
+            kwargs
+        )
+
+    def state_forwards(self, app_label, state):
+        state.rename_model(app_label, self.old_name, self.new_name)
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        new_model = to_state.apps.get_model(app_label, self.new_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+            old_model = from_state.apps.get_model(app_label, self.old_name)
+            # Move the main table
+            schema_editor.alter_db_table(
+                new_model,
+                old_model._meta.db_table,
+                new_model._meta.db_table,
+            )
+            # Alter the fields pointing to us
+            for related_object in old_model._meta.related_objects:
+                if related_object.related_model == old_model:
+                    model = new_model
+                    related_key = (app_label, self.new_name_lower)
+                else:
+                    model = related_object.related_model
+                    related_key = (
+                        related_object.related_model._meta.app_label,
+                        related_object.related_model._meta.model_name,
+                    )
+                to_field = to_state.apps.get_model(
+                    *related_key
+                )._meta.get_field(related_object.field.name)
+                schema_editor.alter_field(
+    
+....(省略中间部分)...
+ted:
+                    continue
+                # Rename the M2M table that's based on this model's name.
+                old_m2m_model = old_field.remote_field.through
+                new_m2m_model = new_field.remote_field.through
+                schema_editor.alter_db_table(
+                    new_m2m_model,
+                    old_m2m_model._meta.db_table,
+                    new_m2m_model._meta.db_table,
+                )
+                # Rename the column in the M2M table that's based on this
+                # model's name.
+                schema_editor.alter_field(
+                    new_m2m_model,
+                    old_m2m_model._meta.get_field(old_model._meta.model_name),
+                    new_m2m_model._meta.get_field(new_model._meta.model_name),
+                )
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        self.new_name_lower, self.old_name_lower = self.old_name_lower, self.new_name_lower
+        self.new_name, self.old_name = self.old_name, self.new_name
+
+        self.database_forwards(app_label, schema_editor, from_state, to_state)
+
+        self.new_name_lower, self.old_name_lower = self.old_name_lower, self.new_name_lower
+        self.new_name, self.old_name = self.old_name, self.new_name
+
+    def references_model(self, name, app_label):
+        return (
+            name.lower() == self.old_name_lower or
+            name.lower() == self.new_name_lower
+        )
+
+    def describe(self):
+        return "Rename model %s to %s" % (self.old_name, self.new_name)
+
+    @property
+    def migration_name_fragment(self):
+        return 'rename_%s_%s' % (self.old_name_lower, self.new_name_lower)
+
+    def reduce(self, operation, app_label):
+        if (isinstance(operation, RenameModel) and
+                self.new_name_lower == operation.old_name_lower):
+            return [
+                RenameModel(
+                    self.old_name,
+                    operation.new_name,
+                ),
+            ]
+
+
+Let me see the full `database_forwards` method to understand the structure.
+
+```bash-action
+sed -n '314,395p' /testbed/django/db/migrations/operations/models.py
+```2026_09_21_09_55_1789984540
+executing输出         )
+
+    def state_forwards(self, app_label, state):
+        state.rename_model(app_label, self.old_name, self.new_name)
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        new_model = to_state.apps.get_model(app_label, self.new_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+            old_model = from_state.apps.get_model(app_label, self.old_name)
+            # Move the main table
+            schema_editor.alter_db_table(
+                new_model,
+                old_model._meta.db_table,
+                new_model._meta.db_table,
+            )
+            # Alter the fields pointing to us
+            for related_object in old_model._meta.related_objects:
+                if related_object.related_model == old_model:
+                    model = new_model
+                    related_key = (app_label, self.new_name_lower)
+                else:
+                    model = related_object.related_model
+                    related_key = (
+                        related_object.related_model._meta.app_label,
+                        related_object.related_model._meta.model_name,
+                    )
+                to_field = to_state.apps.get_model(
+                    *related_key
+                )._meta.get_field(related_object.field.name)
+                schema_editor.alter_field(
+                    model,
+                    related_object.field,
+                    to_field,
+                )
+            # Rename M2M fields whose name is based on this model's name.
+            fields = zip(old_model._meta.local_many_to_many, new_model._meta.local_many_to_many)
+            for (old_field, new_field) in fields:
+                # Skip self-referential fields as these are renamed above.
+                if new_field.model == new_field.related_model or not new_field.remote_field.through._meta.auto_created:
+                    continue
+                # Rename the M2M table that's based on this model's name.
+                old_m2m_model = old_field.remote_field.through
+                new_m2m_model = new_field.remote_field.through
+                schema_editor.alter_db_table(
+                    new_m2m_model,
+                    old_m2m_model._meta.db_table,
+                    new_m2m_model._meta.db_table,
+                )
+                # Rename the column in the M2M table that's based on this
+                # model's name.
+                schema_editor.alter_field(
+                    new_m2m_model,
+                    old_m2m_model._meta.get_field(old_model._meta.model_name),
+                    new_m2m_model._meta.get_field(new_model._meta.model_name),
+                )
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        self.new_name_lower, self.old_name_lower = self.old_name_lower, self.new_name_lower
+        self.new_name, self.old_name = self.old_name, self.new_name
+
+        self.database_forwards(app_label, schema_editor, from_state, to_state)
+
+        self.new_name_lower, self.old_name_lower = self.old_name_lower, self.new_name_lower
+        self.new_name, self.old_name = self.old_name, self.new_name
+
+    def references_model(self, name, app_label):
+        return (
+            name.lower() == self.old_name_lower or
+            name.lower() == self.new_name_lower
+        )
+
+    def describe(self):
+        return "Rename model %s to %s" % (self.old_name, self.new_name)
+
+    @property
+    def migration_name_fragment(self):
+        return 'rename_%s_%s' % (self.old_name_lower, self.new_name_lower)
+
+    def reduce(self, operation, app_label):
+        if (isinstance(operation, RenameModel) and
+                self.new_name_lower == operation.old_name_lower):
+            return [
+
+
+Now I understand the structure. The fix: if the model has an explicit `db_table` defined in its options (Meta), then renaming the model doesn't change the DB table name, so `database_forwards` should be a noop. Let me check how `db_table` is accessed and how the state exposes options.
+
+Let me look at how other operations check for `db_table` and the `state.rename_model` method.
+
+```bash-action
+grep -rn "db_table" /testbed/django/db/migrations/state.py /testbed/django/db/migrations/operations/models.py
+```2026_09_21_09_55_1789984541
+executing输出 /testbed/django/db/migrations/operations/models.py:324:            schema_editor.alter_db_table(
+/testbed/django/db/migrations/operations/models.py:326:                old_model._meta.db_table,
+/testbed/django/db/migrations/operations/models.py:327:                new_model._meta.db_table,
+/testbed/django/db/migrations/operations/models.py:357:                schema_editor.alter_db_table(
+/testbed/django/db/migrations/operations/models.py:359:                    old_m2m_model._meta.db_table,
+/testbed/django/db/migrations/operations/models.py:360:                    new_m2m_model._meta.db_table,
+/testbed/django/db/migrations/operations/models.py:435:        state.alter_model_options(app_label, self.name_lower, {'db_table': self.table})
+/testbed/django/db/migrations/operations/models.py:441:            schema_editor.alter_db_table(
+/testbed/django/db/migrations/operations/models.py:443:                old_model._meta.db_table,
+/testbed/django/db/migrations/operations/models.py:444:                new_model._meta.db_table,
+/testbed/django/db/migrations/operations/models.py:446:            # Rename M2M fields whose name is based on this model's db_table
+/testbed/django/db/migrations/operations/models.py:449:                    schema_editor.alter_db_table(
+/testbed/django/db/migrations/operations/models.py:451:                        old_field.remote_field.through._meta.db_table,
+/testbed/django/db/migrations/operations/models.py:452:                        new_field.remote_field.through._meta.db_table,
+
+
+Let me look at the `AlterModelTable` operation for reference (lines ~420-460).
+
+```bash-action
+sed -n '415,465p' /testbed/django/db/migrations/operations/models.py
+```2026_09_21_09_55_1789984542
+executing输出 
+class AlterModelTable(ModelOptionOperation):
+    """Rename a model's table."""
+
+    def __init__(self, name, table):
+        self.table = table
+        super().__init__(name)
+
+    def deconstruct(self):
+        kwargs = {
+            'name': self.name,
+            'table': self.table,
+        }
+        return (
+            self.__class__.__qualname__,
+            [],
+            kwargs
+        )
+
+    def state_forwards(self, app_label, state):
+        state.alter_model_options(app_label, self.name_lower, {'db_table': self.table})
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        new_model = to_state.apps.get_model(app_label, self.name)
+        if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+            old_model = from_state.apps.get_model(app_label, self.name)
+            schema_editor.alter_db_table(
+                new_model,
+                old_model._meta.db_table,
+                new_model._meta.db_table,
+            )
+            # Rename M2M fields whose name is based on this model's db_table
+            for (old_field, new_field) in zip(old_model._meta.local_many_to_many, new_model._meta.local_many_to_many):
+                if new_field.remote_field.through._meta.auto_created:
+                    schema_editor.alter_db_table(
+                        new_field.remote_field.through,
+                        old_field.remote_field.through._meta.db_table,
+                        new_field.remote_field.through._meta.db_table,
+                    )
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        return self.database_forwards(app_label, schema_editor, from_state, to_state)
+
+    def describe(self):
+        return "Rename table for %s to %s" % (
+            self.name,
+            self.table if self.table is not None else "(default)"
+        )
+
+    @property
+    def migration_name_fragment(self):
+
+
+Now, the fix. When renamed, if the model has an explicit `db_table` set in its Meta options, the table name won't change based on the model name, so we should skip the DB operations. We check `new_model._meta.db_table == old_model._meta.db_table`.
+
+Actually, the cleanest check: if the table name is unchanged (which happens when `db_table` is explicitly defined), skip. Let me write a minimal reproduction first to confirm the bug.
+
+Let me check the test setup and existing test file.Let me first write a minimal reproduction to confirm the bug.
+
+```bash-action
+cat > /tmp/repro.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+)
+django.setup()
+
+from django.db import connection
+from django.db.migrations.state import ProjectState
+from django.db.migrations.operations.models import RenameModel
+from django.db.models import Model, CharField
+
+# Build a model with explicit db_table
+class Author(Model):
+    name = CharField(max_length=100)
+    class Meta:
+        app_label = 'reproapp'
+        db_table = 'custom_author_table'
+
+state = ProjectState()
+state.add_model(Author)
+
+with connection.schema_editor() as se:
+    se.create_model(Author)
+
+to_state = state.clone()
+from_state = state.clone()
+op = RenameModel('Author', 'Writer')
+
+# capture executed SQL
+from django.db import connection as conn
+calls = []
+orig = conn.SchemaEditorClass.alter_db_table
+def spy(self, model, old_db_table, new_db_table):
+    calls.append((old_db_table, new_db_table))
+    return orig(self, model, old_db_table, new_db_table)
+conn.SchemaEditorClass.alter_db_table = spy
+
+op.state_forwards('reproapp', to_state)
+with connection.schema_editor() as se:
+    op.database_forwards('reproapp', se, from_state, to_state)
+
+print("alter_db_table calls:", calls)
+assert calls == [], "BUG: alter_db_table was called even though db_table is set"
+print("OK: noop")
+EOF
+python /tmp/repro.py
+```2026_09_21_09_55_17899845432026_09_21_09_55_1789984544
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+The tests directory has its own `django` in /testbed. Let me set PYTHONPATH.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_09_55_17899845462026_09_21_09_55_1789984547
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 2, in <module>
+    from django.conf import settings
+  File "/testbed/django/conf/__init__.py", line 19, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+Need to find the right python. Let me check what interpreter has the test environment.
+
+```bash-action
+cd /testbed && which python python3; ls tests/runtests.py 2>/dev/null; python -c "import sys; print(sys.path)" 2>&1 | head; pip show django 2>/dev/null | head -3
+```2026_09_21_09_55_17899845472026_09_21_09_55_1789984548
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python3
+tests/runtests.py
+['', '/opt/miniconda3/lib/python311.zip', '/opt/miniconda3/lib/python3.11', '/opt/miniconda3/lib/python3.11/lib-dynload', '/opt/miniconda3/lib/python3.11/site-packages']
+
+
+asgiref isn't in site-packages. Let me check if there's a virtualenv or specific env.
+
+```bash-action
+cd /testbed && find / -name "asgiref" -maxdepth 8 -type d 2>/dev/null | head; ls /opt/miniconda3/envs 2>/dev/null
+```2026_09_21_09_55_17899845482026_09_21_09_55_1789984549
+executing输出 /opt/miniconda3/envs/testbed/lib/python3.9/site-packages/asgiref
+testbed
+
+
+There's a `testbed` conda env. Let me use it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 22, in <module>
+    state.add_model(Author)
+  File "/testbed/django/db/migrations/state.py", line 110, in add_model
+    model_key = model_state.app_label, model_state.name_lower
+AttributeError: type object 'Author' has no attribute 'app_label'
+
+
+`ProjectState.add_model` expects a `ModelState`, not a model class. Let me use `ModelState.from_model`.
+
+```bash-action
+cat > /tmp/repro.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+)
+django.setup()
+
+from django.db import connection
+from django.db.migrations.state import ProjectState, ModelState
+from django.db.migrations.operations.models import RenameModel
+from django.db.models import Model, CharField
+
+class Author(Model):
+    name = CharField(max_length=100)
+    class Meta:
+        app_label = 'reproapp'
+        db_table = 'custom_author_table'
+
+state = ProjectState()
+state.add_model(ModelState.from_model(Author))
+
+with connection.schema_editor() as se:
+    se.create_model(Author)
+
+from_state = state.clone()
+to_state = state.clone()
+op = RenameModel('Author', 'Writer')
+
+calls = []
+conn_cls = connection.SchemaEditorClass
+orig = conn_cls.alter_db_table
+def spy(self, model, old_db_table, new_db_table):
+    calls.append((old_db_table, new_db_table))
+    return orig(self, model, old_db_table, new_db_table)
+conn_cls.alter_db_table = spy
+
+try:
+    op.state_forwards('reproapp', to_state)
+    with connection.schema_editor() as se:
+        op.database_forwards('reproapp', se, from_state, to_state)
+finally:
+    conn_cls.alter_db_table = orig
+
+print("alter_db_table calls:", calls)
+assert calls == [], "BUG: alter_db_table was called even though db_table is set"
+print("OK: noop")
+EOF
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_55_1789984551
+executing输出 alter_db_table calls: [('custom_author_table', 'custom_author_table')]
+Traceback (most recent call last):
+  File "/tmp/repro.py", line 46, in <module>
+    assert calls == [], "BUG: alter_db_table was called even though db_table is set"
+AssertionError: BUG: alter_db_table was called even though db_table is set
+
+
+Bug confirmed. The `alter_db_table` is called even though the table name is unchanged (`custom_author_table` → `custom_author_table`). This is the issue - it triggers unnecessary DB operations.
+
+Now let me apply the fix. The cleanest approach: in `database_forwards`, if the db_table is explicitly defined on the model, skip the rename entirely (noop).
+
+Let me check how the model's options expose `db_table` and whether there's an existing helper in the codebase.
+
+```bash-action
+grep -rn "db_table" /testbed/django/db/migrations/operations/models.py | head; grep -rn "def rename_model" /testbed/django/db/migrations/state.py
+```2026_09_21_09_55_17899845532026_09_21_09_55_1789984554
+executing输出 324:            schema_editor.alter_db_table(
+326:                old_model._meta.db_table,
+327:                new_model._meta.db_table,
+357:                schema_editor.alter_db_table(
+359:                    old_m2m_model._meta.db_table,
+360:                    new_m2m_model._meta.db_table,
+435:        state.alter_model_options(app_label, self.name_lower, {'db_table': self.table})
+441:            schema_editor.alter_db_table(
+443:                old_model._meta.db_table,
+444:                new_model._meta.db_table,
+133:    def rename_model(self, app_label, old_name, new_name):
+
+
+Now I'll apply the fix. The key insight: if the `new_model` has an explicit `db_table` in its Meta options (`new_model._meta.original_attrs.get('db_table') is not None` or checking `_meta.db_table` stays the same), the rename is a noop for the table.
+
+Actually a robust check: if the model's `Meta` explicitly defines `db_table`, then renaming doesn't affect the table. Let me use `new_model._meta.db_table`. But the safest is to check whether `db_table` was explicitly set in the Meta options. Django stores this in `model._meta.original_attrs`.
+
+Let me apply the fix to `database_forwards`:```
+
+```bash-action
+sed -n '318,323p' /testbed/django/db/migrations/operations/models.py
+```2026_09_21_09_55_17899845542026_09_21_09_55_1789984555
+executing输出 
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        new_model = to_state.apps.get_model(app_label, self.new_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+            old_model = from_state.apps.get_model(app_label, self.old_name)
+            # Move the main table
+
+
+I'll add a check for an explicitly defined `db_table`. Django models store the explicit Meta attribute in `_meta.original_attrs`. When `db_table` is explicitly set, that entry exists.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import django
+from django.conf import settings
+settings.configure(INSTALLED_APPS=[], DATABASES={})
+django.setup()
+from django.db.models import Model, CharField
+class A(Model):
+    class Meta:
+        app_label='x'
+        db_table='custom'
+class B(Model):
+    class Meta:
+        app_label='x'
+print('A', A._meta.original_attrs, A._meta.db_table)
+print('B', B._meta.original_attrs, B._meta.db_table)
+"
+```2026_09_21_09_55_17899845562026_09_21_09_55_17899845582026_09_21_09_55_1789984559
+executing输出 A {'db_table': 'custom', 'app_label': 'x'} custom
+B {'app_label': 'x'} x_b
+
+
+`_meta.original_attrs` contains `db_table` only when explicitly set. Now let me apply the fix. I'll modify `database_forwards` to return early when `db_table` is explicitly defined.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python - << 'EOF'
+import re
+p = 'django/db/migrations/operations/models.py'
+s = open(p).read()
+
+old = '''    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        new_model = to_state.apps.get_model(app_label, self.new_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+            old_model = from_state.apps.get_model(app_label, self.old_name)
+            # Move the main table
+            schema_editor.alter_db_table('''
+
+new = '''    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        new_model = to_state.apps.get_model(app_label, self.new_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+            old_model = from_state.apps.get_model(app_label, self.old_name)
+            # Rename the main table if the model does not have an explicit
+            # db_table, in which case the table name does not depend on the
+            # model's name.
+            if new_model._meta.original_attrs.get('db_table') is not None:
+                return
+            # Move the main table
+            schema_editor.alter_db_table('''
+
+assert old in s
+s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+print("patched")
+EOF
+```2026_09_21_09_55_17899845582026_09_21_09_55_17899845592026_09_21_09_55_1789984560
+executing输出 patched
+
+
+Now let me verify the fix with the repro script.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_55_17899845602026_09_21_09_55_17899845612026_09_21_09_55_1789984561
+executing输出 alter_db_table calls: []
+OK: noop
+
+
+Fix works. Now let me run the existing migration tests that cover `RenameModel`. First let me find them.
+
+```bash-action
+grep -rln "RenameModel" /testbed/tests/
+```
+executing输出 /testbed/tests/contenttypes_tests/test_operations.py
+/testbed/tests/contenttypes_tests/operations_migrations/0002_rename_foo.py
+/testbed/tests/migrations/test_operations.py
+/testbed/tests/migrations/test_optimizer.py
+/testbed/tests/migrations/test_autodetector.py
+
+
+Let me run the relevant migration tests, especially `test_operations.py` which has the `RenameModel` operation tests, and the migrations test suite.
+
+```bash-action
+cd /testbed/tests && /opt/miniconda3/envs/testbed/bin/python runtests.py migrations.test_operations migrations.test_optimizer migrations.test_autodetector contenttypes_tests -v 1 2>&1 | tail -30
+```2026_09_21_09_56_17899845622026_09_21_09_56_17899845632026_09_21_09_56_1789984563
+executing输出 Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+
+
+Let me see the actual test result summary (grep for OK/FAILED).
+
+```bash-action
+cd /testbed/tests && /opt/miniconda3/envs/testbed/bin/python runtests.py migrations.test_operations migrations.test_optimizer migrations.test_autodetector contenttypes_tests -v 1 2>&1 | grep -E "^(OK|FAILED|ERROR|Ran )" 
+```2026_09_21_09_56_17899845642026_09_21_09_56_17899845652026_09_21_09_56_17899845662026_09_21_09_56_1789984565
+executing输出 Ran 354 tests in 0.865s
+OK (skipped=1)
+
+
+All 354 tests pass. Now let me double-check my concern: when the model is renamed but keeps an explicit `db_table`, the related models' foreign keys also shouldn't need altering, since the table name is unchanged. My early `return` also skips the FK alterations and M2M renames, which are based on table names that don't change — correct.
+
+But wait — there's a subtle case. What about a model with explicit `db_table` that has M2M fields whose *through* table name is auto-derived? Those M2M through tables also use the model's db_table, so they're explicitly set too. Skipping is correct.
+
+Let me also verify the `database_backwards` path works — it calls `database_forwards` after swapping names. Let me test backwards.
+
+```bash-action
+cat > /tmp/repro2.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+)
+django.setup()
+from django.db import connection
+from django.db.migrations.state import ProjectState, ModelState
+from django.db.migrations.operations.models import RenameModel
+from django.db.models import Model, CharField
+
+class Author(Model):
+    name = CharField(max_length=100)
+    class Meta:
+        app_label = 'reproapp'
+        db_table = 'custom_author_table'
+
+state = ProjectState()
+state.add_model(ModelState.from_model(Author))
+with connection.schema_editor() as se:
+    se.create_model(Author)
+
+from_state = state.clone()
+to_state = state.clone()
+op = RenameModel('Author', 'Writer')
+
+calls = []
+conn_cls = connection.SchemaEditorClass
+orig = conn_cls.alter_db_table
+def spy(self, model, old_db_table, new_db_table):
+    calls.append((old_db_table, new_db_table))
+    return orig(self, model, old_db_table, new_db_table)
+conn_cls.alter_db_table = spy
+try:
+    op.state_forwards('reproapp', to_state)
+    with connection.schema_editor() as se:
+        op.database_forwards('reproapp', se, from_state, to_state)
+    # backwards
+    back_from = to_state.clone()
+    back_to = from_state.clone()
+    with connection.schema_editor() as se:
+        op.database_backwards('reproapp', se, back_from, back_to)
+finally:
+    conn_cls.alter_db_table = orig
+print("calls:", calls)
+assert calls == [], calls
+print("OK backwards+forwards noop")
+EOF
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro2.py
+```2026_09_21_09_56_17899845652026_09_21_09_56_17899845662026_09_21_09_56_1789984567
+executing输出 calls: []
+OK backwards+forwards noop
+
+
+Now let me verify the diff is exactly what I want.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_56_17899845702026_09_21_09_56_17899845712026_09_21_09_56_1789984571
+executing输出 diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index 982816be3a..f04fbee1ae 100755
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -320,6 +320,11 @@ class RenameModel(ModelOperation):
+         new_model = to_state.apps.get_model(app_label, self.new_name)
+         if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+             old_model = from_state.apps.get_model(app_label, self.old_name)
++            # Rename the main table if the model does not have an explicit
++            # db_table, in which case the table name does not depend on the
++            # model's name.
++            if new_model._meta.original_attrs.get('db_table') is not None:
++                return
+             # Move the main table
+             schema_editor.alter_db_table(
+                 new_model,
+
+
+The diff is clean and minimal. Let me clean up the temp repro files.
+
+```bash-action
+rm -f /tmp/repro.py /tmp/repro2.py
+```2026_09_21_09_56_17899845712026_09_21_09_56_17899845722026_09_21_09_56_1789984572
+
+Task complete.
+
+**Summary:**
+- **Root cause:** `RenameModel.database_forwards` always performed table renames (and FK/M2M alterations) even when the model already had an explicit `db_table` in its `Meta`, meaning the DB table name is independent of the model name. This caused unnecessary FK drop/recreate on Postgres and table recreation on SQLite.
+- **Fix:** Added an early `return` in `RenameModel.database_forwards` when `new_model._meta.original_attrs.get('db_table')` is set, making the operation a noop. This also correctly applies to `db_table` set via the `AlterModelTable` operation (stored in `original_attrs`), and to the backwards path.
+- **Verification:** A minimal reproduction confirmed the bug (`alter_db_table` was called with identical names) and confirmed the fix (no calls, forwards and backwards). The existing test suites covering this module (`migrations.test_operations`, `migrations.test_optimizer`, `migrations.test_autodetector`, `contenttypes_tests`) all pass: **354 tests OK (skipped=1)**.
+
+```bash-action
+exit
+```
+executing输出 
+
+```bash-action
+exit
+```

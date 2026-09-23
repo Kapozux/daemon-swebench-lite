@@ -1,0 +1,454 @@
+plan-unwanted
+我已经阅读了 issue，先确认问题所在。
+
+```bash-action
+grep -n "verbose_name_plural" /testbed/django/contrib/admin/options.py | head -50
+```
+executing输出 1823:            'module_name': str(opts.verbose_name_plural),
+1947:            'module_name': str(capfirst(opts.verbose_name_plural)),
+2028:    verbose_name_plural = None
+2042:        if self.verbose_name_plural is None:
+2043:            self.verbose_name_plural = self.model._meta.verbose_name_plural
+
+
+I found the relevant code. Let me look at the InlineModelAdmin class more closely.
+
+```bash-action
+sed -n 2020,2050p /testbed/django/contrib/admin/options.py
+```2026_09_21_09_49_1789984199
+executing输出     model = None
+    fk_name = None
+    formset = BaseInlineFormSet
+    extra = 3
+    min_num = None
+    max_num = None
+    template = None
+    verbose_name = None
+    verbose_name_plural = None
+    can_delete = True
+    show_change_link = False
+    checks_class = InlineModelAdminChecks
+    classes = None
+
+    def __init__(self, parent_model, admin_site):
+        self.admin_site = admin_site
+        self.parent_model = parent_model
+        self.opts = self.model._meta
+        self.has_registered_model = admin_site.is_registered(self.model)
+        super().__init__()
+        if self.verbose_name is None:
+            self.verbose_name = self.model._meta.verbose_name
+        if self.verbose_name_plural is None:
+            self.verbose_name_plural = self.model._meta.verbose_name_plural
+
+    @property
+    def media(self):
+        extra = '' if settings.DEBUG else '.min'
+        js = ['vendor/jquery/jquery%s.js' % extra, 'jquery.init.js', 'inlines.js']
+        if self.filter_vertical or self.filter_horizontal:
+            js.extend(['SelectBox.js', 'SelectFilter2.js'])
+
+
+I can see the bug. When `verbose_name_plural` is not specified, it defaults to the model's `verbose_name_plural`, ignoring a specified `verbose_name`. Let me fix it.
+
+The fix: when `verbose_name` is specified but `verbose_name_plural` is not, use the pluralized form based on the specified `verbose_name`. Django models use `verbose_name_plural` derived from `verbose_name` by adding 's' (or using the model's plural logic).
+
+Let me check how the model meta derives plural from verbose_name.
+
+```bash-action
+grep -n "verbose_name_plural" /testbed/django/db/models/options.py
+```2026_09_21_09_50_1789984200
+executing输出 28:    'verbose_name', 'verbose_name_plural', 'db_table', 'ordering',
+84:        self.verbose_name_plural = None
+189:            # verbose_name_plural is a special case because it uses a 's'
+191:            if self.verbose_name_plural is None:
+192:                self.verbose_name_plural = format_lazy('{}s', self.verbose_name)
+201:            self.verbose_name_plural = format_lazy('{}s', self.verbose_name)
+
+
+Now I understand how Django derives the plural. Let me look at that code section.
+
+```bash-action
+sed -n 185,205p /testbed/django/db/models/options.py
+```2026_09_21_09_50_17899842012026_09_21_09_50_1789984202
+executing输出                 for attr_name in {'constraints', 'indexes'}:
+                    objs = getattr(self, attr_name, [])
+                    setattr(self, attr_name, self._format_names_with_class(cls, objs))
+
+            # verbose_name_plural is a special case because it uses a 's'
+            # by default.
+            if self.verbose_name_plural is None:
+                self.verbose_name_plural = format_lazy('{}s', self.verbose_name)
+
+            # order_with_respect_and ordering are mutually exclusive.
+            self._ordering_clash = bool(self.ordering and self.order_with_respect_to)
+
+            # Any leftover attributes must be invalid.
+            if meta_attrs != {}:
+                raise TypeError("'class Meta' got invalid attribute(s): %s" % ','.join(meta_attrs))
+        else:
+            self.verbose_name_plural = format_lazy('{}s', self.verbose_name)
+        del self.meta
+
+        # If the db_table wasn't provided, use the app_label + model_name.
+        if not self.db_table:
+
+
+Now I'll apply the fix. When a custom `verbose_name` is set on the inline but `verbose_name_plural` isn't, derive `verbose_name_plural` from the inline's `verbose_name` using the same `{}s` logic.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'django/contrib/admin/options.py'
+s = open(p).read()
+old = """        if self.verbose_name is None:
+            self.verbose_name = self.model._meta.verbose_name
+        if self.verbose_name_plural is None:
+            self.verbose_name_plural = self.model._meta.verbose_name_plural
+"""
+new = """        if self.verbose_name is None:
+            self.verbose_name = self.model._meta.verbose_name
+        if self.verbose_name_plural is None:
+            if self.verbose_name is not None and self.verbose_name != self.model._meta.verbose_name:
+                self.verbose_name_plural = format_lazy("{}s", self.verbose_name)
+            else:
+                self.verbose_name_plural = self.model._meta.verbose_name_plural
+"""
+assert old in s, "pattern not found"
+s = s.replace(old, new)
+open(p,'w').write(s)
+print("done")
+EOF
+```2026_09_21_09_50_17899842022026_09_21_09_50_1789984203
+executing输出 done
+
+
+Now check that `format_lazy` is imported in options.py.
+
+```bash-action
+grep -n "format_lazy" /testbed/django/contrib/admin/options.py
+```
+executing输出 47:    capfirst, format_lazy, get_text_list, smart_split, unescape_string_literal,
+282:            form_field.help_text = format_lazy('{} {}', help_text, msg) if help_text else msg
+2044:                self.verbose_name_plural = format_lazy("{}s", self.verbose_name)
+
+
+Good, `format_lazy` is already imported. Let me verify the change with git diff.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_50_1789984205
+executing输出 diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index dadd4acfa1..5f23ab572e 100755
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -2040,7 +2040,10 @@ class InlineModelAdmin(BaseModelAdmin):
+         if self.verbose_name is None:
+             self.verbose_name = self.model._meta.verbose_name
+         if self.verbose_name_plural is None:
+-            self.verbose_name_plural = self.model._meta.verbose_name_plural
++            if self.verbose_name is not None and self.verbose_name != self.model._meta.verbose_name:
++                self.verbose_name_plural = format_lazy("{}s", self.verbose_name)
++            else:
++                self.verbose_name_plural = self.model._meta.verbose_name_plural
+ 
+     @property
+     def media(self):
+
+
+The change looks right, but let me reconsider the logic. After the first `if`, `self.verbose_name` is never None (it's set from model meta if it was None). The condition should be: did the user supply a custom `verbose_name`? 
+
+A cleaner way is to capture whether a custom verbose_name was given before overwriting. Let me refine to avoid the awkward comparison.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+p = 'django/contrib/admin/options.py'
+s = open(p).read()
+old = """        if self.verbose_name is None:
+            self.verbose_name = self.model._meta.verbose_name
+        if self.verbose_name_plural is None:
+            if self.verbose_name is not None and self.verbose_name != self.model._meta.verbose_name:
+                self.verbose_name_plural = format_lazy("{}s", self.verbose_name)
+            else:
+                self.verbose_name_plural = self.model._meta.verbose_name_plural
+"""
+new = """        if self.verbose_name is None:
+            self.verbose_name = self.model._meta.verbose_name
+        if self.verbose_name_plural is None:
+            self.verbose_name_plural = self.model._meta.verbose_name_plural
+"""
+assert old in s
+s = s.replace(old, new)
+open(p,'w').write(s)
+print("reverted")
+EOF
+```2026_09_21_09_50_17899842062026_09_21_09_50_1789984207
+executing输出 reverted
+
+
+Now apply the cleaner version that tracks whether a custom `verbose_name` was provided.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+p = 'django/contrib/admin/options.py'
+s = open(p).read()
+old = """        if self.verbose_name is None:
+            self.verbose_name = self.model._meta.verbose_name
+        if self.verbose_name_plural is None:
+            self.verbose_name_plural = self.model._meta.verbose_name_plural
+"""
+new = """        if self.verbose_name is None:
+            self.verbose_name = self.model._meta.verbose_name
+        if self.verbose_name_plural is None:
+            if self.verbose_name == self.model._meta.verbose_name:
+                self.verbose_name_plural = self.model._meta.verbose_name_plural
+            else:
+                self.verbose_name_plural = format_lazy("{}s", self.verbose_name)
+"""
+assert old in s
+s = s.replace(old, new)
+open(p,'w').write(s)
+print("done")
+EOF
+```2026_09_21_09_50_17899842082026_09_21_09_50_1789984209
+executing输出 done
+
+
+Let me write a minimal reproduction script to confirm the fix works as intended.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'django.contrib.admin', 'django.contrib.sessions', 'django.contrib.messages'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+    USE_TZ=True,
+)
+django.setup()
+
+from django.contrib.admin import ModelAdmin
+from django.contrib.auth.models import User, Group
+from django.contrib.admin.options import InlineModelAdmin
+
+class CustomVerboseInline(InlineModelAdmin):
+    model = Group
+    verbose_name = "custom member"
+
+class NoVerboseInline(InlineModelAdmin):
+    model = Group
+
+# Build parent admin to instantiate inlines
+class ParentAdmin(ModelAdmin):
+    inlines = [CustomVerboseInline, NoVerboseInline]
+    pass
+
+pa = ParentAdmin(User, None)
+
+# Simulate the inline instantiation as the admin machinery does:
+# get_inline_instances creates them with parent_model and admin_site
+tests = [
+    ("custom verbose_name only", CustomVerboseInline),
+    ("no verbose_name", NoVerboseInline),
+]
+from django.contrib import admin as admin_site
+
+for label, cls in tests:
+    inst = cls(User, admin_site.site)
+    print(label, "->", "verbose_name:", inst.verbose_name, "| plural:", inst.verbose_name_plural)
+EOF
+```2026_09_21_09_50_17899842092026_09_21_09_50_17899842102026_09_21_09_50_1789984210
+executing输出 Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+  File "/testbed/django/conf/__init__.py", line 17, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+The bare `python` isn't the test env's python. The task said the current shell's python is configured, but maybe it needs a venv. Let me check.
+
+```bash-action
+cd /testbed && which python python3 && python --version && ls /testbed
+```2026_09_21_09_50_1789984211
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python3
+Python 3.11.5
+AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+django
+docs
+extras
+js_tests
+llm.py
+package.json
+pyproject.toml
+scripts
+setup.cfg
+setup.py
+system_prompt.txt
+tests
+tox.ini
+
+
+asgiref isn't installed. Let me check other pythons / venvs.
+
+```bash-action
+ls /opt/miniconda3/envs 2>/dev/null; ls /testbed/.venv 2>/dev/null; pip show asgiref 2>/dev/null | head -3
+```2026_09_21_09_50_17899842122026_09_21_09_50_1789984213
+executing输出 testbed
+
+
+There's a conda env named `testbed`. Let me use it.
+
+```bash-action
+/opt/miniconda3/envs/testbed/bin/python -c "import asgiref, django; print(asgiref.__version__, django.VERSION)"
+```2026_09_21_09_50_17899842142026_09_21_09_50_17899842152026_09_21_09_50_1789984215
+executing输出 3.8.1 (4, 0, 0, 'alpha', 0)
+
+
+Good. Now run the reproduction with the correct python.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python - <<'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'django.contrib.admin', 'django.contrib.sessions', 'django.contrib.messages'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+    USE_TZ=True,
+)
+django.setup()
+
+from django.contrib.auth.models import User, Group
+from django.contrib.admin.options import InlineModelAdmin
+from django.contrib import admin as admin_mod
+
+class CustomVerboseInline(InlineModelAdmin):
+    model = Group
+    verbose_name = "custom member"
+
+class NoVerboseInline(InlineModelAdmin):
+    model = Group
+
+for label, cls in [("custom verbose_name only", CustomVerboseInline), ("no verbose_name", NoVerboseInline)]:
+    inst = cls(User, admin_mod.site)
+    print(label, "-> verbose_name:", inst.verbose_name, "| plural:", inst.verbose_name_plural)
+EOF
+```2026_09_21_09_50_17899842152026_09_21_09_50_17899842162026_09_21_09_50_17899842162026_09_21_09_50_1789984217
+executing输出 custom verbose_name only -> verbose_name: custom member | plural: custom members
+no verbose_name -> verbose_name: group | plural: groups
+
+
+The bug is fixed:
+- When a custom `verbose_name` is given, `verbose_name_plural` now derives from it: "custom members".
+- Without it, defaults still come from the model: "groups".
+
+Now let me verify the explicit `verbose_name_plural` still takes precedence, and run the existing admin inline tests.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python - <<'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'django.contrib.admin', 'django.contrib.sessions', 'django.contrib.messages'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+    USE_TZ=True,
+)
+django.setup()
+from django.contrib.auth.models import User, Group
+from django.contrib.admin.options import InlineModelAdmin
+from django.contrib import admin as admin_mod
+
+class BothInline(InlineModelAdmin):
+    model = Group
+    verbose_name = "custom member"
+    verbose_name_plural = "custom plural explicit"
+
+inst = BothInline(User, admin_mod.site)
+print("both -> verbose_name:", inst.verbose_name, "| plural:", inst.verbose_name_plural)
+EOF
+```2026_09_21_09_50_17899842172026_09_21_09_50_17899842182026_09_21_09_50_17899842182026_09_21_09_50_1789984218
+executing输出 both -> verbose_name: custom member | plural: custom plural explicit
+
+
+Explicit `verbose_name_plural` still wins. Now run the existing admin tests covering this module.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py admin_inlines admin_views -v1 2>&1 | tail -20
+```2026_09_21_09_50_17899842192026_09_21_09_50_17899842202026_09_21_09_50_17899842202026_09_21_09_50_17899842202026_09_21_09_50_17899842212026_09_21_09_50_1789984221
+executing输出 Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+Destroying test database for alias 'other'...
+
+
+The tail only shows teardown. Let me check the actual test result summary.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py admin_inlines -v1 2>&1 | grep -E "^(OK|FAILED|Ran|ERROR)" 
+```2026_09_21_09_50_17899842252026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842272026_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_17899842262026_09_21_09_50_1789984226
+executing输出 Ran 75 tests in 0.963s
+OK (skipped=12)
+
+
+All 75 admin_inlines tests pass. Let me also confirm the final diff is clean.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_50_17899842282026_09_21_09_50_17899842292026_09_21_09_50_1789984229
+executing输出 diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index dadd4acfa1..5565b7790d 100755
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -2040,7 +2040,10 @@ class InlineModelAdmin(BaseModelAdmin):
+         if self.verbose_name is None:
+             self.verbose_name = self.model._meta.verbose_name
+         if self.verbose_name_plural is None:
+-            self.verbose_name_plural = self.model._meta.verbose_name_plural
++            if self.verbose_name == self.model._meta.verbose_name:
++                self.verbose_name_plural = self.model._meta.verbose_name_plural
++            else:
++                self.verbose_name_plural = format_lazy("{}s", self.verbose_name)
+ 
+     @property
+     def media(self):
+
+
+The fix is complete and verified:
+
+- **Change**: In `InlineModelAdmin.__init__`, when `verbose_name_plural` is not explicitly set, it now derives from a custom `verbose_name` (using the same `{}s` pluralization Django uses for model Meta), falling back to the model's `verbose_name_plural` when no custom `verbose_name` was provided.
+- **Verified**: Custom verbose_name → "custom members"; no verbose_name → "groups"; explicit verbose_name_plural still wins.
+- **Tests**: All 75 `admin_inlines` tests pass.
+
+```bash-action
+exit
+```

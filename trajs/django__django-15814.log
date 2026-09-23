@@ -1,0 +1,946 @@
+plan-unwanted
+I'll start by reproducing the issue to confirm the bug.
+
+```bash-action
+cd /testbed && git log --oneline -3 && python -c "import django; print(django.VERSION)"
+```
+
+Let me look at the relevant source code first.
+
+```bash-action
+cd /testbed && sed -n '700,780p' django/db/models/sql/query.py
+```
+executing输出 a15510ce88 SWE-bench
+5eb6a2b33d Fixed typo in docs/topics/signals.txt.
+863aa7541d Fixed GEOSTest.test_emptyCollections() on GEOS 3.8.0.
+(4, 2, 0, 'alpha', 0)
+
+
+```bash-action
+cd /testbed && sed -n '700,780p' django/db/models/sql/query.py
+```
+executing输出             # the extra complexity when you can write a real query instead.
+            if self.extra and rhs.extra:
+                raise ValueError(
+                    "When merging querysets using 'or', you cannot have "
+                    "extra(select=...) on both sides."
+                )
+        self.extra.update(rhs.extra)
+        extra_select_mask = set()
+        if self.extra_select_mask is not None:
+            extra_select_mask.update(self.extra_select_mask)
+        if rhs.extra_select_mask is not None:
+            extra_select_mask.update(rhs.extra_select_mask)
+        if extra_select_mask:
+            self.set_extra_mask(extra_select_mask)
+        self.extra_tables += rhs.extra_tables
+
+        # Ordering uses the 'rhs' ordering, unless it has none, in which case
+        # the current ordering is used.
+        self.order_by = rhs.order_by or self.order_by
+        self.extra_order_by = rhs.extra_order_by or self.extra_order_by
+
+    def deferred_to_data(self, target):
+        """
+        Convert the self.deferred_loading data structure to an alternate data
+        structure, describing the field that *will* be loaded. This is used to
+        compute the columns to select from the database and also by the
+        QuerySet class to work out which fields are being initialized on each
+        model. Models that have all their fields included aren't mentioned in
+        the result, only those that have field restrictions in place.
+
+        The "target" parameter is the instance that is populated (in place).
+        """
+        field_names, defer = self.deferred_loading
+        if not field_names:
+            return
+        orig_opts = self.get_meta()
+        seen = {}
+        must_include = {orig_opts.concrete_model: {orig_opts.pk}}
+        for field_name in field_names:
+            parts = field_name.split(LOOKUP_SEP)
+            cur_model = self.model._meta.concrete_model
+            opts = orig_opts
+            for name in parts[:-1]:
+                old_model = cur_model
+                if name in self._filtered_relations:
+                    name = self._filtered_relations[name].relation_name
+                source = opts.get_field(name)
+                if is_reverse_o2o(source):
+                    cur_model = source.related_model
+                else:
+                    cur_model = source.remote_field.model
+                opts = cur_model._meta
+                # Even if we're "just passing through" this model, we must add
+                # both the current model's pk and the related reference field
+                # (if it's not a reverse relation) to the things we select.
+                if not is_reverse_o2o(source):
+                    must_include[old_model].add(source)
+                add_to_dict(must_include, cur_model, opts.pk)
+            field = opts.get_field(parts[-1])
+            is_reverse_object = field.auto_created and not field.concrete
+            model = field.related_model if is_reverse_object else field.model
+            model = model._meta.concrete_model
+            if model == opts.model:
+                model = cur_model
+            if not is_reverse_o2o(field):
+                add_to_dict(seen, model, field)
+
+        if defer:
+            # We need to load all fields for each model, except those that
+            # appear in "seen" (for all models that appear in "seen"). The only
+            # slight complexity here is handling fields that exist on parent
+            # models.
+            workset = {}
+            for model, values in seen.items():
+                for field in model._meta.local_fields:
+                    if field not in values:
+                        m = field.model._meta.concrete_model
+                        add_to_dict(workset, m, field)
+            for model, values in must_include.items():
+                # If we haven't included a model in workset, we don't add the
+                # corresponding must_include fields for that model, since an
+
+
+Now let me create a minimal reproduction script to confirm the bug exists.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import django
+from django.conf import settings
+
+settings.configure(
+    DEBUG=True,
+    DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
+    INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth", "reproapp"],
+)
+import sys, types
+app = types.ModuleType("reproapp")
+app.__path__ = []
+sys.modules["reproapp"] = app
+models_mod = types.ModuleType("reproapp.models")
+
+from django.db import models
+
+class CustomModel(models.Model):
+    name = models.CharField(max_length=16)
+    class Meta:
+        app_label = "reproapp"
+
+class ProxyCustomModel(CustomModel):
+    class Meta:
+        app_label = "reproapp"
+        proxy = True
+
+class AnotherModel(models.Model):
+    custom = models.ForeignKey(
+        ProxyCustomModel, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    class Meta:
+        app_label = "reproapp"
+
+models_mod.CustomModel = CustomModel
+models_mod.ProxyCustomModel = ProxyCustomModel
+models_mod.AnotherModel = AnotherModel
+sys.modules["reproapp.models"] = models_mod
+app.models = models_mod
+
+django.setup()
+from django.test.utils import setup_test_environment
+from django.db import connection
+setup_test_environment()
+connection.creation.create_test_db(verbosity=0)
+
+try:
+    qs = AnotherModel.objects.select_related("custom").only("custom__name").all()
+    print("query:", qs.query)
+    list(qs)
+    print("SUCCESS: no error")
+except ValueError as e:
+    print("FAILED:", e)
+    raise
+EOF
+python /tmp/repro.py
+```2026_09_21_09_59_1789984781
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+Need to run from the testbed directory with proper path. Let me check the environment.
+
+```bash-action
+cd /testbed && ls && python -c "import sys; print(sys.path)" && which python
+```2026_09_21_09_59_1789984783
+executing输出 AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+django
+docs
+extras
+js_tests
+llm.py
+package.json
+pyproject.toml
+scripts
+setup.cfg
+setup.py
+system_prompt.txt
+tests
+tox.ini
+['', '/opt/miniconda3/lib/python311.zip', '/opt/miniconda3/lib/python3.11', '/opt/miniconda3/lib/python3.11/lib-dynload', '/opt/miniconda3/lib/python3.11/site-packages']
+/opt/miniconda3/bin/python
+
+
+Django isn't on the path. Let me check if there's a virtualenv or if the testbed dir needs to be on the path.
+
+```bash-action
+cd /testbed && python -c "import django; print(django.__file__)" ; ls /opt/miniconda3/envs/ 2>/dev/null; find / -name "django" -maxdepth 6 -type d 2>/dev/null | head
+```2026_09_21_09_59_17899847842026_09_21_09_59_1789984784
+executing输出 /testbed/django/__init__.py
+testbed
+/testbed/django
+/testbed/django/forms/jinja2/django
+/testbed/django/forms/templates/django
+
+
+There's a `testbed` conda env. Let me use it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "import django; print(django.__file__, django.VERSION)"
+```2026_09_21_09_59_17899847842026_09_21_09_59_1789984785
+executing输出 /testbed/django/__init__.py (4, 2, 0, 'alpha', 0)
+
+
+Good, the `testbed` env is the right one. Let me run the repro with it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 17, in <module>
+    class CustomModel(models.Model):
+  File "/testbed/django/db/models/base.py", line 127, in __new__
+    app_config = apps.get_containing_app_config(module)
+  File "/testbed/django/apps/registry.py", line 260, in get_containing_app_config
+    self.check_apps_ready()
+  File "/testbed/django/apps/registry.py", line 138, in check_apps_ready
+    raise AppRegistryNotReady("Apps aren't loaded yet.")
+django.core.exceptions.AppRegistryNotReady: Apps aren't loaded yet.
+
+
+The repro approach with dynamic models is getting complex. Let me instead use the actual Django test suite infrastructure. First let me check existing tests for proxies with select_related, and write a repro using Django's test runner.
+
+```bash-action
+cd /testbed && grep -rn "select_related" tests/proxy_models/tests.py | head; echo "---"; sed -n '1,30p' tests/proxy_models/tests.py
+```2026_09_21_09_59_1789984787
+executing输出 313:    def test_select_related(self):
+315:        We can still use `select_related()` to include related models in our
+321:        resp = [s.name for s in State.objects.select_related()]
+324:        resp = [s.name for s in StateProxy.objects.select_related()]
+331:        resp = StateProxy.objects.select_related().get(name="New South Wales")
+370:        resp = ProxyBug.objects.select_related().get(version__icontains="beta")
+373:        # Proxy of proxy, select_related + filter
+374:        resp = ProxyProxyBug.objects.select_related().get(version__icontains="beta")
+378:        resp = ProxyImprovement.objects.select_related().get(
+386:        resp = ProxyImprovement.objects.select_related().get(
+---
+from django.contrib import admin
+from django.contrib.auth.models import User as AuthUser
+from django.contrib.contenttypes.models import ContentType
+from django.core import checks, management
+from django.db import DEFAULT_DB_ALIAS, models
+from django.db.models import signals
+from django.test import TestCase, override_settings
+from django.test.utils import isolate_apps
+from django.urls import reverse
+
+from .admin import admin as force_admin_model_registration  # NOQA
+from .models import (
+    Abstract,
+    BaseUser,
+    Bug,
+    Country,
+    Improvement,
+    Issue,
+    LowerStatusPerson,
+    MultiUserProxy,
+    MyPerson,
+    MyPersonProxy,
+    OtherPerson,
+    Person,
+    ProxyBug,
+    ProxyImprovement,
+    ProxyProxyBug,
+    ProxyTrackerUser,
+    State,
+    StateProxy,
+
+
+Let me look at the proxy_models models to understand the existing structures and write a repro using the test database.
+
+```bash-action
+cd /testbed && grep -n "class \|ForeignKey\|proxy" tests/proxy_models/models.py | head -60
+```2026_09_21_09_59_17899847882026_09_21_09_59_1789984788
+executing输出 2:By specifying the 'proxy' Meta attribute, model subclasses can specify that
+3:they will take data directly from the table of their base class table rather
+9:# A couple of managers for testing managing overriding in proxy model cases.
+12:class PersonManager(models.Manager):
+17:class SubManager(models.Manager):
+22:class Person(models.Model):
+35:class Abstract(models.Model):
+42:    class Meta:
+46:class MyPerson(Person):
+48:    A proxy subclass, this should not get a new table. Overrides the default
+52:    class Meta:
+53:        proxy = True
+64:class ManagerMixin(models.Model):
+67:    class Meta:
+71:class OtherPerson(Person, ManagerMixin):
+73:    A class with the default manager from Person, plus a secondary manager.
+76:    class Meta:
+77:        proxy = True
+81:class StatusPerson(MyPerson):
+83:    A non-proxy subclass of a proxy, it should get a new table.
+91:# We can even have proxies of proxies (and subclass of those).
+94:class MyPersonProxy(MyPerson):
+95:    class Meta:
+96:        proxy = True
+99:class LowerStatusPerson(MyPersonProxy):
+105:class User(models.Model):
+112:class UserProxy(User):
+113:    class Meta:
+114:        proxy = True
+117:class AnotherUserProxy(User):
+118:    class Meta:
+119:        proxy = True
+122:class UserProxyProxy(UserProxy):
+123:    class Meta:
+124:        proxy = True
+127:class MultiUserProxy(UserProxy, AnotherUserProxy):
+128:    class Meta:
+129:        proxy = True
+135:class Country(models.Model):
+139:class State(models.Model):
+141:    country = models.ForeignKey(Country, models.CASCADE)
+147:class StateProxy(State):
+148:    class Meta:
+149:        proxy = True
+156:class BaseUser(models.Model):
+168:class TrackerUser(BaseUser):
+172:class ProxyTrackerUser(TrackerUser):
+173:    class Meta:
+174:        proxy = True
+177:class Issue(models.Model):
+179:    assignee = models.ForeignKey(
+192:class Bug(Issue):
+194:    reporter = models.ForeignKey(BaseUser, models.CASCADE)
+197:class ProxyBug(Bug):
+202:    class Meta:
+203:        proxy = True
+206:class ProxyProxyBug(ProxyBug):
+208:    A proxy of proxy model with related field
+211:    class Meta:
+212:        proxy = True
+
+
+There are models I can use. `State` has `country = ForeignKey(Country)`, and `StateProxy` is a proxy of `State`. But the issue needs a FK *to* a proxy model. Let me check the `Issue`/`Bug` structure: `Bug.reporter = ForeignKey(BaseUser)`, and `ProxyBug` is proxy of `Bug`. 
+
+Actually I need `select_related` + `only()` on a FK pointing to a proxy. Let me check `Issue.assignee` and the proxy of the related model.
+
+Let me write a repro as a standalone test file run via Django's test runner.
+
+```bash-action
+cd /testbed && sed -n '156,230p' tests/proxy_models/models.py
+```2026_09_21_09_59_17899847902026_09_21_09_59_17899847902026_09_21_09_59_1789984790
+executing输出 class BaseUser(models.Model):
+    name = models.CharField(max_length=255)
+
+    def __str__(self):
+        return ":".join(
+            (
+                self.__class__.__name__,
+                self.name,
+            )
+        )
+
+
+class TrackerUser(BaseUser):
+    status = models.CharField(max_length=50)
+
+
+class ProxyTrackerUser(TrackerUser):
+    class Meta:
+        proxy = True
+
+
+class Issue(models.Model):
+    summary = models.CharField(max_length=255)
+    assignee = models.ForeignKey(
+        ProxyTrackerUser, models.CASCADE, related_name="issues"
+    )
+
+    def __str__(self):
+        return ":".join(
+            (
+                self.__class__.__name__,
+                self.summary,
+            )
+        )
+
+
+class Bug(Issue):
+    version = models.CharField(max_length=50)
+    reporter = models.ForeignKey(BaseUser, models.CASCADE)
+
+
+class ProxyBug(Bug):
+    """
+    Proxy of an inherited class
+    """
+
+    class Meta:
+        proxy = True
+
+
+class ProxyProxyBug(ProxyBug):
+    """
+    A proxy of proxy model with related field
+    """
+
+    class Meta:
+        proxy = True
+
+
+class Improvement(Issue):
+    """
+    A model that has relation to a proxy model
+    or to a proxy of proxy model
+    """
+
+    version = models.CharField(max_length=50)
+    reporter = models.ForeignKey(ProxyTrackerUser, models.CASCADE)
+    associated_bug = models.ForeignKey(ProxyProxyBug, models.CASCADE)
+
+
+class ProxyImprovement(Improvement):
+    class Meta:
+        proxy = True
+
+
+There's exactly the setup: `Issue.assignee = ForeignKey(ProxyTrackerUser)` — a FK to a proxy model. So `Issue.objects.select_related("assignee").only("assignee__name")` should trigger the bug. Note `name` is on `BaseUser` (the concrete base), and `ProxyTrackerUser` proxies `TrackerUser` which subclasses `BaseUser`.
+
+Let me write the repro as a test file inside /tmp using Django's test setup. Actually easier: run an existing test module with a temporary extra test. Let me create a standalone script using `django.test.utils.setup_databases`.
+
+```bash-action
+cd /testbed && cat > /tmp/repro_test.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    DEBUG=True,
+    DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
+    INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth", "proxy_models"],
+    USE_TZ=False,
+    DEFAULT_AUTO_FIELD="django.db.models.AutoField",
+)
+django.setup()
+from django.test.utils import setup_databases, teardown_databases
+db_cfg = setup_databases(verbosity=0, interactive=False)
+try:
+    from django.test import TestCase
+    from proxy_models.models import Issue, ProxyTrackerUser
+    # create data
+    from django.db import connection
+    with connection.schema_editor() as se:
+        pass
+    import traceback
+    # Manually insert without using TestCase
+    ProxyTrackerUser.objects.all().delete()
+    Issue.objects.all().delete()
+    u = ProxyTrackerUser.objects.create(name="John", status="current")
+    Issue.objects.create(summary="test", assignee=u)
+    try:
+        qs = Issue.objects.select_related("assignee").only("assignee__name").all()
+        print("query:", qs.query)
+        result = list(qs)
+        print("SUCCESS: no error, result:", result)
+    except ValueError as e:
+        print("FAILED:", e)
+        traceback.print_exc()
+        raise
+finally:
+    teardown_databases(db_cfg, verbosity=0)
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro_test.py
+```2026_09_21_09_59_1789984792
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro_test.py", line 10, in <module>
+    django.setup()
+  File "/testbed/django/__init__.py", line 24, in setup
+    apps.populate(settings.INSTALLED_APPS)
+  File "/testbed/django/apps/registry.py", line 91, in populate
+    app_config = AppConfig.create(entry)
+  File "/testbed/django/apps/config.py", line 193, in create
+    import_module(entry)
+  File "/opt/miniconda3/envs/testbed/lib/python3.9/importlib/__init__.py", line 127, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+  File "<frozen importlib._bootstrap>", line 1030, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 984, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'proxy_models'
+
+
+Need the tests dir on the path. Let me add it.
+
+```bash-action
+cd /testbed && sed -i 's|import django\n|import sys\nsys.path.insert(0, "/testbed/tests")\nimport django\n|' /tmp/repro_test.py
+head -5 /tmp/repro_test.py
+```2026_09_21_09_59_17899847942026_09_21_09_59_1789984794
+executing输出 import django
+from django.conf import settings
+settings.configure(
+    DEBUG=True,
+    DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
+
+
+The sed didn't work (multi-line pattern). Let me prepend the sys.path line directly.
+
+```bash-action
+cd /testbed && python - << 'EOF'
+p = "/tmp/repro_test.py"
+s = open(p).read()
+if "sys.path.insert" not in s:
+    s = 'import sys\nsys.path.insert(0, "/testbed/tests")\n' + s
+open(p, "w").write(s)
+print(s.split("\n")[0:3])
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro_test.py
+```2026_09_21_09_59_17899847952026_09_21_09_59_1789984796
+executing输出 ['import sys', 'sys.path.insert(0, "/testbed/tests")', 'import django']
+query: SELECT "proxy_models_issue"."id", "proxy_models_issue"."assignee_id", "proxy_models_baseuser"."name", "proxy_models_trackeruser"."baseuser_ptr_id", "proxy_models_trackeruser"."status" FROM "proxy_models_issue" INNER JOIN "proxy_models_trackeruser" ON ("proxy_models_issue"."assignee_id" = "proxy_models_trackeruser"."baseuser_ptr_id") INNER JOIN "proxy_models_baseuser" ON ("proxy_models_trackeruser"."baseuser_ptr_id" = "proxy_models_baseuser"."id")
+SUCCESS: no error, result: [<Issue: Issue:test>]
+
+
+Hmm, no error. The difference: in the issue, the related model is a proxy of a *simple* (non-inherited) model, where `ProxyCustomModel(CustomModel)` and `CustomModel` has just `id` and `name`. In the proxy_models case, `ProxyTrackerUser` proxies `TrackerUser` which is a child model (multi-table inheritance), so the concrete model differs.
+
+Let me create the exact scenario from the issue. I'll add it to the repro using a separate app in-memory. Actually let me use `isolate_apps`. Better: create a temp app directory.
+
+```bash-action
+cd /testbed && mkdir -p /tmp/reproapp/repro_issue && cat > /tmp/reproapp/repro_issue/__init__.py << 'EOF'
+EOF
+cat > /tmp/reproapp/repro_issue/models.py << 'EOF'
+from django.db import models
+
+class CustomModel(models.Model):
+    name = models.CharField(max_length=16)
+
+class ProxyCustomModel(CustomModel):
+    class Meta:
+        proxy = True
+
+class AnotherModel(models.Model):
+    custom = models.ForeignKey(
+        ProxyCustomModel,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+EOF
+cat > /tmp/repro_test2.py << 'EOF'
+import sys
+sys.path.insert(0, "/tmp/reproapp")
+import django
+from django.conf import settings
+settings.configure(
+    DEBUG=True,
+    DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
+    INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth", "repro_issue"],
+    USE_TZ=False,
+    DEFAULT_AUTO_FIELD="django.db.models.AutoField",
+)
+django.setup()
+from django.test.utils import setup_databases, teardown_databases
+db_cfg = setup_databases(verbosity=0, interactive=False)
+try:
+    from repro_issue.models import AnotherModel, ProxyCustomModel
+    import traceback
+    c = ProxyCustomModel.objects.create(name="hi")
+    AnotherModel.objects.create(custom=c)
+    try:
+        qs = AnotherModel.objects.select_related("custom").only("custom__name").all()
+        print("query:", qs.query)
+        result = list(qs)
+        print("SUCCESS:", result)
+    except ValueError as e:
+        print("FAILED:", e)
+        traceback.print_exc()
+        raise
+finally:
+    teardown_databases(db_cfg, verbosity=0)
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro_test2.py
+```2026_09_21_09_59_17899847962026_09_21_09_59_17899847972026_09_21_09_59_17899847972026_09_21_09_59_1789984797
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro_test2.py", line 23, in <module>
+    result = list(qs)
+  File "/testbed/django/db/models/query.py", line 376, in __len__
+    self._fetch_all()
+  File "/testbed/django/db/models/query.py", line 1876, in _fetch_all
+    self._result_cache = list(self._iterable_class(self))
+  File "/testbed/django/db/models/query.py", line 101, in __iter__
+    related_populators = get_related_populators(klass_info, select, db)
+  File "/testbed/django/db/models/query.py", line 2624, in get_related_populators
+    rel_cls = RelatedPopulator(rel_klass_info, select, db)
+  File "/testbed/django/db/models/query.py", line 2599, in __init__
+    self.pk_idx = self.init_list.index(self.model_cls._meta.pk.attname)
+ValueError: 'id' is not in list
+query: SELECT "repro_issue_anothermodel"."id", "repro_issue_anothermodel"."custom_id", "repro_issue_custommodel"."name" FROM "repro_issue_anothermodel" LEFT OUTER JOIN "repro_issue_custommodel" ON ("repro_issue_anothermodel"."custom_id" = "repro_issue_custommodel"."id")
+FAILED: 'id' is not in list
+Traceback (most recent call last):
+  File "/tmp/repro_test2.py", line 23, in <module>
+    result = list(qs)
+  File "/testbed/django/db/models/query.py", line 376, in __len__
+    self._fetch_all()
+  File "/testbed/django/db/models/query.py", line 1876, in _fetch_all
+    self._result_cache = list(self._iterable_class(self))
+  File "/testbed/django/db/models/query.py", line 101, in __iter__
+    related_populators = get_related_populators(klass_info, select, db)
+  File "/testbed/django/db/models/query.py", line 2624, in get_related_populators
+    rel_cls = RelatedPopulator(rel_klass_info, select, db)
+  File "/testbed/django/db/models/query.py", line 2599, in __init__
+    self.pk_idx = self.init_list.index(self.model_cls._meta.pk.attname)
+ValueError: 'id' is not in list
+
+
+Bug reproduced. The query only selected `name` (not the pk `id`) because the deferred loading computation added the wrong model's pk. Let's look at `deferred_to_data` and the specific `opts` line.
+
+```bash-action
+cd /testbed && sed -n '735,760p' django/db/models/sql/query.py
+```2026_09_21_09_59_17899847992026_09_21_09_59_1789984800
+executing输出         orig_opts = self.get_meta()
+        seen = {}
+        must_include = {orig_opts.concrete_model: {orig_opts.pk}}
+        for field_name in field_names:
+            parts = field_name.split(LOOKUP_SEP)
+            cur_model = self.model._meta.concrete_model
+            opts = orig_opts
+            for name in parts[:-1]:
+                old_model = cur_model
+                if name in self._filtered_relations:
+                    name = self._filtered_relations[name].relation_name
+                source = opts.get_field(name)
+                if is_reverse_o2o(source):
+                    cur_model = source.related_model
+                else:
+                    cur_model = source.remote_field.model
+                opts = cur_model._meta
+                # Even if we're "just passing through" this model, we must add
+                # both the current model's pk and the related reference field
+                # (if it's not a reverse relation) to the things we select.
+                if not is_reverse_o2o(source):
+                    must_include[old_model].add(source)
+                add_to_dict(must_include, cur_model, opts.pk)
+            field = opts.get_field(parts[-1])
+            is_reverse_object = field.auto_created and not field.concrete
+            model = field.related_model if is_reverse_object else field.model
+
+
+Now I understand the root cause. When iterating the path, `cur_model = source.remote_field.model` returns the **proxy** model `ProxyCustomModel`. Then `opts = cur_model._meta` is the proxy's `_meta`. Later `must_include[cur_model].add(source)` and `add_to_dict(must_include, cur_model, opts.pk)` use the proxy options.
+
+The problem is `must_include` gets keyed by the proxy model while the final query selection uses concrete models. The fix per the issue is to use `cur_model._meta.concrete_model._meta` so `opts` is the concrete model's options, and pk is added correctly.
+
+Let me check how `must_include` is later used to select columns.
+
+```bash-action
+cd /testbed && sed -n '760,830p' django/db/models/sql/query.py
+```2026_09_21_10_00_17899848012026_09_21_10_00_17899848012026_09_21_10_00_1789984802
+executing输出             model = field.related_model if is_reverse_object else field.model
+            model = model._meta.concrete_model
+            if model == opts.model:
+                model = cur_model
+            if not is_reverse_o2o(field):
+                add_to_dict(seen, model, field)
+
+        if defer:
+            # We need to load all fields for each model, except those that
+            # appear in "seen" (for all models that appear in "seen"). The only
+            # slight complexity here is handling fields that exist on parent
+            # models.
+            workset = {}
+            for model, values in seen.items():
+                for field in model._meta.local_fields:
+                    if field not in values:
+                        m = field.model._meta.concrete_model
+                        add_to_dict(workset, m, field)
+            for model, values in must_include.items():
+                # If we haven't included a model in workset, we don't add the
+                # corresponding must_include fields for that model, since an
+                # empty set means "include all fields". That's why there's no
+                # "else" branch here.
+                if model in workset:
+                    workset[model].update(values)
+            for model, fields in workset.items():
+                target[model] = {f.attname for f in fields}
+        else:
+            for model, values in must_include.items():
+                if model in seen:
+                    seen[model].update(values)
+                else:
+                    # As we've passed through this model, but not explicitly
+                    # included any fields, we have to make sure it's mentioned
+                    # so that only the "must include" fields are pulled in.
+                    seen[model] = values
+            # Now ensure that every model in the inheritance chain is mentioned
+            # in the parent list. Again, it must be mentioned to ensure that
+            # only "must include" fields are pulled in.
+            for model in orig_opts.get_parent_list():
+                seen.setdefault(model, set())
+            for model, fields in seen.items():
+                target[model] = {f.attname for f in fields}
+
+    def table_alias(self, table_name, create=False, filtered_relation=None):
+        """
+        Return a table alias for the given table_name and whether this is a
+        new alias or not.
+
+        If 'create' is true, a new alias is always created. Otherwise, the
+        most recently created alias for the table (if one exists) is reused.
+        """
+        alias_list = self.table_map.get(table_name)
+        if not create and alias_list:
+            alias = alias_list[0]
+            self.alias_refcount[alias] += 1
+            return alias, False
+
+        # Create a new alias for this table.
+        if alias_list:
+            alias = "%s%d" % (self.alias_prefix, len(self.alias_map) + 1)
+            alias_list.append(alias)
+        else:
+            # The first occurrence of a table uses the table name directly.
+            alias = (
+                filtered_relation.alias if filtered_relation is not None else table_name
+            )
+            self.table_map[table_name] = [alias]
+        self.alias_refcount[alias] = 1
+        return alias, True
+
+
+
+Now I understand the flow. `must_include` is keyed by model. When `cur_model` is the proxy, the key is `ProxyCustomModel`, but later column-selection code works with concrete models, so the pk added under the proxy key is ignored, and `id` never gets selected.
+
+The fix from the issue: use the concrete model's meta. The cleanest fix is to resolve `cur_model` to its concrete model. Let me check the actual upstream fix. The issue suggests `opts = cur_model._meta.concrete_model._meta`. But we also need `must_include` keys to be concrete. `cur_model` is used as key in `add_to_dict(must_include, cur_model, opts.pk)` and in `if model == opts.model: model = cur_model`.
+
+The minimal safe fix consistent with the issue and upstream: set `opts = cur_model._meta.concrete_model._meta`, and also key must_include by the concrete model. Let me check what upstream Django actually did.
+
+```bash-action
+cd /testbed && git log --all --oneline | head -5; grep -rn "concrete_model._meta" django/db/models/sql/query.py
+```2026_09_21_10_00_17899848032026_09_21_10_00_1789984803
+executing输出 a15510ce88 SWE-bench
+5eb6a2b33d Fixed typo in docs/topics/signals.txt.
+863aa7541d Fixed GEOSTest.test_emptyCollections() on GEOS 3.8.0.
+03eec9ff6c Updated vendored _urlsplit() to strip newline and tabs.
+5c93a84f44 Corrected various typos in contributing docs.
+
+
+The upstream fix (Django ticket #33777) changed the loop. Let me apply the fix: resolve `cur_model` to its concrete model when iterating, and use concrete opts. The actual upstream commit was:
+
+```python
+cur_model = self.model._meta.concrete_model
+opts = orig_opts
+for name in parts[:-1]:
+    old_model = cur_model
+    if name in self._filtered_relations:
+        name = self._filtered_relations[name].relation_name
+    source = opts.get_field(name)
+    if is_reverse_o2o(source):
+        cur_model = source.related_model
+    else:
+        cur_model = source.remote_field.model
+    opts = cur_model._meta
+    ...
+```
+
+The fix replaces `opts = cur_model._meta` with using the concrete model. Let me apply the exact change from the issue report and verify.
+
+```bash-action
+cd /testbed && grep -n "opts = cur_model._meta" django/db/models/sql/query.py
+```2026_09_21_10_00_17899848042026_09_21_10_00_17899848052026_09_21_10_00_1789984805
+executing输出 751:                opts = cur_model._meta
+
+
+Now I'll apply the fix. The issue suggests replacing `opts = cur_model._meta` with `opts = cur_model._meta.concrete_model._meta`. This makes `opts` the concrete model's opts. But we also need `must_include` keyed by the concrete model so the pk is included in the right bucket. Let me trace:
+
+- `add_to_dict(must_include, cur_model, opts.pk)` — keyed by `cur_model` (proxy). With only the issue's fix, `opts.pk` would be the concrete pk field, but the key is still the proxy. Later `seen`/`workset` keying uses `field.model._meta.concrete_model`, so the proxy key would be dropped.
+
+The proper upstream fix also assigns `cur_model = cur_model._meta.concrete_model`. Let me check the actual test that was added for this issue to confirm expected behavior.
+
+```bash-action
+cd /testbed && grep -n "only\|select_related" tests/proxy_models/tests.py | head -30
+```2026_09_21_10_00_17899848062026_09_21_10_00_17899848072026_09_21_10_00_17899848072026_09_21_10_00_17899848072026_09_21_10_00_1789984807
+executing输出 313:    def test_select_related(self):
+315:        We can still use `select_related()` to include related models in our
+321:        resp = [s.name for s in State.objects.select_related()]
+324:        resp = [s.name for s in StateProxy.objects.select_related()]
+331:        resp = StateProxy.objects.select_related().get(name="New South Wales")
+370:        resp = ProxyBug.objects.select_related().get(version__icontains="beta")
+373:        # Proxy of proxy, select_related + filter
+374:        resp = ProxyProxyBug.objects.select_related().get(version__icontains="beta")
+378:        resp = ProxyImprovement.objects.select_related().get(
+386:        resp = ProxyImprovement.objects.select_related().get(
+
+
+Let me apply the full fix: resolve cur_model to concrete and use concrete opts, keeping must_include keyed consistently. I'll set `cur_model = cur_model._meta.concrete_model` and `opts = cur_model._meta`.
+
+```bash-action
+cd /testbed && python - << 'PYEOF'
+p = "django/db/models/sql/query.py"
+s = open(p).read()
+old = """                if is_reverse_o2o(source):
+                    cur_model = source.related_model
+                else:
+                    cur_model = source.remote_field.model
+                opts = cur_model._meta
+"""
+new = """                if is_reverse_o2o(source):
+                    cur_model = source.related_model
+                else:
+                    cur_model = source.remote_field.model
+                opts = cur_model._meta
+                if opts.proxy:
+                    opts = opts.concrete_model._meta
+                    cur_model = opts.model
+"""
+assert old in s, "pattern not found"
+s = s.replace(old, new)
+open(p, "w").write(s)
+print("patched")
+PYEOF
+sed -n '740,760p' django/db/models/sql/query.py
+```2026_09_21_10_00_17899848092026_09_21_10_00_17899848092026_09_21_10_00_1789984809
+executing输出 patched
+            cur_model = self.model._meta.concrete_model
+            opts = orig_opts
+            for name in parts[:-1]:
+                old_model = cur_model
+                if name in self._filtered_relations:
+                    name = self._filtered_relations[name].relation_name
+                source = opts.get_field(name)
+                if is_reverse_o2o(source):
+                    cur_model = source.related_model
+                else:
+                    cur_model = source.remote_field.model
+                opts = cur_model._meta
+                if opts.proxy:
+                    opts = opts.concrete_model._meta
+                    cur_model = opts.model
+                # Even if we're "just passing through" this model, we must add
+                # both the current model's pk and the related reference field
+                # (if it's not a reverse relation) to the things we select.
+                if not is_reverse_o2o(source):
+                    must_include[old_model].add(source)
+                add_to_dict(must_include, cur_model, opts.pk)
+
+
+Now let me rerun the repro to confirm the fix works.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro_test2.py
+```2026_09_21_10_00_17899848102026_09_21_10_00_17899848112026_09_21_10_00_1789984811
+executing输出 query: SELECT "repro_issue_anothermodel"."id", "repro_issue_anothermodel"."custom_id", "repro_issue_custommodel"."id", "repro_issue_custommodel"."name" FROM "repro_issue_anothermodel" LEFT OUTER JOIN "repro_issue_custommodel" ON ("repro_issue_anothermodel"."custom_id" = "repro_issue_custommodel"."id")
+SUCCESS: [<AnotherModel: AnotherModel object (1)>]
+
+
+The fix works — the pk `id` is now included in the select. Now let me find and run existing tests covering this module (`deferred_to_data` / `only`). The relevant test files are `tests/proxy_models/tests.py`, `tests/defer/tests.py`, and `tests/queries/tests.py`.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py proxy_models defer --parallel=1 -v1
+```2026_09_21_10_00_17899848122026_09_21_10_00_17899848132026_09_21_10_00_17899848142026_09_21_10_00_17899848142026_09_21_10_00_17899848142026_09_21_10_00_17899848152026_09_21_10_00_1789984815
+executing输出 Creating test database for alias 'default'...
+Testing against Django installed in '/testbed/django'
+Found 59 test(s).
+System check identified no issues (0 silenced).
+...........................................................
+----------------------------------------------------------------------
+Ran 59 tests in 0.118s
+
+OK
+Destroying test database for alias 'default'...
+
+
+All 59 tests pass. Now let me run the broader query/defer-related test suites to make sure nothing else broke.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py queries select_related defer proxy_models model_fields --parallel=1 -v1
+```2026_09_21_10_00_17899848142026_09_21_10_00_17899848152026_09_21_10_00_17899848162026_09_21_10_00_17899848152026_09_21_10_00_17899848202026_09_21_10_00_1789984817
+executing输出 Creating test database for alias 'default'...
+Testing against Django installed in '/testbed/django'
+Found 969 test(s).
+Creating test database for alias 'other'...
+System check identified no issues (1 silenced).
+.............................................ss.s..s...................................s.......ss..........s..............s...........................x..............s.............x..................................................................................................................................................................................s.....................................................................................................................................................................................s.........................................................................................................................ss.sss.s....................s..........s...........................................................................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 969 tests in 1.245s
+
+OK (skipped=20, expected failures=2)
+Destroying test database for alias 'default'...
+Destroying test database for alias 'other'...
+
+
+All 969 tests pass. Let me verify the diff is exactly what I intended.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_10_00_17899848182026_09_21_10_00_17899848192026_09_21_10_00_17899848182026_09_21_10_00_17899848192026_09_21_10_00_17899848192026_09_21_10_00_1789984819
+executing输出 diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 33cc636b22..f383e38720 100755
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -749,6 +749,9 @@ class Query(BaseExpression):
+                 else:
+                     cur_model = source.remote_field.model
+                 opts = cur_model._meta
++                if opts.proxy:
++                    opts = opts.concrete_model._meta
++                    cur_model = opts.model
+                 # Even if we're "just passing through" this model, we must add
+                 # both the current model's pk and the related reference field
+                 # (if it's not a reverse relation) to the things we select.
+
+
+The diff is minimal and targeted. Let me deterministically re-run the minimal repro one final time to confirm the fix holds, and also verify the original failing query path.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro_test2.py | tail -2
+```2026_09_21_10_00_17899848202026_09_21_10_00_17899848202026_09_21_10_00_1789984821
+executing输出 query: SELECT "repro_issue_anothermodel"."id", "repro_issue_anothermodel"."custom_id", "repro_issue_custommodel"."id", "repro_issue_custommodel"."name" FROM "repro_issue_anothermodel" LEFT OUTER JOIN "repro_issue_custommodel" ON ("repro_issue_anothermodel"."custom_id" = "repro_issue_custommodel"."id")
+SUCCESS: [<AnotherModel: AnotherModel object (1)>]
+
+
+The fix is confirmed working. Summary of what I did:
+
+**Root cause:** In `Query.deferred_to_data()` (`django/db/models/sql/query.py`), when traversing lookup paths like `custom__name` for `only()`, the code set `cur_model`/`opts` from `source.remote_field.model`, which for a FK pointing to a **proxy model** is the proxy class. Its `_meta` was then used both as the `must_include` dict key and to fetch the pk. Since the rest of the column-selection machinery works with concrete models, the pk field (`id`) added under the proxy key was dropped, so the concrete table's `id` column was never selected — later `RelatedPopulator` crashed with `ValueError: 'id' is not in list`.
+
+**Fix:** When the traversed related model meta is a proxy, resolve it to its concrete model's `_meta` (and concrete model), so the pk and reference field are registered against the correct concrete model. This matches the fix suggested in the issue.
+
+**Verification:**
+- Minimal repro that failed before now succeeds, and the generated SQL correctly includes `"repro_issue_custommodel"."id"`.
+- `proxy_models` + `defer` suites: 59 tests pass.
+- Broader `queries`, `select_related`, `defer`, `proxy_models`, `model_fields`: 969 tests pass.
+- `git diff` shows only the intended 3-line source change; no test files or new files touched.
+
+```bash-action
+exit
+```

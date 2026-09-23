@@ -1,0 +1,1057 @@
+plan-unwanted
+I'll start by exploring the repository structure to understand the codebase and locate the relevant source code.
+
+```bash-action
+cd /testbed && git log --oneline -3 && git status
+```
+executing输出 b74cd5f880 SWE-bench
+f39634ff22 Refs #32390 -- Bumped required cx_Oracle to 7.0.
+84283ab9cd Fixed #32390 -- Dropped support for Oracle 12.2 and 18c.
+On branch main
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+nothing added to commit but untracked files present (use "git add" to track)
+
+
+Let me look at the foreign key descriptor code where this issue likely lives.
+
+```bash-action
+cd /testbed && cat django/db/models/fields/related_descriptors.py | head -100
+```2026_09_21_09_51_1789984278
+executing输出 """
+Accessors for related objects.
+
+When a field defines a relation between two models, each model class provides
+an attribute to access related instances of the other model class (unless the
+reverse accessor has been disabled with related_name='+').
+
+Accessors are implemented as descriptors in order to customize access and
+assignment. This module defines the descriptor classes.
+
+Forward accessors follow foreign keys. Reverse accessors trace them back. For
+example, with the following models::
+
+    class Parent(Model):
+        pass
+
+    class Child(Model):
+        parent = ForeignKey(Parent, related_name='children')
+
+ ``child.parent`` is a forward many-to-one relation. ``parent.children`` is a
+reverse many-to-one relation.
+
+There are three types of relations (many-to-one, one-to-one, and many-to-many)
+and two directions (forward and reverse) for a total of six combinations.
+
+1. Related instance on the forward side of a many-to-one relation:
+   ``ForwardManyToOneDescriptor``.
+
+   Uniqueness of foreign key values is irrelevant to accessing the related
+   instance, making the many-to-one and one-to-one cases identical as far as
+   the descriptor is concerned. The constraint is checked upstream (unicity
+   validation in forms) or downstream (unique indexes in the database).
+
+2. Related instance on the forward side of a one-to-one
+   relation: ``ForwardOneToOneDescriptor``.
+
+   It avoids querying the database when accessing the parent link field in
+   a multi-table inheritance scenario.
+
+3. Related instance on the reverse side of a one-to-one relation:
+   ``ReverseOneToOneDescriptor``.
+
+   One-to-one relations are asymmetrical, despite the apparent symmetry of the
+   name, because they're implemented in the database with a foreign key from
+   one table to another. As a consequence ``ReverseOneToOneDescriptor`` is
+   slightly different from ``ForwardManyToOneDescriptor``.
+
+4. Related objects manager for related instances on the reverse side of a
+   many-to-one relation: ``ReverseManyToOneDescriptor``.
+
+   Unlike the previous two classes, this one provides access to a collection
+   of objects. It returns a manager rather than an instance.
+
+5. Related objects manager for related instances on the forward or reverse
+   sides of a many-to-many relation: ``ManyToManyDescriptor``.
+
+   Many-to-many relations are symmetrical. The syntax of Django models
+   requires declaring them on one side but that's an implementation detail.
+   They could be declared on the other side without any change in behavior.
+   Therefore the forward and reverse descriptors can be the same.
+
+   If you're looking for ``ForwardManyToManyDescriptor`` or
+   ``ReverseManyToManyDescriptor``, use ``ManyToManyDescriptor`` instead.
+"""
+
+from django.core.exceptions import FieldError
+from django.db import connections, router, transaction
+from django.db.models import Q, signals
+from django.db.models.query import QuerySet
+from django.db.models.query_utils import DeferredAttribute
+from django.db.models.utils import resolve_callables
+from django.utils.functional import cached_property
+
+
+class ForeignKeyDeferredAttribute(DeferredAttribute):
+    def __set__(self, instance, value):
+        if instance.__dict__.get(self.field.attname) != value and self.field.is_cached(instance):
+            self.field.delete_cached_value(instance)
+        instance.__dict__[self.field.attname] = value
+
+
+class ForwardManyToOneDescriptor:
+    """
+    Accessor to the related object on the forward side of a many-to-one or
+    one-to-one (via ForwardOneToOneDescriptor subclass) relation.
+
+    In the example::
+
+        class Child(Model):
+            parent = ForeignKey(Parent, related_name='children')
+
+    ``Child.parent`` is a ``ForwardManyToOneDescriptor`` instance.
+    """
+
+    def __init__(self, field_with_rel):
+        self.field = field_with_rel
+
+    @cached_property
+    def RelatedObjectDoesNotExist(self):
+        # The exception can't be created at initialization time since the
+
+
+Let me look at the `__set__` method of `ForwardManyToOneDescriptor` and the related `pk` handling.
+
+```bash-action
+cd /testbed && sed -n '100,220p' django/db/models/fields/related_descriptors.py
+```2026_09_21_09_51_1789984279
+executing输出         # The exception can't be created at initialization time since the
+        # related model might not be resolved yet; `self.field.model` might
+        # still be a string model reference.
+        return type(
+            'RelatedObjectDoesNotExist',
+            (self.field.remote_field.model.DoesNotExist, AttributeError), {
+                '__module__': self.field.model.__module__,
+                '__qualname__': '%s.%s.RelatedObjectDoesNotExist' % (
+                    self.field.model.__qualname__,
+                    self.field.name,
+                ),
+            }
+        )
+
+    def is_cached(self, instance):
+        return self.field.is_cached(instance)
+
+    def get_queryset(self, **hints):
+        return self.field.remote_field.model._base_manager.db_manager(hints=hints).all()
+
+    def get_prefetch_queryset(self, instances, queryset=None):
+        if queryset is None:
+            queryset = self.get_queryset()
+        queryset._add_hints(instance=instances[0])
+
+        rel_obj_attr = self.field.get_foreign_related_value
+        instance_attr = self.field.get_local_related_value
+        instances_dict = {instance_attr(inst): inst for inst in instances}
+        related_field = self.field.foreign_related_fields[0]
+        remote_field = self.field.remote_field
+
+        # FIXME: This will need to be revisited when we introduce support for
+        # composite fields. In the meantime we take this practical approach to
+        # solve a regression on 1.6 when the reverse manager in hidden
+        # (related_name ends with a '+'). Refs #21410.
+        # The check for len(...) == 1 is a special case that allows the query
+        # to be join-less and smaller. Refs #21760.
+        if remote_field.is_hidden() or len(self.field.foreign_related_fields) == 1:
+            query = {'%s__in' % related_field.name: {instance_attr(inst)[0] for inst in instances}}
+        else:
+            query = {'%s__in' % self.field.related_query_name(): instances}
+        queryset = q
+....(省略中间部分)...
+ instance's class.
+                ancestor = ancestor_link.get_cached_value(instance)
+                # The value might be cached on an ancestor if the instance
+                # originated from walking down the inheritance chain.
+                rel_obj = self.field.get_cached_value(ancestor, default=None)
+            else:
+                rel_obj = None
+            if rel_obj is None and has_value:
+                rel_obj = self.get_object(instance)
+                remote_field = self.field.remote_field
+                # If this is a one-to-one relation, set the reverse accessor
+                # cache on the related object to the current instance to avoid
+                # an extra SQL query if it's accessed later on.
+                if not remote_field.multiple:
+                    remote_field.set_cached_value(rel_obj, instance)
+            self.field.set_cached_value(instance, rel_obj)
+
+        if rel_obj is None and not self.field.null:
+            raise self.RelatedObjectDoesNotExist(
+                "%s has no %s." % (self.field.model.__name__, self.field.name)
+            )
+        else:
+            return rel_obj
+
+    def __set__(self, instance, value):
+        """
+        Set the related instance through the forward relation.
+
+        With the example above, when setting ``child.parent = parent``:
+
+        - ``self`` is the descriptor managing the ``parent`` attribute
+        - ``instance`` is the ``child`` instance
+        - ``value`` is the ``parent`` instance on the right of the equal sign
+        """
+        # An object must be an instance of the related class.
+        if value is not None and not isinstance(value, self.field.remote_field.model._meta.concrete_model):
+            raise ValueError(
+                'Cannot assign "%r": "%s.%s" must be a "%s" instance.' % (
+                    value,
+                    instance._meta.object_name,
+                    self.field.name,
+                    self.field.remote_field.model._meta.object_name,
+
+
+```bash-action
+cd /testbed && sed -n '220,300p' django/db/models/fields/related_descriptors.py
+```2026_09_21_09_51_17899842802026_09_21_09_51_1789984280
+executing输出                     self.field.remote_field.model._meta.object_name,
+                )
+            )
+        elif value is not None:
+            if instance._state.db is None:
+                instance._state.db = router.db_for_write(instance.__class__, instance=value)
+            if value._state.db is None:
+                value._state.db = router.db_for_write(value.__class__, instance=instance)
+            if not router.allow_relation(value, instance):
+                raise ValueError('Cannot assign "%r": the current database router prevents this relation.' % value)
+
+        remote_field = self.field.remote_field
+        # If we're setting the value of a OneToOneField to None, we need to clear
+        # out the cache on any old related object. Otherwise, deleting the
+        # previously-related object will also cause this object to be deleted,
+        # which is wrong.
+        if value is None:
+            # Look up the previously-related object, which may still be available
+            # since we've not yet cleared out the related field.
+            # Use the cache directly, instead of the accessor; if we haven't
+            # populated the cache, then we don't care - we're only accessing
+            # the object to invalidate the accessor cache, so there's no
+            # need to populate the cache just to expire it again.
+            related = self.field.get_cached_value(instance, default=None)
+
+            # If we've got an old related object, we need to clear out its
+            # cache. This cache also might not exist if the related object
+            # hasn't been accessed yet.
+            if related is not None:
+                remote_field.set_cached_value(related, None)
+
+            for lh_field, rh_field in self.field.related_fields:
+                setattr(instance, lh_field.attname, None)
+
+        # Set the values of the related field.
+        else:
+            for lh_field, rh_field in self.field.related_fields:
+                setattr(instance, lh_field.attname, getattr(value, rh_field.attname))
+
+        # Set the related instance cache used by __get__ to avoid an SQL query
+        # when accessing the attribute we just set.
+        self.field.set_cached_value(instance, value)
+
+        # If this is a one-to-one relation, set the reverse accessor cache on
+        # the related object to the current instance to avoid an extra SQL
+        # query if it's accessed later on.
+        if value is not None and not remote_field.multiple:
+            remote_field.set_cached_value(value, instance)
+
+    def __reduce__(self):
+        """
+        Pickling should return the instance attached by self.field on the
+        model, not a new copy of that descriptor. Use getattr() to retrieve
+        the instance directly from the model.
+        """
+        return getattr, (self.field.model, self.field.name)
+
+
+class ForwardOneToOneDescriptor(ForwardManyToOneDescriptor):
+    """
+    Accessor to the related object on the forward side of a one-to-one relation.
+
+    In the example::
+
+        class Restaurant(Model):
+            place = OneToOneField(Place, related_name='restaurant')
+
+    ``Restaurant.place`` is a ``ForwardOneToOneDescriptor`` instance.
+    """
+
+    def get_object(self, instance):
+        if self.field.remote_field.parent_link:
+            deferred = instance.get_deferred_fields()
+            # Because it's a parent link, all the data is available in the
+            # instance, so populate the parent model with this data.
+            rel_model = self.field.remote_field.model
+            fields = [field.attname for field in rel_model._meta.concrete_fields]
+
+            # If any of the related model's fields are deferred, fallback to
+            # fetching all fields from the related model. This avoids a query
+            # on the related model for every deferred field.
+
+
+I found the root cause. In `__set__`, the related field values are copied from `value` at assignment time:
+
+```python
+for lh_field, rh_field in self.field.related_fields:
+    setattr(instance, lh_field.attname, getattr(value, rh_field.attname))
+```
+
+When `value` is an unsaved `Product()` with empty `sku`, `product_id` gets set to `""`. Later, `order.product.sku = "foo"` and `save()` changes the pk, but `order.product_id` still holds the stale `""`.
+
+Let me first create a minimal reproduction script to confirm the bug.
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+)
+django.setup()
+from django.db import models, connection
+
+class Product(models.Model):
+    sku = models.CharField(primary_key=True, max_length=50)
+    class Meta:
+        app_label = 'auth'
+
+class Order(models.Model):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    class Meta:
+        app_label = 'auth'
+
+with connection.schema_editor() as se:
+    se.create_model(Product)
+    se.create_model(Order)
+
+order = Order()
+order.product = Product()
+order.product.sku = "foo"
+order.product.save()
+order.save()
+print("product_id set at child save:", repr(Order.objects.get().product_id))
+EOF
+python /tmp/repro.py
+```2026_09_21_09_51_17899842802026_09_21_09_51_1789984281
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 1, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+```bash-action
+cd /testbed && python -c "import sys; print(sys.executable)" && ls
+```2026_09_21_09_51_1789984281
+executing输出 /opt/miniconda3/bin/python
+AUTHORS
+CONTRIBUTING.rst
+Django.egg-info
+Gruntfile.js
+INSTALL
+LICENSE
+LICENSE.python
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+django
+docs
+extras
+js_tests
+llm.py
+package.json
+scripts
+setup.cfg
+setup.py
+system_prompt.txt
+tests
+tox.ini
+
+
+The current dir isn't auto-added. Let me run with the testbed in path.
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_09_51_17899842822026_09_21_09_51_1789984282
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 7, in <module>
+    django.setup()
+  File "/testbed/django/__init__.py", line 14, in setup
+    from django.apps import apps
+  File "/testbed/django/apps/__init__.py", line 1, in <module>
+    from .config import AppConfig
+  File "/testbed/django/apps/config.py", line 7, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+The system python doesn't have dependencies. The environment must be a specific one. Let me check for a venv or how tests are run.
+
+```bash-action
+cd /testbed && ls /opt/miniconda3/envs 2>/dev/null; which -a python python3; cat tox.ini | grep -i envlist | head
+```2026_09_21_09_51_17899842842026_09_21_09_51_17899842852026_09_21_09_51_17899842852026_09_21_09_51_1789984285
+executing输出 testbed
+/opt/miniconda3/bin/python
+/usr/bin/python
+/bin/python
+/opt/miniconda3/bin/python3
+/usr/bin/python3
+/bin/python3
+envlist =
+
+
+There's a `testbed` conda env. Let me use it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_51_17899842852026_09_21_09_51_17899842862026_09_21_09_51_1789984286
+executing输出 Traceback (most recent call last):
+  File "/testbed/django/db/backends/utils.py", line 84, in _execute
+    return self.cursor.execute(sql, params)
+  File "/testbed/django/db/backends/sqlite3/base.py", line 422, in execute
+    return Database.Cursor.execute(self, query, params)
+sqlite3.IntegrityError: FOREIGN KEY constraint failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/tmp/repro.py", line 28, in <module>
+    order.save()
+  File "/testbed/django/db/models/base.py", line 726, in save
+    self.save_base(using=using, force_insert=force_insert,
+  File "/testbed/django/db/models/base.py", line 763, in save_base
+    updated = self._save_table(
+  File "/testbed/django/db/models/base.py", line 868, in _save_table
+    results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+  File "/testbed/django/db/models/base.py", line 906, in _do_insert
+    return manager._insert(
+  File "/testbed/django/db/models/manager.py", line 85, in manager_method
+    return getattr(self.get_queryset(), name)(*args, **kwargs)
+  File "/testbed/django/db/models/query.py", line 1268, in _insert
+    return query.get_compiler(using=using).execute_sql(returning_fields)
+  File "/testbed/django/db/models/sql/compiler.py", line 1410, in execute_sql
+    cursor.execute(sql, params)
+  File "/testbed/django/db/backends/utils.py", line 66, in execute
+    return self._execute_with_wrappers(sql, params, many=False, executor=self._execute)
+  File "/testbed/django/db/backends/utils.py", line 75, in _execute_with_wrappers
+    return executor(sql, params, many, context)
+  File "/testbed/django/db/backends/utils.py", line 84, in _execute
+    return self.cursor.execute(sql, params)
+  File "/testbed/django/db/utils.py", line 90, in __exit__
+    raise dj_exc_value.with_traceback(traceback) from exc_value
+  File "/testbed/django/db/backends/utils.py", line 84, in _execute
+    return self.cursor.execute(sql, params)
+  File "/testbed/django/db/backends/sqlite3/base.py", line 422, in execute
+    return Database.Cursor.execute(self, query, params)
+django.db.utils.IntegrityError: FOREIGN KEY constraint failed
+
+
+The bug is confirmed: `product_id` is set to `""` at assignment, so `order.save()` fails FK constraint. Now let me look at the `related_fields` and how the copy happens. The fix needs to re-sync the FK value when the related object's pk is set/saved, or defer copying until save.
+
+Let me look at how the Django project actually fixed this. The known fix (Django ticket #30046) modified `__set__` to copy from the related instance only if the value is saved, otherwise set the pk attribute but keep the cache reference. Actually, let me check the `related_fields` and `foreign_related_fields`.
+
+```bash-action
+cd /testbed && grep -n "related_fields\|foreign_related_fields\|local_related_fields" django/db/models/fields/related.py | head -30
+```2026_09_21_09_51_17899842862026_09_21_09_51_17899842872026_09_21_09_51_17899842872026_09_21_09_51_1789984287
+executing输出 340:            for _, rh_field in self.related_fields
+352:            for lh_field, rh_field in self.related_fields
+515:            self.foreign_related_fields
+519:        if not self.foreign_related_fields:
+535:        foreign_fields = {f.name for f in self.foreign_related_fields}
+538:        if not has_unique_constraint and len(self.foreign_related_fields) > 1:
+540:                "'%s'" % rel_field.name for rel_field in self.foreign_related_fields
+558:            field_name = self.foreign_related_fields[0].name
+611:    def resolve_related_fields(self):
+616:        related_fields = []
+627:            related_fields.append((from_field, to_field))
+628:        return related_fields
+631:    def related_fields(self):
+632:        return self.resolve_related_fields()
+635:    def reverse_related_fields(self):
+636:        return [(rhs_field, lhs_field) for lhs_field, rhs_field in self.related_fields]
+639:    def local_related_fields(self):
+640:        return tuple(lhs_field for lhs_field, rhs_field in self.related_fields)
+643:    def foreign_related_fields(self):
+644:        return tuple(rhs_field for lhs_field, rhs_field in self.related_fields if rhs_field)
+647:        return self.get_instance_value_for_fields(instance, self.local_related_fields)
+650:        return self.get_instance_value_for_fields(instance, self.foreign_related_fields)
+675:        source = self.reverse_related_fields if reverse_join else self.related_fields
+717:            target_fields=self.foreign_related_fields,
+897:        return self.foreign_related_fields[0]
+935:    def resolve_related_fields(self):
+936:        related_fields = super().resolve_related_fields()
+937:        for from_field, to_field in related_fields:
+948:        return related_fields
+
+
+Now let me check how tests exist for this. Let me find the actual Django fix. The fix in `__set__` should set the cached value and NOT eagerly copy unsaved pk if the value has no pk. Let me look at the actual Django commit for this issue (#30046). Let me check the test file for related descriptors.
+
+```bash-action
+cd /testbed && grep -rn "product_id\|sku\|non-numeric\|non_numeric\|CharField(primary_key" tests/foreign_keys/ | head
+```2026_09_21_09_51_17899842882026_09_21_09_51_17899842892026_09_21_09_51_17899842892026_09_21_09_51_17899842892026_09_21_09_51_1789984289
+executing输出 grep: tests/foreign_keys/: No such file or directory
+
+
+```bash-action
+cd /testbed && ls tests/ | grep -i foreign; ls tests/ | grep -i relation
+```2026_09_21_09_51_17899842892026_09_21_09_51_1789984289
+executing输出 foreign_object
+nested_foreign_keys
+filtered_relation
+generic_relations
+generic_relations_regress
+
+
+```bash-action
+cd /testbed && ls tests/model_fields/ | head; ls tests/ | grep -i "many_to\|one_to\|foreignkey\|pk"
+```2026_09_21_09_51_1789984290
+executing输出 4x8.png
+8x4.png
+__init__.py
+models.py
+test_autofield.py
+test_binaryfield.py
+test_booleanfield.py
+test_charfield.py
+test_datetimefield.py
+test_decimalfield.py
+custom_pk
+many_to_many
+many_to_one
+many_to_one_null
+one_to_one
+
+
+The test is likely in `tests/many_to_one`. Let me check it.
+
+```bash-action
+cd /testbed && ls tests/many_to_one/ && grep -n "non_numeric\|non-numeric\|CharField(primary_key\|pk=pk\|related\.fields\|empty" tests/many_to_one/tests.py | head
+```2026_09_21_09_51_17899842912026_09_21_09_51_17899842922026_09_21_09_51_17899842922026_09_21_09_51_17899842922026_09_21_09_51_17899842922026_09_21_09_51_1789984293
+executing输出 __init__.py
+models.py
+tests.py
+
+
+```bash-action
+cd /testbed && cat tests/many_to_one/models.py
+```2026_09_21_09_51_17899842922026_09_21_09_51_1789984292
+executing输出 """
+Many-to-one relationships
+
+To define a many-to-one relationship, use ``ForeignKey()``.
+"""
+from django.db import models
+
+
+class Reporter(models.Model):
+    first_name = models.CharField(max_length=30)
+    last_name = models.CharField(max_length=30)
+    email = models.EmailField()
+
+    def __str__(self):
+        return "%s %s" % (self.first_name, self.last_name)
+
+
+class Article(models.Model):
+    headline = models.CharField(max_length=100)
+    pub_date = models.DateField()
+    reporter = models.ForeignKey(Reporter, models.CASCADE)
+
+    class Meta:
+        ordering = ('headline',)
+
+    def __str__(self):
+        return self.headline
+
+
+class Country(models.Model):
+    id = models.SmallAutoField(primary_key=True)
+    name = models.CharField(max_length=50)
+
+
+class City(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    country = models.ForeignKey(Country, models.CASCADE, related_name='cities', null=True)
+    name = models.CharField(max_length=50)
+
+
+class District(models.Model):
+    city = models.ForeignKey(City, models.CASCADE, related_name='districts', null=True)
+    name = models.CharField(max_length=50)
+
+    def __str__(self):
+        return self.name
+
+
+# If ticket #1578 ever slips back in, these models will not be able to be
+# created (the field names being lowercased versions of their opposite classes
+# is important here).
+class First(models.Model):
+    second = models.IntegerField()
+
+
+class Second(models.Model):
+    first = models.ForeignKey(First, models.CASCADE, related_name='the_first')
+
+
+# Protect against repetition of #1839, #2415 and #2536.
+class Third(models.Model):
+    name = models.CharField(max_length=20)
+    third = models.ForeignKey('self', models.SET_NULL, null=True, related_name='child_set')
+
+
+class Parent(models.Model):
+    name = models.CharField(max_length=20, unique=True)
+    bestchild = models.ForeignKey('Child', models.SET_NULL, null=True, related_name='favored_by')
+
+
+class Child(models.Model):
+    name = models.CharField(max_length=20)
+    parent = models.ForeignKey(Parent, models.CASCADE)
+
+
+class ChildNullableParent(models.Model):
+    parent = models.ForeignKey(Parent, models.CASCADE, null=True)
+
+
+class ToFieldChild(models.Model):
+    parent = models.ForeignKey(Parent, models.CASCADE, to_field='name', related_name='to_field_children')
+
+
+# Multiple paths to the same model (#7110, #7125)
+class Category(models.Model):
+    name = models.CharField(max_length=20)
+
+    def __str__(self):
+        return self.name
+
+
+class Record(models.Model):
+    category = models.ForeignKey(Category, models.CASCADE)
+
+
+class Relation(models.Model):
+    left = models.ForeignKey(Record, models.CASCADE, related_name='left_set')
+    right = models.ForeignKey(Record, models.CASCADE, related_name='right_set')
+
+    def __str__(self):
+        return "%s - %s" % (self.left.category.name, self.right.category.name)
+
+
+# Test related objects visibility.
+class SchoolManager(models.Manager):
+    def get_queryset(self):
+        return super().get_queryset().filter(is_public=True)
+
+
+class School(models.Model):
+    is_public = models.BooleanField(default=False)
+    objects = SchoolManager()
+
+
+class Student(models.Model):
+    school = models.ForeignKey(School, models.CASCADE)
+
+
+Now I understand the models. The fix: in `ForwardManyToOneDescriptor.__set__`, when the related `value` doesn't have a pk yet (unsaved with empty pk), we should not eagerly copy the empty pk. Instead we should keep the cache and let it get populated at save time.
+
+The actual Django fix (commit for #30046) changed `__set__` to set the cache and only copy the FK value if the related object has a value. Let me look at the actual approach — the cleanest fix that Django adopted: in `Model.save()`, re-sync related cached objects. But the minimal targeted fix is in `__set__`: only assign the local fields if the remote field value is set, otherwise leave as-is but cache the object.
+
+Wait, but then `order.product_id` would remain its default (None/empty). Let me check the real Django fix. Let me look at how `save()` handles it and check git history context.
+
+Let me search Django's fix approach by looking at the save logic and `_prepare_related_fields_for_save`.
+
+```bash-action
+cd /testbed && grep -n "_prepare_related_fields_for_save\|prepare_related\|related_object" django/db/models/base.py | head -20
+```2026_09_21_09_51_17899842932026_09_21_09_51_1789984294
+executing输出 451:            is_related_object = False
+460:                        is_related_object = True
+479:            if is_related_object:
+649:        for field in self._meta.related_objects:
+682:        self._prepare_related_fields_for_save(operation_name='save')
+911:    def _prepare_related_fields_for_save(self, operation_name):
+1853:            for f in chain(opts.fields, opts.related_objects)
+
+
+```bash-action
+cd /testbed && sed -n '911,970p' django/db/models/base.py
+```2026_09_21_09_51_17899842952026_09_21_09_51_17899842962026_09_21_09_51_17899842962026_09_21_09_51_17899842962026_09_21_09_51_17899842962026_09_21_09_51_1789984297
+executing输出     def _prepare_related_fields_for_save(self, operation_name):
+        # Ensure that a model instance without a PK hasn't been assigned to
+        # a ForeignKey or OneToOneField on this model. If the field is
+        # nullable, allowing the save would result in silent data loss.
+        for field in self._meta.concrete_fields:
+            # If the related field isn't cached, then an instance hasn't been
+            # assigned and there's no need to worry about this check.
+            if field.is_relation and field.is_cached(self):
+                obj = getattr(self, field.name, None)
+                if not obj:
+                    continue
+                # A pk may have been assigned manually to a model instance not
+                # saved to the database (or auto-generated in a case like
+                # UUIDField), but we allow the save to proceed and rely on the
+                # database to raise an IntegrityError if applicable. If
+                # constraints aren't supported by the database, there's the
+                # unavoidable risk of data corruption.
+                if obj.pk is None:
+                    # Remove the object from a related instance cache.
+                    if not field.remote_field.multiple:
+                        field.remote_field.delete_cached_value(obj)
+                    raise ValueError(
+                        "%s() prohibited to prevent data loss due to unsaved "
+                        "related object '%s'." % (operation_name, field.name)
+                    )
+                elif getattr(self, field.attname) is None:
+                    # Use pk from related object if it has been saved after
+                    # an assignment.
+                    setattr(self, field.attname, obj.pk)
+                # If the relationship's pk/to_field was changed, clear the
+                # cached relationship.
+                if getattr(obj, field.target_field.attname) != getattr(self, field.attname):
+                    field.delete_cached_value(self)
+
+    def delete(self, using=None, keep_parents=False):
+        using = using or router.db_for_write(self.__class__, instance=self)
+        assert self.pk is not None, (
+            "%s object can't be deleted because its %s attribute is set to None." %
+            (self._meta.object_name, self._meta.pk.attname)
+        )
+
+        collector = Collector(using=using)
+        collector.collect([self], keep_parents=keep_parents)
+        return collector.delete()
+
+    delete.alters_data = True
+
+    def _get_FIELD_display(self, field):
+        value = getattr(self, field.attname)
+        choices_dict = dict(make_hashable(field.flatchoices))
+        # force_str() to coerce lazy strings.
+        return force_str(choices_dict.get(make_hashable(value), value), strings_only=True)
+
+    def _get_next_or_previous_by_FIELD(self, field, is_next, **kwargs):
+        if not self.pk:
+            raise ValueError("get_next/get_previous cannot be used on unsaved objects.")
+        op = 'gt' if is_next else 'lt'
+        order = '' if is_next else '-'
+        param = getattr(self, field.attname)
+        q = Q(**{'%s__%s' % (field.name, op): param})
+
+
+I found the exact bug. Look at:
+
+```python
+elif getattr(self, field.attname) is None:
+    # Use pk from related object if it has been saved after
+    # an assignment.
+    setattr(self, field.attname, obj.pk)
+```
+
+This only re-syncs the pk when `field.attname` is `None`. But for a non-numeric pk like `CharField`, the eager copy in `__set__` set `product_id = ""` (empty string, not `None`). So this branch is skipped. The comment says "Use pk from related object if it has been saved after an assignment."
+
+The correct fix per Django (commit) is to also re-sync when the stored FK value doesn't match the related object's pk — i.e., the `else` branch handling. Actually the real Django fix for #30046 was exactly to change this `elif` condition. Let me check the actual known fix:
+
+The fix changed:
+```python
+elif getattr(self, field.attname) is None:
+```
+to also handle the case where the pk was changed. The proper fix: always set the attname from obj.pk when the FK is a to-field and the value isn't set correctly.
+
+Let me think about the semantics. The eager copy in `__set__` copies `obj.sku` which was `""` at that moment. After `obj.save()`, `obj.sku` is `"foo"`, but `self.product_id` is `""`.
+
+The condition `getattr(self, field.attname) is None` fails because it's `""`. We want to also handle this. The Django fix (commit `278b6187d8` "Fixed #30046 -- Fixed ...") actually was in `_prepare_related_fields_for_save`:
+
+```python
+if getattr(obj, field.target_field.attname) != getattr(self, field.attname):
+    field.delete_cached_value(self)
+```
+No, that just clears cache.
+
+Let me reconsider. The actual real fix for this specific issue is in `related_descriptors.py.__set__`. Django changed it so that when the value's pk is not yet set (empty), the FK value is left unset instead of set to empty string. Let me look at the actual upstream fix. The issue number here references "Saving parent object after setting on child". Let me check the git blame / find the commit in Django history isn't available. Let me reason about the correct minimal fix.
+
+The eager copy at `__set__` copies the related object's pk. If the related object is not yet saved (pk is empty/None), the copied value will be wrong later. The robust fix: in `_prepare_related_fields_for_save`, always sync the FK attname from the cached related object when the related object has a pk, not just when attname is None.
+
+Let me change the `elif` to also cover the empty-string/mismatch case. The safest: replace the condition to check whether `self.field.attname` value differs from `obj.pk`. But there's nuanced handling for to_field.
+
+Let me look at the actual Django fix. I recall the real fix was in `Model.save()`/`_prepare_related_fields_for_save`. Let me look at `field.related_fields` to sync all local fields.
+
+The cleanest correct fix: sync using the related field mapping. Let me modify `_prepare_related_fields_for_save` so it always updates the local related field values from the related object when the related object has been saved.
+
+Let me check what `field.target_field` and `field.attname` are, and `field.related_fields`.
+
+Actually, let me look at the real upstream fix which I believe added this to `_prepare_related_fields_for_save`:
+
+```python
+# If the related field isn't cached, then an instance hasn't been
+# assigned and there's no need to worry about this check.
+if field.is_relation and field.is_cached(self):
+    obj = getattr(self, field.name, None)
+    ...
+    if obj.pk is None:
+        ...
+        raise ValueError(...)
+    elif getattr(self, field.attname) != getattr(obj, field.target_field.attname):
+        # obj.pk may differ from the assigned value (e.g. the related
+        # object was saved after assignment). Update it.
+        setattr(self, field.attname, getattr(obj, field.target_field.attname))
+```
+
+But wait, for the normal (numeric auto pk) case, `getattr(self, field.attname) is None` handles the "assigned then saved" scenario. For non-numeric, the value is `""` not `None`, so we need the comparison.
+
+Let me implement the fix to use `field.target_field.attname` for the comparison and update.
+
+```bash-action
+cd /testbed && sed -n '925,942p' django/db/models/base.py
+```2026_09_21_09_51_17899842972026_09_21_09_51_1789984297
+executing输出                 # database to raise an IntegrityError if applicable. If
+                # constraints aren't supported by the database, there's the
+                # unavoidable risk of data corruption.
+                if obj.pk is None:
+                    # Remove the object from a related instance cache.
+                    if not field.remote_field.multiple:
+                        field.remote_field.delete_cached_value(obj)
+                    raise ValueError(
+                        "%s() prohibited to prevent data loss due to unsaved "
+                        "related object '%s'." % (operation_name, field.name)
+                    )
+                elif getattr(self, field.attname) is None:
+                    # Use pk from related object if it has been saved after
+                    # an assignment.
+                    setattr(self, field.attname, obj.pk)
+                # If the relationship's pk/to_field was changed, clear the
+                # cached relationship.
+                if getattr(obj, field.target_field.attname) != getattr(self, field.attname):
+
+
+Now I understand the whole block. Let me apply the fix: change the `elif` condition so that when the FK value doesn't match the related object's target field value, we re-sync it (not only when it's `None`).
+
+The current logic:
+```python
+elif getattr(self, field.attname) is None:
+    # Use pk from related object if it has been saved after
+    # an assignment.
+    setattr(self, field.attname, obj.pk)
+```
+
+For a non-numeric pk, after `__set__`, `self.product_id == ""` (not None), so this misses. And then the next `if` clears the cache because `obj.sku ("foo") != self.product_id ("")`.
+
+The fix: sync the local field value whenever it differs from the related object's target field value.
+
+```bash-action
+cd /testbed && python - << 'EOF'
+import re
+p = 'django/db/models/base.py'
+s = open(p).read()
+old = """                elif getattr(self, field.attname) is None:
+                    # Use pk from related object if it has been saved after
+                    # an assignment.
+                    setattr(self, field.attname, obj.pk)
+                # If the relationship's pk/to_field was changed, clear the
+                # cached relationship.
+                if getattr(obj, field.target_field.attname) != getattr(self, field.attname):
+                    field.delete_cached_value(self)"""
+new = """                elif getattr(self, field.attname) != getattr(obj, field.target_field.attname):
+                    # Use pk from related object if it has been saved after
+                    # an assignment.
+                    setattr(self, field.attname, obj.pk)
+                # If the relationship's pk/to_field was changed, clear the
+                # cached relationship.
+                if getattr(obj, field.target_field.attname) != getattr(self, field.attname):
+                    field.delete_cached_value(self)"""
+assert old in s, "old block not found"
+s = s.replace(old, new)
+open(p, 'w').write(s)
+print("patched")
+EOF
+```2026_09_21_09_51_17899843012026_09_21_09_51_17899843022026_09_21_09_51_1789984302
+executing输出 patched
+
+
+Now let me run the reproduction script again to confirm the fix.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_51_17899843042026_09_21_09_51_17899843052026_09_21_09_51_17899843052026_09_21_09_51_17899843062026_09_21_09_51_1789984305
+executing输出 product_id set at child save: 'foo'
+
+
+The fix works. `product_id` is now `'foo'` instead of `''`. Now let me run the existing tests that cover this module.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py many_to_one --verbosity=1 2>&1 | tail -20
+```2026_09_21_09_51_17899843052026_09_21_09_51_17899843062026_09_21_09_51_17899843062026_09_21_09_51_17899843062026_09_21_09_51_17899843062026_09_21_09_51_17899843062026_09_21_09_51_1789984307
+executing输出 Testing against Django installed in '/testbed/django' with up to 16 processes
+Creating test database for alias 'default'...
+System check identified no issues (0 silenced).
+....................................
+----------------------------------------------------------------------
+Ran 36 tests in 0.059s
+
+OK
+Destroying test database for alias 'default'...
+
+
+All 36 tests pass. Let me run additional related test modules to make sure I didn't break anything with the changed condition.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py one_to_one nested_foreign_keys model_fields foreign_object --verbosity=1 2>&1 | tail -20
+```2026_09_21_09_51_17899843072026_09_21_09_51_17899843072026_09_21_09_51_17899843082026_09_21_09_51_17899843082026_09_21_09_51_17899843082026_09_21_09_51_17899843082026_09_21_09_51_17899843082026_09_21_09_51_1789984308
+executing输出 Ran 495 tests in 0.182s
+
+OK (skipped=10)
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+All 495 tests pass. Let me also run the tests for the model save logic to be thorough.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py model_inheritance model_forms many_to_many_null --verbosity=1 2>&1 | tail -6
+```2026_09_21_09_51_17899843092026_09_21_09_51_17899843092026_09_21_09_51_17899843092026_09_21_09_51_17899843102026_09_21_09_51_1789984309
+executing输出 Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+Destroying test database for alias 'default'...
+
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py model_inheritance model_forms many_to_many_null --verbosity=1 2>&1 | grep -E "^(Ran|OK|FAILED|ERROR)"
+```2026_09_21_09_51_17899843112026_09_21_09_51_17899843112026_09_21_09_51_17899843112026_09_21_09_51_17899843122026_09_21_09_51_17899843112026_09_21_09_51_1789984312
+executing输出 ERROR: many_to_many_null (unittest.loader._FailedTest)
+Ran 224 tests in 0.127s
+FAILED (errors=1)
+
+
+That error is just because `many_to_many_null` isn't a valid test module name. Let me verify by checking and running the valid ones.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py model_inheritance model_forms --verbosity=1 2>&1 | grep -E "^(Ran|OK|FAILED|ERROR)"
+```2026_09_21_09_51_17899843132026_09_21_09_51_17899843132026_09_21_09_51_17899843132026_09_21_09_51_17899843142026_09_21_09_51_17899843132026_09_21_09_51_1789984313
+executing输出 Ran 223 tests in 0.138s
+OK
+
+
+All tests pass. Now let me verify the diff is exactly what I want.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_51_17899843152026_09_21_09_51_17899843152026_09_21_09_51_17899843152026_09_21_09_51_17899843162026_09_21_09_51_17899843152026_09_21_09_51_17899843162026_09_21_09_51_1789984316
+executing输出 diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 2428218696..50d06920b9 100755
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -933,7 +933,7 @@ class Model(metaclass=ModelBase):
+                         "%s() prohibited to prevent data loss due to unsaved "
+                         "related object '%s'." % (operation_name, field.name)
+                     )
+-                elif getattr(self, field.attname) is None:
++                elif getattr(self, field.attname) != getattr(obj, field.target_field.attname):
+                     # Use pk from related object if it has been saved after
+                     # an assignment.
+                     setattr(self, field.attname, obj.pk)
+
+
+The diff is exactly what I intended — a single-line condition change. Let me verify the reproduction once more with the exact issue scenario including the assertions, to be fully confident.
+
+```bash-action
+cd /testbed && cat > /tmp/repro2.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
+)
+django.setup()
+from django.db import models, connection
+
+class Product(models.Model):
+    sku = models.CharField(primary_key=True, max_length=50)
+    class Meta:
+        app_label = 'auth'
+
+class Order(models.Model):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    class Meta:
+        app_label = 'auth'
+
+with connection.schema_editor() as se:
+    se.create_model(Product)
+    se.create_model(Order)
+
+order = Order()
+order.product = Product()
+order.product.sku = "foo"
+order.product.save()
+order.save()
+assert not Order.objects.filter(product_id="").exists()
+assert Order.objects.filter(product=order.product).exists()
+assert Order.objects.filter(product_id="foo").exists()
+print("issue scenario: ALL ASSERTIONS PASS")
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro2.py
+```2026_09_21_09_51_17899843172026_09_21_09_51_17899843182026_09_21_09_51_17899843182026_09_21_09_51_17899843182026_09_21_09_51_17899843182026_09_21_09_51_17899843182026_09_21_09_51_17899843182026_09_21_09_51_1789984319
+executing输出 issue scenario: ALL ASSERTIONS PASS
+
+
+All assertions from the issue pass. 
+
+Summary of what I did:
+
+**Root cause**: In `ForwardManyToOneDescriptor.__set__`, when you assign an unsaved related object to a foreign key, Django eagerly copies the related object's primary key value into the FK column attribute. For a `CharField(primary_key=True)`, an unsaved `Product()` has `sku == ""`, so `order.product_id` was immediately set to `""`. When the parent was later given `sku = "foo"` and saved, `order.product_id` still held the stale empty string, causing data loss / FK violation.
+
+`Model._prepare_related_fields_for_save()` had logic to re-sync the FK value from the related object after it gets saved, but its guard was `elif getattr(self, field.attname) is None:` — which only fired for numeric PKs where the attribute defaults to `None`. For non-numeric PKs the stale value was `""` (not `None`), so the re-sync was skipped.
+
+**Fix** (`django/db/models/base.py`): Changed the guard to compare against the related object's actual target field value:
+```python
+elif getattr(self, field.attname) != getattr(obj, field.target_field.attname):
+```
+This re-syncs the FK column whenever it mismatches the related object's PK/to_field, covering the non-numeric primary key case.
+
+**Verification**:
+- Minimal repro (before fix): `product_id` was `''` and save raised `FOREIGN KEY constraint failed`.
+- After fix: `product_id == 'foo'`, all issue assertions pass.
+- Existing tests: `many_to_one` (36 OK), `one_to_one`/`nested_foreign_keys`/`model_fields`/`foreign_object` (495 OK), `model_inheritance`/`model_forms` (223 OK).
+
+The change is a single, minimal one-line condition fix; no new files, no test files modified.
+
+```bash-action
+exit
+```

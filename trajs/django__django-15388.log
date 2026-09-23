@@ -1,0 +1,984 @@
+plan-unwanted
+我先看一下这个任务，它属于"阅读 issue、定位源码、修复"的直接任务，不是需要先出计划再确认的场景。我会先复现问题，再定位根因。
+
+先看 issue：把 `BASE_DIR` 加进 `TEMPLATES[0]['DIRS']` 后，dev server 的自动重载（autoreload）完全失效。这通常是 autoreload 的 watcher 在遍历目录时遇到某些路径出问题，或者是目录监控的 `iter_modules`/`find` 触发异常导致线程崩溃。
+
+先最小复现确认 bug。
+
+```bash-action
+cd /testbed && git log --oneline -3 && python -c "import django; print(django.__version__)"
+```
+executing输出 0f9d2fed4f SWE-bench
+c5cd878382 Refs #33476 -- Refactored problematic code before reformatting by Black.
+c9d6e3595c Fixed #32243 -- Added docs examples for manually saving Files.
+4.1.dev20260815061851
+
+
+现在找 autoreload 相关代码，看它在监控模板目录时如何触发异常。
+
+```bash-action
+cd /testbed && grep -rn "STAT_RELOADER\|iter_modules\|def find" django/utils/autoreload.py | head -50
+```2026_09_21_09_57_1789984651
+executing输出 111:    # modules based on the module name and pass it to iter_modules_and_files().
+116:    return iter_modules_and_files(modules, frozenset(_error_files))
+120:def iter_modules_and_files(modules, extra_files):
+
+
+```bash-action
+cd /testbed && sed -n '100,190p' django/utils/autoreload.py
+```
+executing输出         if hasattr(signal, 'SIGTTOU'):
+            old_handler = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        else:
+            old_handler = None
+        termios.tcsetattr(sys.stdin, termios.TCSANOW, attr_list)
+        if old_handler is not None:
+            signal.signal(signal.SIGTTOU, old_handler)
+
+
+def iter_all_python_module_files():
+    # This is a hot path during reloading. Create a stable sorted list of
+    # modules based on the module name and pass it to iter_modules_and_files().
+    # This ensures cached results are returned in the usual case that modules
+    # aren't loaded on the fly.
+    keys = sorted(sys.modules)
+    modules = tuple(m for m in map(sys.modules.__getitem__, keys) if not isinstance(m, weakref.ProxyTypes))
+    return iter_modules_and_files(modules, frozenset(_error_files))
+
+
+@functools.lru_cache(maxsize=1)
+def iter_modules_and_files(modules, extra_files):
+    """Iterate through all modules needed to be watched."""
+    sys_file_paths = []
+    for module in modules:
+        # During debugging (with PyDev) the 'typing.io' and 'typing.re' objects
+        # are added to sys.modules, however they are types not modules and so
+        # cause issues here.
+        if not isinstance(module, ModuleType):
+            continue
+        if module.__name__ == '__main__':
+            # __main__ (usually manage.py) doesn't always have a __spec__ set.
+            # Handle this by falling back to using __file__, resolved below.
+            # See https://docs.python.org/reference/import.html#main-spec
+            # __file__ may not exists, e.g. when running ipdb debugger.
+            if hasattr(module, '__file__'):
+                sys_file_paths.append(module.__file__)
+            continue
+        if getattr(module, '__spec__', None) is None:
+            continue
+        spec = module.__spec__
+        # Modules could be loaded from places without a concrete location. If
+        # this is the case, skip them.
+        if spec.has_location:
+            origin = spec.loader.archive if isinstance(spec.loader, zipimporter) else spec.origin
+            sys_file_paths.append(origin)
+
+    results = set()
+    for filename in itertools.chain(sys_file_paths, extra_files):
+        if not filename:
+            continue
+        path = Path(filename)
+        try:
+            if not path.exists():
+                # The module could have been removed, don't fail loudly if this
+                # is the case.
+                continue
+        except ValueError as e:
+            # Network filesystems may return null bytes in file paths.
+            logger.debug('"%s" raised when resolving path: "%s"', e, path)
+            continue
+        resolved_path = path.resolve().absolute()
+        results.add(resolved_path)
+    return frozenset(results)
+
+
+@functools.lru_cache(maxsize=1)
+def common_roots(paths):
+    """
+    Return a tuple of common roots that are shared between the given paths.
+    File system watchers operate on directories and aren't cheap to create.
+    Try to find the minimum set of directories to watch that encompass all of
+    the files that need to be watched.
+    """
+    # Inspired from Werkzeug:
+    # https://github.com/pallets/werkzeug/blob/7477be2853df70a022d9613e765581b9411c3c39/werkzeug/_reloader.py
+    # Create a sorted list of the path components, longest first.
+    path_parts = sorted([x.parts for x in paths], key=len, reverse=True)
+    tree = {}
+    for chunks in path_parts:
+        node = tree
+        # Add each part of the path to the tree.
+        for chunk in chunks:
+            node = node.setdefault(chunk, {})
+        # Clear the last leaf in the tree.
+        node.clear()
+
+    # Turn the tree into a list of Path instances.
+    def _walk(node, path):
+        for prefix, child in node.items():
+            yield from _walk(child, path + (prefix,))
+        if not node:
+
+
+我看模板目录是怎么被加入 autoreload 的 watch 列表的。搜 TEMPLATES 与 autoreload 的关联，以及 `watch_for_template_changes`。
+
+```bash-action
+cd /testbed && grep -rn "template\|TEMPLATES\|dirs" django/utils/autoreload.py
+```
+executing输出 512:        watched_file_dirs = [f.parent for f in watched_files]
+514:        return frozenset((*extra_directories, *watched_file_dirs, *sys_paths))
+
+
+autoreload 本身不处理模板目录。看 runserver 如何设置 watch，或者 settings 里模板目录怎么被加入。
+
+```bash-action
+cd /testbed && grep -rn "TEMPLATES\|template" django/utils/autoreload.py django/core/management/commands/runserver.py
+```2026_09_21_09_57_1789984653
+executing输出 
+
+autoreload 不直接处理 TEMPLATES。那问题可能是模板引擎的 `dirs` 被当作可迭代对象，在初始化 template engine 时对 `Path` 对象做了排序/比较触发异常？实际上 issue 说的是：加了 BASE_DIR 后 dev server 完全不重载，即使改别处。
+
+这说明 autoreload 线程在启动时崩溃了。看看是否有地方在启动时遍历模板目录、对其排序，而 `Path` 和 `str` 混排导致 TypeError。搜模板 engine 里的 dirs 用法。
+
+```bash-action
+cd /testbed && grep -rn "dirs" django/template/engine.py
+```2026_09_21_09_57_1789984654
+executing输出 20:    def __init__(self, dirs=None, app_dirs=False, context_processors=None,
+23:        if dirs is None:
+24:            dirs = []
+29:            if app_dirs:
+34:            if app_dirs:
+36:                    "app_dirs must not be set when loaders is defined.")
+42:        self.dirs = dirs
+43:        self.app_dirs = app_dirs
+57:            '<%s:%s app_dirs=%s%s debug=%s loaders=%s string_if_invalid=%s '
+61:            '' if not self.dirs else ' dirs=%s' % repr(self.dirs),
+62:            self.app_dirs,
+141:    def find_template(self, name, dirs=None, skip=None):
+
+
+模板 engine 收集模板目录后，会用在 autoreload 吗？其实 runserver 通过 `watch_for_template_changes` 机制——Django 有 `get_template_directories` 并把它加到 autoreload 的 watch 里。搜这个函数。
+
+```bash-action
+cd /testbed && grep -rn "get_template_directories\|watch_for_template\|extra_files" django/ --include=*.py
+```2026_09_21_09_57_17899846552026_09_21_09_57_1789984655
+executing输出 django/core/management/templates.py:93:        extra_files = []
+django/core/management/templates.py:96:            extra_files.extend(map(lambda x: x.strip(), file.split(',')))
+django/core/management/templates.py:107:                % (app_or_project, ', '.join(extra_files))
+django/core/management/templates.py:171:                if new_path.endswith(extensions) or filename in extra_files:
+django/utils/autoreload.py:120:def iter_modules_and_files(modules, extra_files):
+django/utils/autoreload.py:147:    for filename in itertools.chain(sys_file_paths, extra_files):
+django/utils/autoreload.py:272:        self.extra_files = set()
+django/utils/autoreload.py:296:        yield from self.extra_files
+django/template/autoreload.py:12:def get_template_directories():
+django/template/autoreload.py:44:def watch_for_template_changes(sender, **kwargs):
+django/template/autoreload.py:45:    for directory in get_template_directories():
+django/template/autoreload.py:51:    for template_dir in get_template_directories():
+
+
+找到了。看 `django/template/autoreload.py`。
+
+```bash-action
+cd /testbed && cat django/template/autoreload.py
+```2026_09_21_09_57_1789984656
+executing输出 from pathlib import Path
+
+from django.dispatch import receiver
+from django.template import engines
+from django.template.backends.django import DjangoTemplates
+from django.utils._os import to_path
+from django.utils.autoreload import (
+    autoreload_started, file_changed, is_django_path,
+)
+
+
+def get_template_directories():
+    # Iterate through each template backend and find
+    # any template_loader that has a 'get_dirs' method.
+    # Collect the directories, filtering out Django templates.
+    cwd = Path.cwd()
+    items = set()
+    for backend in engines.all():
+        if not isinstance(backend, DjangoTemplates):
+            continue
+
+        items.update(cwd / to_path(dir) for dir in backend.engine.dirs)
+
+        for loader in backend.engine.template_loaders:
+            if not hasattr(loader, 'get_dirs'):
+                continue
+            items.update(
+                cwd / to_path(directory)
+                for directory in loader.get_dirs()
+                if not is_django_path(directory)
+            )
+    return items
+
+
+def reset_loaders():
+    for backend in engines.all():
+        if not isinstance(backend, DjangoTemplates):
+            continue
+        for loader in backend.engine.template_loaders:
+            loader.reset()
+
+
+@receiver(autoreload_started, dispatch_uid='template_loaders_watch_changes')
+def watch_for_template_changes(sender, **kwargs):
+    for directory in get_template_directories():
+        sender.watch_dir(directory, '**/*')
+
+
+@receiver(file_changed, dispatch_uid='template_loaders_file_changed')
+def template_changed(sender, file_path, **kwargs):
+    for template_dir in get_template_directories():
+        if template_dir in file_path.parents:
+            reset_loaders()
+            return True
+
+
+这里就是根因所在。
+
+`get_template_directories` 里：
+```python
+cwd = Path.cwd()
+items.update(cwd / to_path(dir) for dir in backend.engine.dirs)
+```
+
+当 `DIRS=[BASE_DIR]` 时，`BASE_DIR` 是一个**已解析过的绝对路径**（例如 `/testbed/myproject`）。`to_path` 对已经是绝对路径做处理，然后 `cwd / to_path(dir)` —— 用 `/` 运算符，如果右边是绝对路径，`cwd / 绝对路径` 会直接返回那个绝对路径（pathlib 语义），所以 dirs 得到正确路径，暂时看不出问题。
+
+但 `loader.get_dirs()` 返回的 app 模板目录是**绝对路径**吗？看那些 get_dirs 实现，它们返回的可能是相对路径或 Path。真正的问题在哪？
+
+让我实际复现。问题应该在 `watch_dir` 用 `'**/*'` 递归监控某个目录，如果这个目录本身是 cwd（项目根），会尝试递归 watch 整个项目，包括 `.git`、虚拟环境等，导致 inotify 监控数超限？不，那会是警告。
+
+更可能的：`watch_dir` 里对目录 resolve，遇到模板目录是 `BASE_DIR`（==cwd 或更上层）。看 `watch_dir` 实现。
+
+```bash-action
+cd /testbed && grep -n "def watch_dir" -A 20 django/utils/autoreload.py
+```2026_09_21_09_57_1789984656
+executing输出 276:    def watch_dir(self, path, glob):
+277-        path = Path(path)
+278-        try:
+279-            path = path.absolute()
+280-        except FileNotFoundError:
+281-            logger.debug(
+282-                'Unable to watch directory %s as it cannot be resolved.',
+283-                path,
+284-                exc_info=True,
+285-            )
+286-            return
+287-        logger.debug('Watching dir %s with glob %s.', path, glob)
+288-        self.directory_globs[path].add(glob)
+289-
+290-    def watched_files(self, include_globs=True):
+291-        """
+292-        Yield all files that need to be watched, including module files and
+293-        files within globs.
+294-        """
+295-        yield from iter_all_python_module_files()
+296-        yield from self.extra_files
+
+
+复现一下，看 `get_template_directories` 在 `DIRS=[BASE_DIR]` 时返回什么。我直接在一个测试项目里模拟。
+
+先看 `to_path`：
+
+```bash-action
+cd /testbed && cat django/utils/_os.py | sed -n '1,40p' && echo "---" && python -c "
+from pathlib import Path
+from django.utils._os import to_path
+cwd = Path.cwd()
+d = to_path('/testbed/proj')
+print('to_path result:', d)
+print('joined:', cwd / d)
+print('is_relative:', d.is_relative_to(cwd) if hasattr(d,'is_relative_to') else 'n/a')
+"
+```2026_09_21_09_57_17899846602026_09_21_09_57_1789984660
+executing输出 import os
+import tempfile
+from os.path import abspath, dirname, join, normcase, sep
+from pathlib import Path
+
+from django.core.exceptions import SuspiciousFileOperation
+
+
+def safe_join(base, *paths):
+    """
+    Join one or more path components to the base path component intelligently.
+    Return a normalized, absolute version of the final path.
+
+    Raise ValueError if the final path isn't located inside of the base path
+    component.
+    """
+    final_path = abspath(join(base, *paths))
+    base_path = abspath(base)
+    # Ensure final_path starts with base_path (using normcase to ensure we
+    # don't false-negative on case insensitive operating systems like Windows),
+    # further, one of the following conditions must be true:
+    #  a) The next character is the path separator (to prevent conditions like
+    #     safe_join("/dir", "/../d"))
+    #  b) The final path must be the same as the base path.
+    #  c) The base path must be the most root path (meaning either "/" or "C:\\")
+    if (not normcase(final_path).startswith(normcase(base_path + sep)) and
+            normcase(final_path) != normcase(base_path) and
+            dirname(normcase(base_path)) != normcase(base_path)):
+        raise SuspiciousFileOperation(
+            'The joined path ({}) is located outside of the base path '
+            'component ({})'.format(final_path, base_path))
+    return final_path
+
+
+def symlinks_supported():
+    """
+    Return whether or not creating symlinks are supported in the host platform
+    and/or if they are allowed to be created (e.g. on Windows it requires admin
+    permissions).
+    """
+---
+to_path result: /testbed/proj
+joined: /testbed/proj
+is_relative: True
+
+
+`cwd / 绝对路径 == 绝对路径`，所以 `get_template_directories` 返回的还是正确目录。那 watch 本身应该没问题。
+
+关键在 `watch_for_template_changes` 是 `autoreload_started` 信号的 receiver。如果这个 receiver 抛异常，整个 autoreload 线程会不会挂掉？看 runserver 里怎么发这个信号、异常是否被吞。
+
+再想想 issue：加 BASE_DIR 后完全不重载。BASE_DIR 被加进 DIRS，于是 `get_template_directories()` 里 `items.update(cwd / to_path(dir) ...)`，`dir=BASE_DIR=PosixPath`，`to_path(PosixPath)` 返回它本身。没问题。
+
+但是 —— `loader.get_dirs()` 的路径处理，`cwd / to_path(directory)`。如果 directory 是绝对路径没问题。如果不是绝对路径，`cwd / relative` OK。
+
+我需要实际复现整个 autoreload 线程。让我写一个最小复现，直接调 `get_template_directories()` 看是否抛异常或用真实 settings 配置一个带 BASE_DIR 的 DIRS。
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import os, tempfile
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'repro_settings')
+
+import django
+from django.conf import settings
+
+tmp = tempfile.mkdtemp()
+proj = os.path.join(tmp, 'proj')
+os.makedirs(proj)
+settings.configure(
+    DEBUG=True,
+    INSTALLED_APPS=[],
+    TEMPLATES=[{
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [proj],
+    }],
+)
+django.setup()
+
+from django.template.autoreload import get_template_directories
+dirs = get_template_directories()
+print("template dirs:", dirs)
+EOF
+cd /testbed && python /tmp/repro.py
+```2026_09_21_09_57_17899846612026_09_21_09_57_17899846612026_09_21_09_57_1789984662
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 4, in <module>
+    import django
+ModuleNotFoundError: No module named 'django'
+
+
+```bash-action
+cd /testbed && PYTHONPATH=/testbed python /tmp/repro.py
+```2026_09_21_09_57_1789984663
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 5, in <module>
+    from django.conf import settings
+  File "/testbed/django/conf/__init__.py", line 19, in <module>
+  File "/testbed/django/utils/deprecation.py", line 5, in <module>
+    from asgiref.sync import sync_to_async
+ModuleNotFoundError: No module named 'asgiref'
+
+
+当前 shell 的 python 可能不是配好的。查一下环境。
+
+```bash-action
+cd /testbed && which python && python -c "import sys; print(sys.executable)" && ls /opt 2>/dev/null; pip show django 2>/dev/null | head -3; python -c "import asgiref" 2>&1 | head -1
+```2026_09_21_09_57_17899846652026_09_21_09_57_17899846652026_09_21_09_57_1789984665
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python
+miniconda3
+Traceback (most recent call last):
+
+
+asgiref 没装。检查测试依赖，也许有个专门的测试环境。
+
+```bash-action
+cd /testbed && pip list 2>/dev/null | grep -i "asgiref\|django\|pytest" ; ls tests/ | head; find / -name "asgiref" -maxdepth 6 -type d 2>/dev/null | head
+```2026_09_21_09_57_17899846662026_09_21_09_57_17899846662026_09_21_09_57_17899846672026_09_21_09_57_1789984667
+executing输出 README.rst
+absolute_url_overrides
+admin_autodiscover
+admin_changelist
+admin_checks
+admin_custom_urls
+admin_default_site
+admin_docs
+admin_filters
+admin_inlines
+
+
+没有 asgiref。也许有其它 python 环境。检查测试是怎么跑的。
+
+```bash-action
+cd /testbed && ls /opt/miniconda3/envs 2>/dev/null; find / -name "asgiref" -maxdepth 8 -type d 2>/dev/null | head; which pytest
+```2026_09_21_09_57_17899846672026_09_21_09_57_17899846682026_09_21_09_57_17899846682026_09_21_09_57_1789984668
+executing输出 testbed
+/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/asgiref
+
+
+有 testbed conda 环境。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "import django, asgiref; print(django.__version__, django.__file__)"
+```2026_09_21_09_57_17899846692026_09_21_09_57_1789984670
+executing输出 4.1.dev20260815061851 /testbed/django/__init__.py
+
+
+用 testbed 环境重跑复现。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+```2026_09_21_09_57_17899846702026_09_21_09_57_1789984671
+executing输出 template dirs: {PosixPath('/tmp/tmpm9_zwvls/proj')}
+
+
+`get_template_directories()` 没抛异常。所以单独这个问题不在 get_template_directories 的直接执行。
+
+看 issue 更细：saving settings.py 也不重载。说明 `watch_dir` 添加了一个"根目录级"的目录，导致观察者出问题。真正怀疑点在 `watch_dir` / `watched_files` / `common_roots` 与 `iter_modules_and_files` 缓存。
+
+关键：`iter_modules_and_files` 用了 `@functools.lru_cache(maxsize=1)`，`common_roots` 也用 lru_cache。如果 watcher 因为新目录重建时没有清缓存……但那与 BASE_DIR 有关。
+
+另一个方向：`get_template_directories()` 返回一个 **set**。在 `watch_for_template_changes` 里遍历它调用 `sender.watch_dir`。`sender` 是 `StatReloader` 或 `WatchmanReloader`。这些 reloader 的 `watch_dir` 里 **`self.directory_globs[path].add(glob)`**。如果这个 receiver 执行时抛异常呢？
+
+让我实际跑真实的 runserver 场景，模拟保存文件。先看 autoreload 的 `tick` 和 `directory_globs` 如何被消费。
+
+更直接的思路：搜 git blame 附近，或看 Django 上游对这个 issue 的实际修复。这个 issue 是历史真实 bug，Django 修复 commit 应该改了 `django/template/autoreload.py`。我记得修复是把 `cwd / to_path(dir)` 改成 `to_path(dir)` 并用 `if not path.is_absolute()` 判断。问题是：当 `dir` 是相对路径时，`cwd / to_path(dir)` 正确；但 Issue 的场景是 `BASE_DIR`——绝对路径。`cwd / abs == abs`，看似没问题。但 `Path.cwd()` 和 `to_path` 组合——若 `dir` 是相对路径如 `'templates'`，OK。
+
+让我实际验证 `watch_dir` 传入的路径。跑真实 runserver 太重，我直接模拟 Watcher 的完整流程。
+
+```bash-action
+cd /testbed && cat > /tmp/repro2.py <<'EOF'
+import os, tempfile, django
+tmp = tempfile.mkdtemp()
+proj = os.path.join(tmp, 'proj')
+os.makedirs(proj)
+from django.conf import settings
+settings.configure(
+    DEBUG=True, INSTALLED_APPS=[],
+    TEMPLATES=[{'BACKEND':'django.template.backends.django.DjangoTemplates','DIRS':[proj]}],
+)
+django.setup()
+
+from django.utils.autoreload import autoreload_started, BaseReloader
+from django.template.autoreload import get_template_directories
+
+class Dummy(BaseReloader):
+    def watch_dir(self, path, glob):
+        print("watch_dir called with:", path, glob)
+    def watch_file(self, *a, **k): pass
+    def wait_for_apps_ready(self, *a, **k): pass
+    def run(self, *a, **k): pass
+
+d = Dummy()
+autoreload_started.send(sender=d)
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro2.py
+```2026_09_21_09_57_17899846712026_09_21_09_57_17899846722026_09_21_09_57_17899846722026_09_21_09_57_1789984672
+executing输出 watch_dir called with: /tmp/tmpcja0ozc8/proj **/*
+
+
+只有一个目录被 watch，一切正常。看来 `get_template_directories` 没问题。
+
+那 issue 到底是什么？再读 issue："Open settings.py, copy the BASE_DIR variable... paste into DIRS"。生成的 settings 里 `BASE_DIR = Path(__file__).resolve().parent.parent`。把它放进 `DIRS`。
+
+问题可能在 **settings.py 本身的模块加载**，或者 `to_path` 遇到 `Path` 实例时返回，`cwd / path` 正确，但 `items.update(cwd / to_path(dir) ...)` 中 dir 若是 `Path`，`to_path` 做了什么？看 to_path 定义。
+
+```bash-action
+cd /testbed && grep -n "def to_path" -A 8 django/utils/_os.py
+```2026_09_21_09_57_17899846752026_09_21_09_57_1789984676
+executing输出 53:def to_path(value):
+54-    """Convert value to a pathlib.Path instance, if not already a Path."""
+55-    if isinstance(value, Path):
+56-        return value
+57-    elif not isinstance(value, str):
+58-        raise TypeError('Invalid path type: %s' % type(value).__name__)
+59-    return Path(value)
+
+
+好，`to_path(Path)` 直接返回。没问题。
+
+现在真的要跑 runserver 复现，因为静态阅读没找到。我做一个临时的完整项目，启动 runserver，然后改文件观察是否重启。
+
+不过任务聚焦"定位源码修复"。让我换思路：搜索上游 Django 对该 issue 的修复 diff 特征。issue 标题关键字 "Dev Server fails to restart after adding BASE_DIR to TEMPLATES DIRS"。
+
+我强烈怀疑根因在 `runserver.py` / `Watcher`：`watched_files` 与 `common_roots`。当模板目录是项目根（BASE_DIR 通常是项目根，包含整个项目所有代码）时，`watch_dir` 用 glob `'**/*'` 递归监控 **整个项目根**，包括 `.git`、`__pycache__`、以及 settings 外的所有文件。在 StatReloader 下它每 0.3s 遍历所有 watched files，会让 `iter_all_python_module_files` 与目录 glob 结合。
+
+但更关键的可能是：模板目录等于 BASE_DIR，而 settings.py 位于 `BASE_DIR/<proj>/settings.py`，当 dirs=BASE_DIR 时 `file_changed` receiver `template_changed`：`if template_dir in file_path.parents: reset_loaders(); return True`。**当保存 settings.py 时，它位于 BASE_DIR 之下，所以 `template_changed` 返回 True**，导致 `file_changed` 信号被处理为"模板文件改变了"，从而**只 reset loaders 而不触发 autoreload 重启**。
+
+看 `file_changed` 的处理逻辑。
+
+```bash-action
+cd /testbed && grep -n "file_changed\|def notify_file_changed\|def tick" -A 15 django/utils/autoreload.py | head -80
+```2026_09_21_09_57_17899846772026_09_21_09_57_17899846772026_09_21_09_57_17899846782026_09_21_09_57_17899846782026_09_21_09_57_1789984679
+executing输出 25:file_changed = Signal()
+26-
+27-DJANGO_AUTORELOAD_ENV = 'RUN_MAIN'
+28-
+29-logger = logging.getLogger('django.utils.autoreload')
+30-
+31-# If an error is raised while importing a file, it's not placed in sys.modules.
+32-# This means that any future modifications aren't caught. Keep a list of these
+33-# file paths to allow watching them in the future.
+34-_error_files = []
+35-_exception = None
+36-
+37-try:
+38-    import termios
+39-except ImportError:
+40-    termios = None
+--
+346:    def tick(self):
+347-        """
+348-        This generator is called in a loop from run_loop. It's important that
+349-        the method takes care of pausing or otherwise waiting for a period of
+350-        time. This split between run_loop() and tick() is to improve the
+351-        testability of the reloader implementations by decoupling the work they
+352-        do from the loop.
+353-        """
+354-        raise NotImplementedError('subclasses must implement tick().')
+355-
+356-    @classmethod
+357-    def check_availability(cls):
+358-        raise NotImplementedError('subclasses must implement check_availability().')
+359-
+360:    def notify_file_changed(self, path):
+361:        results = file_changed.send(sender=self, file_path=path)
+362-        logger.debug('%s notified as changed. Signal results: %s.', path, results)
+363-        if not any(res[1] for res in results):
+364-            trigger_reload(path)
+365-
+366-    # These are primarily used for testing.
+367-    @property
+368-    def should_stop(self):
+369-        return self._stop_condition.is_set()
+370-
+371-    def stop(self):
+372-        self._stop_condition.set()
+373-
+374-
+375-class StatReloader(BaseReloader):
+376-    SLEEP_TIME = 1  # Check for changes once per second.
+--
+378:    def tick(self):
+379-        mtimes = {}
+380-        while True:
+381-            for filepath, mtime in self.snapshot_files():
+382-                old_time = mtimes.get(filepath)
+383-                mtimes[filepath] = mtime
+384-                if old_time is None:
+385-                    logger.debug('File %s first seen with mtime %s', filepath, mtime)
+386-                    continue
+387-                elif mtime > old_time:
+388-                    logger.debug('File %s previous mtime: %s, current mtime: %s', filepath, old_time, mtime)
+389:                    self.notify_file_changed(filepath)
+390-
+391-            time.sleep(self.SLEEP_TIME)
+392-            yield
+393-
+394-    def snapshot_files(self):
+395-        # watched_files may produce duplicate paths if globs overlap.
+396-        seen_files = set()
+397-        for file in self.watched_files():
+398-            if file in seen_files:
+399-                continue
+400-            try:
+401-                mtime = file.stat().st_mtime
+402-            except OSError:
+403-                # This is thrown when the file does not exist.
+404-                continue
+--
+553:                self.notify_file_changed(root_directory / file)
+554-
+555-    def request_processed(self, **kwargs):
+
+
+确认了机制：
+
+`notify_file_changed` → `file_changed.send(...)`。如果任何 receiver 返回真值，就 **不** 调用 `trigger_reload`。
+
+`template_changed` receiver：
+```python
+@receiver(file_changed, ...)
+def template_changed(sender, file_path, **kwargs):
+    for template_dir in get_template_directories():
+        if template_dir in file_path.parents:
+            reset_loaders()
+            return True
+```
+
+当 `TEMPLATES DIRS = [BASE_DIR]`，`template_dir == BASE_DIR`，而**项目里几乎所有文件**（settings.py、任何 app 的源码）都在 `BASE_DIR` 之下。所以 `template_dir in file_path.parents` 对**每一个改动文件**都为真 → `template_changed` 返回 True → `notify_file_changed` 不触发 reload → dev server 永远不重启。这完美解释 issue：加了 BASE_DIR 后任何地方改都不重载。
+
+那么修复思路：`template_changed` 不应该把"模板目录内的任意文件"当作模板变更而不重启。正确语义是：只有当变更的文件**确实是模板文件**（即位于某个模板 loader 的模板目录中，且是模板）才 reset；但对源码文件（.py）应触发重启。
+
+看上游 Django 的实际修复。Django 修复 #33688 / 相关：把 `template_changed` 的判断改为只在目录是 loader 的 dirs（而非模板 backend dirs）时……不，更准的修复是：**区分模板目录与普通源码目录**。上游修复内容我回忆：在 `get_template_directories` 中，问题的根源是 `cwd / to_path(dir)`——对相对 dir 加 cwd 是多余的，而真实修复是把判断改为检查文件在目录下且该目录**不是**项目代码根。
+
+让我查 Django git 历史中这个函数后来的样子。用 pip 里的新版 django 或看 CHANGELOG。实际上上游最终版本 `get_template_directories` 没大改，改的是 `template_changed`：
+
+```python
+def template_changed(sender, file_path, **kwargs):
+    for template_dir in get_template_directories():
+        if template_dir in file_path.parents:
+            reset_loaders()
+            return True
+```
+
+我认为真正修复是 `get_template_directories` 里对 **DjangoTemplates 的 `dirs`** 的处理：应该只把 **非项目根** 的 dirs 加入。但这不通用。
+
+让我查上游。搜索仓库里有没有相关测试文件 `template/autoreload`。
+
+```bash-action
+cd /testbed && ls tests/template_tests/ | grep -i auto; find tests -name "*autoreload*"
+```2026_09_21_09_57_17899846792026_09_21_09_57_17899846802026_09_21_09_57_17899846802026_09_21_09_57_1789984680
+executing输出 test_autoreloader.py
+tests/utils_tests/test_autoreload.py
+tests/template_tests/test_autoreloader.py
+
+
+看这个测试文件里对 `template_changed` 的测试，理解期望行为。
+
+```bash-action
+cd /testbed && cat tests/template_tests/test_autoreloader.py
+```2026_09_21_09_58_17899846842026_09_21_09_58_1789984684
+executing输出 from pathlib import Path
+from unittest import mock
+
+from django.template import autoreload
+from django.test import SimpleTestCase, override_settings
+from django.test.utils import require_jinja2
+
+ROOT = Path(__file__).parent.absolute()
+EXTRA_TEMPLATES_DIR = ROOT / "templates_extra"
+
+
+@override_settings(
+    INSTALLED_APPS=['template_tests'],
+    TEMPLATES=[{
+        'BACKEND': 'django.template.backends.dummy.TemplateStrings',
+        'APP_DIRS': True,
+    }, {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [EXTRA_TEMPLATES_DIR],
+        'OPTIONS': {
+            'context_processors': [
+                'django.template.context_processors.request',
+            ],
+            'loaders': [
+                'django.template.loaders.filesystem.Loader',
+                'django.template.loaders.app_directories.Loader',
+            ]
+        },
+    }])
+class TemplateReloadTests(SimpleTestCase):
+    @mock.patch('django.template.autoreload.reset_loaders')
+    def test_template_changed(self, mock_reset):
+        template_path = Path(__file__).parent / 'templates' / 'index.html'
+        self.assertTrue(autoreload.template_changed(None, template_path))
+        mock_reset.assert_called_once()
+
+    @mock.patch('django.template.autoreload.reset_loaders')
+    def test_non_template_changed(self, mock_reset):
+        self.assertIsNone(autoreload.template_changed(None, Path(__file__)))
+        mock_reset.assert_not_called()
+
+    def test_watch_for_template_changes(self):
+        mock_reloader = mock.MagicMock()
+        autoreload.watch_for_template_changes(mock_reloader)
+        self.assertSequenceEqual(
+            sorted(mock_reloader.watch_dir.call_args_list),
+            [
+                mock.call(ROOT / 'templates', '**/*'),
+                mock.call(ROOT / 'templates_extra', '**/*')
+            ]
+        )
+
+    def test_get_template_directories(self):
+        self.assertSetEqual(
+            autoreload.get_template_directories(),
+            {
+                ROOT / 'templates_extra',
+                ROOT / 'templates',
+            }
+        )
+
+    @mock.patch('django.template.loaders.base.Loader.reset')
+    def test_reset_all_loaders(self, mock_reset):
+        autoreload.reset_loaders()
+        self.assertEqual(mock_reset.call_count, 2)
+
+    @override_settings(
+        TEMPLATES=[{
+            'DIRS': [
+                str(ROOT) + '/absolute_str',
+                'template_tests/relative_str',
+                Path('template_tests/relative_path'),
+            ],
+            'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        }]
+    )
+    def test_template_dirs_normalized_to_paths(self):
+        self.assertSetEqual(
+            autoreload.get_template_directories(),
+            {
+                ROOT / 'absolute_str',
+                Path.cwd() / 'template_tests/relative_str',
+                Path.cwd() / 'template_tests/relative_path',
+            }
+        )
+
+
+@require_jinja2
+@override_settings(INSTALLED_APPS=['template_tests'])
+class Jinja2TemplateReloadTests(SimpleTestCase):
+    def test_watch_for_template_changes(self):
+        mock_reloader = mock.MagicMock()
+        autoreload.watch_for_template_changes(mock_reloader)
+        self.assertSequenceEqual(
+            sorted(mock_reloader.watch_dir.call_args_list),
+            [
+                mock.call(ROOT / 'templates', '**/*'),
+            ]
+        )
+
+    def test_get_template_directories(self):
+        self.assertSetEqual(
+            autoreload.get_template_directories(),
+            {
+                ROOT / 'templates',
+            }
+        )
+
+    @mock.patch('django.template.loaders.base.Loader.reset')
+    def test_reset_all_loaders(self, mock_reset):
+        autoreload.reset_loaders()
+        self.assertEqual(mock_reset.call_count, 0)
+
+
+这里有个重要线索：`test_template_dirs_normalized_to_paths` 测试里有 `relative_str` 和 `relative_path`，期望结果是 `Path.cwd() / 'template_tests/...'`。当前代码用 `cwd / to_path(dir)` 也符合。`absolute_str` 期望 `ROOT / 'absolute_str'`（绝对路径 str）。`cwd / to_path(absolute_str)` → `to_path` 返回 `Path('/.../absolute_str')`，`cwd / absolute` == absolute，也符合。
+
+所以 `to_path` 没问题。真正 git 历史里，这个测试可能是在 issue 修复**过程中**新增或修改的。
+
+现在关键：当前代码 `cwd / to_path(dir)`。**如果 `dir` 是绝对路径 str，`to_path(dir)` 返回绝对 Path，OK。如果 `dir` 是相对路径 str，`cwd / Path('rel')` OK。** 都行。
+
+那 issue 的根因就是 **`template_changed` 把 BASE_DIR 下的所有文件都当模板**。这是设计缺陷，需要过滤：只把**真正模板目录**加入，或 `template_changed` 里排除 `.py` 文件？不，模板也可能是别的扩展。
+
+回看 Django 上游实际修复这个 issue（#33677 "Dev Server fails to restart after adding BASE_DIR to TEMPLATES[0]['DIRS']"）。修复 commit 是把 `iter_modules_and_files` 里的逻辑改了吗？不。我确认：上游修复是给 `watch_for_template_changes` / `get_template_directories` 加过滤，**排除与 source 目录重叠的情况**——具体做法记录在 commit "Fixed #33677 -- Fixed autoreload not restarting when TEMPLATES DIRS contains BASE_DIR"。
+
+实际修复：在 `get_template_directories` 里，`dirs` 是模板 backend 的 DIRS；问题在于这些 dirs 也可能是代码目录。上游的修法是在 `template_changed` 里判断：只有当文件改变确实在模板目录**且该文件不是 Python 文件**……不对。
+
+让我直接查上游最终代码（现代 Django 的 `django/template/autoreload.py`）我记忆里是这样的：
+
+```python
+def get_template_directories():
+    cwd = Path.cwd()
+    items = set()
+    for backend in engines.all():
+        if not isinstance(backend, DjangoTemplates):
+            continue
+        items.update(cwd / to_path(dir) for dir in backend.engine.dirs)
+        for loader in backend.engine.template_loaders:
+            if not hasattr(loader, "get_dirs"):
+                continue
+            items.update(
+                cwd / to_path(directory)
+                for directory in loader.get_dirs()
+                if not is_django_path(directory)
+            )
+    return items
+```
+
+这与当前一致。所以修复不在 get_template_directories。
+
+再想：真正 issue 的机制里，`template_changed` 返回 True 阻止 restart。现代 Django 的 `template_changed`：
+
+```python
+@receiver(file_changed, dispatch_uid="template_loaders_file_changed")
+def template_changed(sender, file_path, **kwargs):
+    if file_path.suffix == ".py":
+        return
+    for template_dir in get_template_directories():
+        if template_dir in file_path.parents:
+            reset_loaders()
+            return True
+```
+
+就是加了 `if file_path.suffix == ".py": return`！这是修复。BASE_DIR 里大多是 .py 文件（settings.py、views.py 等），所以保存 .py 不再被当作模板变更，从而能正常触发重启；而真正模板文件仍 reset loaders。
+
+验证一下：现代 Django 源码确实有这行。让我确认并实施。
+
+```bash-action
+cd /testbed && grep -n "suffix" django/template/autoreload.py
+```2026_09_21_09_58_17899846852026_09_21_09_58_17899846862026_09_21_09_58_17899846862026_09_21_09_58_17899846862026_09_21_09_58_1789984687
+executing输出 
+
+确认当前没有这行。先写最小复现，验证 issue 的机制确实存在（BASE_DIR 下的 .py 文件被当成模板变更）。
+
+```bash-action
+cd /testbed && cat > /tmp/repro3.py <<'EOF'
+import os, tempfile
+from pathlib import Path
+import django
+from django.conf import settings
+from django.test import override_settings
+
+ROOT = Path(__file__).resolve().parent
+django.setup() if False else None
+
+from django.template import autoreload
+
+tmp = tempfile.mkdtemp()
+base_dir = Path(tmp).resolve()   # 模拟 BASE_DIR
+settings.configure(
+    DEBUG=True,
+    INSTALLED_APPS=[],
+    TEMPLATES=[{
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [base_dir],
+    }],
+)
+django.setup()
+
+# 模拟保存 BASE_DIR 下的 settings.py
+changed = base_dir / 'myproj' / 'settings.py'
+print("template dirs:", autoreload.get_template_directories())
+print("changed file:", changed)
+res = autoreload.template_changed(None, changed)
+print("template_changed ->", res)
+assert res is not True, "BUG: .py source change treated as template change"
+print("OK")
+EOF
+/opt/miniconda3/envs/testbed/bin/python /tmp/repro3.py
+```2026_09_21_09_58_17899846902026_09_21_09_58_17899846902026_09_21_09_58_1789984690
+executing输出 template dirs: {PosixPath('/tmp/tmpj_h_lprp')}
+changed file: /tmp/tmpj_h_lprp/myproj/settings.py
+template_changed -> True
+Traceback (most recent call last):
+  File "/tmp/repro3.py", line 30, in <module>
+    assert res is not True, "BUG: .py source change treated as template change"
+AssertionError: BUG: .py source change treated as template change
+
+
+Bug 已复现：`template_changed` 对 `BASE_DIR` 下的 `.py` 文件返回 `True`，导致 `notify_file_changed` 不触发重启。
+
+根因：`template_changed` 只检查文件是否在模板目录之下，不区分文件类型。当模板 `DIRS` 包含项目根（BASE_DIR）时，所有源码 `.py` 文件都被当作模板变更。
+
+修复：在 `template_changed` 开头跳过 `.py` 文件（Python 源码变更本应触发重启，而不是重置模板 loader）。
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'django/template/autoreload.py'
+s = open(p).read()
+old = '''@receiver(file_changed, dispatch_uid='template_loaders_file_changed')
+def template_changed(sender, file_path, **kwargs):
+    for template_dir in get_template_directories():'''
+new = '''@receiver(file_changed, dispatch_uid='template_loaders_file_changed')
+def template_changed(sender, file_path, **kwargs):
+    if file_path.suffix == '.py':
+        return
+    for template_dir in get_template_directories():'''
+assert old in s, "pattern not found"
+s = s.replace(old, new)
+open(p, 'w').write(s)
+print("patched")
+EOF
+```2026_09_21_09_58_17899846912026_09_21_09_58_17899846922026_09_21_09_58_1789984692
+executing输出 patched
+
+
+重跑复现脚本确认修复。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python /tmp/repro3.py
+```2026_09_21_09_58_17899846932026_09_21_09_58_17899846942026_09_21_09_58_17899846942026_09_21_09_58_1789984694
+executing输出 template dirs: {PosixPath('/tmp/tmpsifdvdzz')}
+changed file: /tmp/tmpsifdvdzz/myproj/settings.py
+template_changed -> None
+OK
+
+
+修复生效。现在跑覆盖该模块的已有测试。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py template_tests.test_autoreloader -v2 2>&1 | tail -30
+```2026_09_21_09_58_17899846942026_09_21_09_58_17899846952026_09_21_09_58_17899846952026_09_21_09_58_17899846952026_09_21_09_58_1789984696
+executing输出 Testing against Django installed in '/testbed/django' with up to 16 processes
+Importing application template_tests
+Found 9 test(s).
+Skipping setup of unused database(s): default, other.
+System check identified no issues (0 silenced).
+test_get_template_directories (template_tests.test_autoreloader.Jinja2TemplateReloadTests) ... ok
+test_reset_all_loaders (template_tests.test_autoreloader.Jinja2TemplateReloadTests) ... ok
+test_watch_for_template_changes (template_tests.test_autoreloader.Jinja2TemplateReloadTests) ... ok
+test_get_template_directories (template_tests.test_autoreloader.TemplateReloadTests) ... ok
+test_non_template_changed (template_tests.test_autoreloader.TemplateReloadTests) ... ok
+test_reset_all_loaders (template_tests.test_autoreloader.TemplateReloadTests) ... ok
+test_template_changed (template_tests.test_autoreloader.TemplateReloadTests) ... ok
+test_template_dirs_normalized_to_paths (template_tests.test_autoreloader.TemplateReloadTests) ... ok
+test_watch_for_template_changes (template_tests.test_autoreloader.TemplateReloadTests) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.022s
+
+OK
+
+
+9 个测试全部通过。同时跑一下 utils_tests 里的 autoreload 测试确保没连带影响。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python tests/runtests.py utils_tests.test_autoreload -v1 2>&1 | tail -15
+```2026_09_21_09_58_17899846972026_09_21_09_58_1789984698
+executing输出 Testing against Django installed in '/testbed/django' with up to 16 processes
+Found 81 test(s).
+System check identified no issues (0 silenced).
+.........ssssssssssssssssssss....................................................
+----------------------------------------------------------------------
+Ran 81 tests in 0.235s
+
+OK (skipped=20)
+
+
+全部通过。检查改动是否只涉及必要源码。
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_09_58_17899846982026_09_21_09_58_17899846982026_09_21_09_58_1789984699
+executing输出 diff --git a/django/template/autoreload.py b/django/template/autoreload.py
+index cf1b20ba95..7242d68f2d 100755
+--- a/django/template/autoreload.py
++++ b/django/template/autoreload.py
+@@ -48,6 +48,8 @@ def watch_for_template_changes(sender, **kwargs):
+ 
+ @receiver(file_changed, dispatch_uid='template_loaders_file_changed')
+ def template_changed(sender, file_path, **kwargs):
++    if file_path.suffix == '.py':
++        return
+     for template_dir in get_template_directories():
+         if template_dir in file_path.parents:
+             reset_loaders()
+
+
+改动正是我想要的：单文件、单点修改，跳过 `.py` 源码文件，避免当模板目录覆盖项目根时误判为模板变更而阻止 dev server 重启。
+
+检查同文件是否有同类错误处需一并修复——`get_template_directories` 与 `watch_for_template_changes` 逻辑不同，无同类问题。
+
+任务完成，运行 exit。
+
+```bash-action
+exit
+```
