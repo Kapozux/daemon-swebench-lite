@@ -1,0 +1,461 @@
+plan-unwanted
+I'll start by exploring the repository to understand the issue.
+
+```bash-action
+cd /testbed && git log --oneline -3 && grep -rn "print_changed_only" sklearn/utils/__init__.py | head -20
+```
+executing输出 6ce16d815 SWE-bench
+0e3c1879b TST Fixes to make test_pprint.py more resilient to change (#13529)
+eda99f3ce ENH Convert y in GradientBoosting to float64 instead of float32 (#13524)
+
+
+```bash-action
+cd /testbed && grep -rn "def _changed_params\|def _pprint\|print_changed_only" sklearn/utils/__init__.py
+```
+executing输出 
+
+Let me find where the repr logic is.
+
+```bash-action
+cd /testbed && grep -rn "print_changed_only\|_changed_params" sklearn/ --include=*.py | grep -v test_ | head -30
+```2026_09_21_10_33_1789986799
+executing输出 sklearn/utils/_pprint.py:87:def _changed_params(estimator):
+sklearn/utils/_pprint.py:162:        self._changed_only = get_config()['print_changed_only']
+sklearn/utils/_pprint.py:179:            params = _changed_params(object)
+sklearn/utils/_pprint.py:413:            params = _changed_params(object)
+sklearn/_config.py:9:    'print_changed_only': False,
+sklearn/_config.py:25:               print_changed_only=None):
+sklearn/_config.py:48:    print_changed_only : bool, optional
+sklearn/_config.py:61:    if print_changed_only is not None:
+sklearn/_config.py:62:        _global_config['print_changed_only'] = print_changed_only
+
+
+```bash-action
+cd /testbed && sed -n '80,110p' sklearn/utils/_pprint.py
+```2026_09_21_10_33_1789986800
+executing输出 
+
+class KeyValTupleParam(KeyValTuple):
+    """Dummy class for correctly rendering key-value tuples from parameters."""
+    pass
+
+
+def _changed_params(estimator):
+    """Return dict (param_name: value) of parameters that were given to
+    estimator with non-default values."""
+
+    params = estimator.get_params(deep=False)
+    filtered_params = {}
+    init_func = getattr(estimator.__init__, 'deprecated_original',
+                        estimator.__init__)
+    init_params = signature(init_func).parameters
+    init_params = {name: param.default for name, param in init_params.items()}
+    for k, v in params.items():
+        if (v != init_params[k] and
+                not (is_scalar_nan(init_params[k]) and is_scalar_nan(v))):
+            filtered_params[k] = v
+    return filtered_params
+
+
+class _EstimatorPrettyPrinter(pprint.PrettyPrinter):
+    """Pretty Printer class for estimator objects.
+
+    This extends the pprint.PrettyPrinter class, because:
+    - we need estimators to be printed with their parameters, e.g.
+      Estimator(param1=value1, ...) which is not supported by default.
+    - the 'compact' parameter of PrettyPrinter is ignored for dicts, which
+
+
+Found the bug. The `v != init_params[k]` comparison fails with arrays. Let me confirm with a minimal reproduction.
+
+```bash-action
+cd /testbed && python -c "
+import sklearn
+import numpy as np
+from sklearn.linear_model import LogisticRegressionCV
+sklearn.set_config(print_changed_only=True)
+print(LogisticRegressionCV(Cs=np.array([0.1, 1])))
+"
+```2026_09_21_10_33_17899868012026_09_21_10_33_1789986802
+executing输出 Traceback (most recent call last):
+  File "/testbed/sklearn/__check_build/__init__.py", line 44, in <module>
+    from ._check_build import check_build  # noqa
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'sklearn.__check_build._check_build'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<string>", line 2, in <module>
+  File "/testbed/sklearn/__init__.py", line 75, in <module>
+    from . import __check_build
+  File "/testbed/sklearn/__check_build/__init__.py", line 46, in <module>
+    raise_build_error(e)
+  File "/testbed/sklearn/__check_build/__init__.py", line 31, in raise_build_error
+    raise ImportError("""%s
+ImportError: No module named 'sklearn.__check_build._check_build'
+___________________________________________________________________________
+Contents of /testbed/sklearn/__check_build:
+__pycache__               __init__.py               _check_build.pyx
+setup.py                  _check_build.c            _check_build.cpython-36m-x86_64-linux-gnu.so
+___________________________________________________________________________
+It seems that scikit-learn has not been built correctly.
+
+If you have installed scikit-learn from source, please do not forget
+to build the package before using it: run `python setup.py install` or
+`make` in the source directory.
+
+If you have used an installer, please check that it is suited for your
+Python version, your operating system and your platform.
+
+
+Need to run from a different directory or build. Let me check the build state.
+
+```bash-action
+cd /tmp && python -c "
+import sklearn, numpy as np
+print(sklearn.__file__)
+"
+```2026_09_21_10_33_17899868022026_09_21_10_33_1789986803
+executing输出 Traceback (most recent call last):
+  File "<string>", line 2, in <module>
+ModuleNotFoundError: No module named 'sklearn'
+
+
+There's a version mismatch — the .so is for cpython-36 but current python differs. Let me check.
+
+```bash-action
+cd /testbed && python --version && python -c "import sys; print(sys.executable)"
+```2026_09_21_10_33_17899868032026_09_21_10_33_1789986804
+executing输出 Python 3.11.5
+/opt/miniconda3/bin/python
+
+
+```bash-action
+cd /testbed && ls sklearn/__check_build/*.so && ls /opt/miniconda3/envs/ 2>/dev/null && which -a python python3
+```2026_09_21_10_33_17899868042026_09_21_10_33_1789986805
+executing输出 sklearn/__check_build/_check_build.cpython-36m-x86_64-linux-gnu.so
+testbed
+/opt/miniconda3/bin/python
+/usr/bin/python
+/bin/python
+/opt/miniconda3/bin/python3
+/usr/bin/python3
+/bin/python3
+
+
+There's a conda env named "testbed". Let me use it.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python --version && /opt/miniconda3/envs/testbed/bin/python -c "import sklearn; print(sklearn.__file__)"
+```2026_09_21_10_33_17899868052026_09_21_10_33_17899868062026_09_21_10_33_1789986806
+executing输出 Python 3.6.13 :: Anaconda, Inc.
+/testbed/sklearn/__init__.py
+
+
+That env works. Let me set up a repro.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import sklearn
+import numpy as np
+from sklearn.linear_model import LogisticRegressionCV
+sklearn.set_config(print_changed_only=True)
+print(LogisticRegressionCV(Cs=np.array([0.1, 1])))
+"
+```2026_09_21_10_33_17899868062026_09_21_10_33_17899868072026_09_21_10_33_1789986807
+executing输出 Traceback (most recent call last):
+  File "<string>", line 6, in <module>
+  File "/testbed/sklearn/base.py", line 247, in __repr__
+    repr_ = pp.pformat(self)
+  File "/opt/miniconda3/envs/testbed/lib/python3.6/pprint.py", line 144, in pformat
+    self._format(object, sio, 0, 0, {}, 0)
+  File "/opt/miniconda3/envs/testbed/lib/python3.6/pprint.py", line 161, in _format
+    rep = self._repr(object, context, level)
+  File "/opt/miniconda3/envs/testbed/lib/python3.6/pprint.py", line 393, in _repr
+    self._depth, level)
+  File "/testbed/sklearn/utils/_pprint.py", line 170, in format
+    changed_only=self._changed_only)
+  File "/testbed/sklearn/utils/_pprint.py", line 413, in _safe_repr
+    params = _changed_params(object)
+  File "/testbed/sklearn/utils/_pprint.py", line 98, in _changed_params
+    if (v != init_params[k] and
+ValueError: The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()
+
+
+Bug confirmed at `sklearn/utils/_pprint.py:98`. Now let me check the imports at the top of the file and look for other similar comparison patterns.
+
+```bash-action
+cd /testbed && sed -n '1,20p' sklearn/utils/_pprint.py && grep -n "!=\|==" sklearn/utils/_pprint.py
+```2026_09_21_10_33_17899868082026_09_21_10_33_17899868092026_09_21_10_33_1789986809
+executing输出 """This module contains the _EstimatorPrettyPrinter class used in
+BaseEstimator.__repr__ for pretty-printing estimators"""
+
+# Copyright (c) 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+# 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018 Python Software Foundation;
+# All Rights Reserved
+
+# Authors: Fred L. Drake, Jr. <fdrake@acm.org> (built-in CPython pprint module)
+#          Nicolas Hug (scikit-learn specific changes)
+
+# License: PSF License version 2 (see below)
+
+# PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2
+# --------------------------------------------
+
+# 1. This LICENSE AGREEMENT is between the Python Software Foundation ("PSF"),
+# and the Individual or Organization ("Licensee") accessing and otherwise
+# using this software ("Python") in source or binary form and its associated
+# documentation.
+
+98:        if (v != init_params[k] and
+224:            if n_items == self.n_max_elements_to_show:
+280:            if n_items == self.n_max_elements_to_show:
+375:        elif len(object) == 1:
+
+
+Only one relevant comparison. Let me check how `_safe_repr` and the code around line 413 use comparisons too.
+
+```bash-action
+cd /testbed && sed -n '405,425p' sklearn/utils/_pprint.py && grep -n "^from\|^import" sklearn/utils/_pprint.py
+```2026_09_21_10_33_17899868092026_09_21_10_33_17899868102026_09_21_10_33_17899868102026_09_21_10_33_1789986810
+executing输出         if maxlevels and level >= maxlevels:
+            return "{...}", False, objid in context
+        if objid in context:
+            return pprint._recursion(object), False, True
+        context[objid] = 1
+        readable = True
+        recursive = False
+        if changed_only:
+            params = _changed_params(object)
+        else:
+            params = object.get_params(deep=False)
+        components = []
+        append = components.append
+        level += 1
+        saferepr = _safe_repr
+        items = sorted(params.items(), key=pprint._safe_tuple)
+        for k, v in items:
+            krepr, kreadable, krecur = saferepr(
+                k, context, maxlevels, level, changed_only=changed_only)
+            vrepr, vreadable, vrecur = saferepr(
+                v, context, maxlevels, level, changed_only=changed_only)
+66:from inspect import signature
+67:import pprint
+68:from collections import OrderedDict
+70:from ..base import BaseEstimator
+71:from .._config import get_config
+72:from . import is_scalar_nan
+
+
+Now I understand the full picture. The fix is to use a safe comparison that handles array-like values. The standard sklearn pattern is to use `np.array_equal` / handle it robustly. Let me look at how the actual upstream fix handled this — the simplest robust approach for this bug is to use `repr`-based comparison fallback or try/except.
+
+Let me check what's imported and choose the minimal fix. I'll use a helper that compares values safely.
+
+The cleanest minimal fix that matches the codebase idiom: wrap the comparison so array-ambiguity is avoided. I'll implement `_changed_params` to compare with a helper using `np.array_equal` when needed.
+
+Let me check if numpy is imported elsewhere in the file/module scope — I'll import what's needed.
+
+```bash-action
+cd /testbed && grep -rn "np.array_equal\|from numpy" sklearn/utils/_pprint.py
+```
+executing输出 
+
+I'll add a small comparison helper. The robust approach: try the normal comparison, and if it raises ValueError (ambiguous truth value) fall back to `repr` comparison. This handles arrays and any other non-scalar params.
+
+```bash-action
+cd /testbed && sed -n '86,101p' sklearn/utils/_pprint.py
+```2026_09_21_10_33_17899868122026_09_21_10_33_17899868132026_09_21_10_33_1789986813
+executing输出 
+def _changed_params(estimator):
+    """Return dict (param_name: value) of parameters that were given to
+    estimator with non-default values."""
+
+    params = estimator.get_params(deep=False)
+    filtered_params = {}
+    init_func = getattr(estimator.__init__, 'deprecated_original',
+                        estimator.__init__)
+    init_params = signature(init_func).parameters
+    init_params = {name: param.default for name, param in init_params.items()}
+    for k, v in params.items():
+        if (v != init_params[k] and
+                not (is_scalar_nan(init_params[k]) and is_scalar_nan(v))):
+            filtered_params[k] = v
+    return filtered_params
+
+
+Now let me apply the fix with a `_safe_compare` helper. This is the minimal change targeting the root cause.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+path = 'sklearn/utils/_pprint.py'
+with open(path) as f:
+    src = f.read()
+
+old = '''def _changed_params(estimator):
+    """Return dict (param_name: value) of parameters that were given to
+    estimator with non-default values."""
+
+    params = estimator.get_params(deep=False)
+    filtered_params = {}
+    init_func = getattr(estimator.__init__, 'deprecated_original',
+                        estimator.__init__)
+    init_params = signature(init_func).parameters
+    init_params = {name: param.default for name, param in init_params.items()}
+    for k, v in params.items():
+        if (v != init_params[k] and
+                not (is_scalar_nan(init_params[k]) and is_scalar_nan(v))):
+            filtered_params[k] = v
+    return filtered_params
+'''
+
+new = '''def _changed_params(estimator):
+    """Return dict (param_name: value) of parameters that were given to
+    estimator with non-default values."""
+
+    params = estimator.get_params(deep=False)
+    filtered_params = {}
+    init_func = getattr(estimator.__init__, 'deprecated_original',
+                        estimator.__init__)
+    init_params = signature(init_func).parameters
+    init_params = {name: param.default for name, param in init_params.items()}
+
+    def is_changed(v, default):
+        if is_scalar_nan(default) and is_scalar_nan(v):
+            return False
+        try:
+            return bool(v != default)
+        except ValueError:
+            # v is an array-like; comparison with a scalar/array default
+            # yields an array of booleans, which is ambiguous. Fall back on
+            # comparing the reprs.
+            return repr(v) != repr(default)
+
+    for k, v in params.items():
+        if is_changed(v, init_params[k]):
+            filtered_params[k] = v
+    return filtered_params
+'''
+
+assert old in src, "old block not found"
+src = src.replace(old, new)
+with open(path, 'w') as f:
+    f.write(src)
+print("patched")
+EOF
+```2026_09_21_10_33_17899868132026_09_21_10_33_17899868142026_09_21_10_33_17899868142026_09_21_10_33_1789986814
+executing输出 patched
+
+
+Now let me verify the repro is fixed.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import sklearn
+import numpy as np
+from sklearn.linear_model import LogisticRegressionCV
+sklearn.set_config(print_changed_only=True)
+print(LogisticRegressionCV(Cs=np.array([0.1, 1])))
+sklearn.set_config(print_changed_only=False)
+print(LogisticRegressionCV(Cs=np.array([0.1, 1])))
+"
+```
+executing输出 LogisticRegressionCV(Cs=array([0.1, 1. ]))
+LogisticRegressionCV(Cs=array([0.1, 1. ]), class_weight=None, cv='warn',
+                     dual=False, fit_intercept=True, intercept_scaling=1.0,
+                     l1_ratios=None, max_iter=100, multi_class='warn',
+                     n_jobs=None, penalty='l2', random_state=None, refit=True,
+                     scoring=None, solver='lbfgs', tol=0.0001, verbose=0)
+
+
+Bug fixed. Now let me verify the default case (array equal to default should be filtered out). Let me check what the default Cs is and test the "unchanged" path.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import sklearn, numpy as np
+from sklearn.linear_model import LogisticRegression
+sklearn.set_config(print_changed_only=True)
+# LogisticRegression Cs default is 1.0; passing array default-valued should be filtered
+lr = LogisticRegression(C=np.array([1.0]))
+print(lr)
+lr2 = LogisticRegression(C=1.0)
+print(lr2)
+"
+```2026_09_21_10_33_17899868192026_09_21_10_33_17899868192026_09_21_10_33_1789986820
+executing输出 LogisticRegression()
+LogisticRegression()
+
+
+The unchanged-path filtering works correctly (array `[1.0]` interpreted as default? Actually `repr(np.array([1.0])) != repr(1.0)` so it fell into the except branch and considered it changed... but it printed unchanged. Let me check why).
+
+Wait — LogisticRegression's default in this version may already be a different type. Let me verify more carefully with a clearer test where the array differs from the default.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import sklearn, numpy as np
+from sklearn.linear_model import LogisticRegression
+sklearn.set_config(print_changed_only=True)
+print('default C repr:', repr(LogisticRegression().C))
+print(LogisticRegression(C=np.array([2.0])))   # changed
+print(LogisticRegression(C=1.0))               # unchanged scalar -> filtered
+"
+```2026_09_21_10_33_17899868202026_09_21_10_33_17899868202026_09_21_10_33_1789986821
+executing输出 default C repr: 1.0
+LogisticRegression(C=array([2.]))
+LogisticRegression()
+
+
+Correct. The array default `C=np.array([1.0])` from a moment ago: `np.array([1.0]) != 1.0` returns `array([False])` which is a 1-element array, and `bool()` of it is `False`, so it correctly considered unchanged. Good — the try/except only kicks in for multi-element arrays where bool() genuinely raises.
+
+Now let me find and run the existing tests covering this module.
+
+```bash-action
+cd /testbed && ls sklearn/utils/tests/test_pprint.py && /opt/miniconda3/envs/testbed/bin/python -m pytest sklearn/utils/tests/test_pprint.py -q 2>&1 | tail -20
+```2026_09_21_10_33_17899868222026_09_21_10_33_17899868232026_09_21_10_33_17899868232026_09_21_10_33_1789986823
+executing输出 sklearn/utils/tests/test_pprint.py
+.........                                                                [100%]
+9 passed in 0.49s
+
+
+Existing tests pass. Let me also add the exact issue scenario to make sure. Let me verify my diff and confirm nothing else in the file needs fixing.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_10_33_17899868252026_09_21_10_33_17899868262026_09_21_10_33_17899868262026_09_21_10_33_17899868262026_09_21_10_33_1789986827
+executing输出 diff --git a/sklearn/utils/_pprint.py b/sklearn/utils/_pprint.py
+index b8686dba5..d25a861d0 100755
+--- a/sklearn/utils/_pprint.py
++++ b/sklearn/utils/_pprint.py
+@@ -94,9 +94,20 @@ def _changed_params(estimator):
+                         estimator.__init__)
+     init_params = signature(init_func).parameters
+     init_params = {name: param.default for name, param in init_params.items()}
++
++    def is_changed(v, default):
++        if is_scalar_nan(default) and is_scalar_nan(v):
++            return False
++        try:
++            return bool(v != default)
++        except ValueError:
++            # v is an array-like; comparison with a scalar/array default
++            # yields an array of booleans, which is ambiguous. Fall back on
++            # comparing the reprs.
++            return repr(v) != repr(default)
++
+     for k, v in params.items():
+-        if (v != init_params[k] and
+-                not (is_scalar_nan(init_params[k]) and is_scalar_nan(v))):
++        if is_changed(v, init_params[k]):
+             filtered_params[k] = v
+     return filtered_params
+ 
+
+
+The diff is exactly the targeted fix: the root cause was the ambiguous `v != init_params[k]` truth-value evaluation for array params. I wrapped it in a helper that returns a plain bool and falls back to repr comparison for ambiguous array-like comparisons. Existing tests pass and the issue's repro now works.
+
+Task complete.
+
+```bash-action
+exit
+```

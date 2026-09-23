@@ -1,0 +1,758 @@
+plan-unwanted
+我先看一下仓库情况和相关源码。
+
+```bash-action
+cd /testbed && git log --oneline -3 && git status
+```
+executing输出 e8053fb4 SWE-bench
+36453b95 Merge pull request #3365 from nateprewitt/3364_chunking_is_int
+cf3c9989 added in type check for chunk_size
+On branch main
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+nothing added to commit but untracked files present (use "git add" to track)
+
+
+```bash-action
+cd /testbed && grep -n "decode_unicode" requests/*.py
+```
+executing输出 requests/models.py:653:    def iter_content(self, chunk_size=1, decode_unicode=False):
+requests/models.py:660:        If decode_unicode is True, content will be decoded using the best
+requests/models.py:697:        if decode_unicode:
+requests/models.py:702:    def iter_lines(self, chunk_size=ITER_CHUNK_SIZE, decode_unicode=None, delimiter=None):
+requests/models.py:712:        for chunk in self.iter_content(chunk_size=chunk_size, decode_unicode=decode_unicode):
+
+
+```bash-action
+cd /testbed && sed -n '640,720p' requests/models.py
+```2026_09_21_10_21_1789986103
+executing输出         """
+        return ('location' in self.headers and self.status_code in REDIRECT_STATI)
+
+    @property
+    def is_permanent_redirect(self):
+        """True if this Response one of the permanent versions of redirect"""
+        return ('location' in self.headers and self.status_code in (codes.moved_permanently, codes.permanent_redirect))
+
+    @property
+    def apparent_encoding(self):
+        """The apparent encoding, provided by the chardet library"""
+        return chardet.detect(self.content)['encoding']
+
+    def iter_content(self, chunk_size=1, decode_unicode=False):
+        """Iterates over the response data.  When stream=True is set on the
+        request, this avoids reading the content at once into memory for
+        large responses.  The chunk size is the number of bytes it should
+        read into memory.  This is not necessarily the length of each item
+        returned as decoding can take place.
+
+        If decode_unicode is True, content will be decoded using the best
+        available encoding based on the response.
+        """
+
+        def generate():
+            # Special case for urllib3.
+            if hasattr(self.raw, 'stream'):
+                try:
+                    for chunk in self.raw.stream(chunk_size, decode_content=True):
+                        yield chunk
+                except ProtocolError as e:
+                    raise ChunkedEncodingError(e)
+                except DecodeError as e:
+                    raise ContentDecodingError(e)
+                except ReadTimeoutError as e:
+                    raise ConnectionError(e)
+            else:
+                # Standard file-like object.
+                while True:
+                    chunk = self.raw.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+
+            self._content_consumed = True
+
+        if self._content_consumed and isinstance(self._content, bool):
+            raise StreamConsumedError()
+        elif not isinstance(chunk_size, int):
+            raise TypeError("chunk_size must be an int, it is instead a %s." % type(chunk_size))
+        # simulate reading small chunks of the content
+        reused_chunks = iter_slices(self._content, chunk_size)
+
+        stream_chunks = generate()
+
+        chunks = reused_chunks if self._content_consumed else stream_chunks
+
+        if decode_unicode:
+            chunks = stream_decode_response_unicode(chunks, self)
+
+        return chunks
+
+    def iter_lines(self, chunk_size=ITER_CHUNK_SIZE, decode_unicode=None, delimiter=None):
+        """Iterates over the response data, one line at a time.  When
+        stream=True is set on the request, this avoids reading the
+        content at once into memory for large responses.
+
+        .. note:: This method is not reentrant safe.
+        """
+
+        pending = None
+
+        for chunk in self.iter_content(chunk_size=chunk_size, decode_unicode=decode_unicode):
+
+            if pending is not None:
+                chunk = pending + chunk
+
+            if delimiter:
+                lines = chunk.split(delimiter)
+            else:
+                lines = chunk.splitlines()
+
+
+Now let me look at `stream_decode_response_unicode` in utils.py.
+
+```bash-action
+cd /testbed && grep -n "stream_decode_response_unicode" requests/utils.py && sed -n '/def stream_decode_response_unicode/,/^def /p' requests/utils.py
+```2026_09_21_10_21_1789986104
+executing输出 359:def stream_decode_response_unicode(iterator, r):
+def stream_decode_response_unicode(iterator, r):
+    """Stream decodes a iterator."""
+
+    if r.encoding is None:
+        for item in iterator:
+            yield item
+        return
+
+    decoder = codecs.getincrementaldecoder(r.encoding)(errors='replace')
+    for chunk in iterator:
+        rv = decoder.decode(chunk)
+        if rv:
+            yield rv
+    rv = decoder.decode(b'', final=True)
+    if rv:
+        yield rv
+
+
+def iter_slices(string, slice_length):
+
+
+I found the root cause. Let me reproduce the bug first.
+
+```bash-action
+cd /testbed && python -c "
+import requests
+from requests import Response
+
+# Simulate a JSON response without explicit encoding
+r = Response()
+r.status_code = 200
+r.headers['Content-Type'] = 'application/json'
+r._content = b'{\"a\": 1}'
+r.encoding = None
+r._content_consumed = True
+
+print('text:', repr(r.text))
+print('iter_content:', repr(next(r.iter_content(16*1024, decode_unicode=True))))
+"
+```2026_09_21_10_21_17899861052026_09_21_10_21_1789986106
+executing输出 Traceback (most recent call last):
+  File "<string>", line 2, in <module>
+  File "/testbed/requests/__init__.py", line 64, in <module>
+    from . import utils
+  File "/testbed/requests/utils.py", line 28, in <module>
+    from .cookies import RequestsCookieJar, cookiejar_from_dict
+  File "/testbed/requests/cookies.py", line 164, in <module>
+    class RequestsCookieJar(cookielib.CookieJar, collections.MutableMapping):
+                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'collections' has no attribute 'MutableMapping'
+
+
+This is a Python version incompatibility (Python 3.10+ moved `MutableMapping` out of `collections`). Let me check the Python version and whether this is a separate environment issue.
+
+```bash-action
+cd /testbed && python --version
+```2026_09_21_10_21_17899861062026_09_21_10_21_1789986107
+executing输出 Python 3.11.5
+
+
+This is an unrelated environment compatibility issue. My task is scoped to the issue, not fixing `collections.MutableMapping`. I'll focus on the actual bug and verify `stream_decode_response_unicode` logic independently.
+
+```bash-action
+cd /testbed && python -c "
+from requests.utils import stream_decode_response_unicode
+
+class FakeResp:
+    encoding = None
+
+# When encoding is None, decode_unicode yields bytes unchanged -> BUG
+print('encoding None ->', repr(list(stream_decode_response_unicode([b'{\"a\": 1}'], FakeResp()))))
+"
+```2026_09_21_10_21_1789986107
+executing输出 Traceback (most recent call last):
+  File "<string>", line 2, in <module>
+  File "/testbed/requests/__init__.py", line 64, in <module>
+    from . import utils
+  File "/testbed/requests/utils.py", line 28, in <module>
+    from .cookies import RequestsCookieJar, cookiejar_from_dict
+  File "/testbed/requests/cookies.py", line 164, in <module>
+    class RequestsCookieJar(cookielib.CookieJar, collections.MutableMapping):
+                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'collections' has no attribute 'MutableMapping'
+
+
+The import failure blocks testing anything from the requests package. I need the package importable to run tests. This `collections.MutableMapping` issue must be addressed so I can validate my fix — but the task says only change necessary source. Let me check if there's a test harness that patches this, or if the SWE-bench env expects an older Python.
+
+Let me check other files for similar `collections.` usages.
+
+```bash-action
+cd /testbed && grep -rn "collections\.\(MutableMapping\|Mapping\|Iterable\|Sequence\|Callable\)" requests/
+```2026_09_21_10_21_17899861092026_09_21_10_21_17899861092026_09_21_10_21_1789986110
+executing输出 requests/models.py:170:        if isinstance(hook, collections.Callable):
+requests/models.py:173:            self.hooks[event].extend(h for h in hook if isinstance(h, collections.Callable))
+requests/cookies.py:164:class RequestsCookieJar(cookielib.CookieJar, collections.MutableMapping):
+requests/structures.py:16:class CaseInsensitiveDict(collections.MutableMapping):
+requests/structures.py:21:    ``collections.MutableMapping`` as well as dict's ``copy``. Also
+requests/structures.py:76:        if isinstance(other, collections.Mapping):
+requests/utils.py:197:    if isinstance(value, collections.Mapping):
+
+
+These are many pre-existing incompatibilities. The SWE-bench evaluation for this repo likely uses a patch that makes it importable, OR the test runner installs a compatibility shim. Let me check if there's a conftest or sitecustomize, and check pip.
+
+```bash-action
+cd /testbed && ls && cat setup.py 2>/dev/null | head -20 && python -c "import sys; print(sys.path)"
+```2026_09_21_10_21_17899861102026_09_21_10_21_1789986111
+executing输出 AUTHORS.rst
+CONTRIBUTING.md
+HISTORY.rst
+LICENSE
+MANIFEST.in
+Makefile
+My_agent.py
+NOTICE
+README.rst
+__pycache__
+actions.py
+build
+chat_export.py
+chat_history
+docs
+ext
+llm.py
+requests
+requests.egg-info
+requirements-to-freeze.txt
+requirements.txt
+setup.py
+system_prompt.txt
+tests
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+
+from codecs import open
+
+from setuptools import setup
+from setuptools.command.test import test as TestCommand
+
+
+class PyTest(TestCommand):
+    user_options = [('pytest-args=', 'a', "Arguments to pass into py.test")]
+
+    def initialize_options(self):
+        TestCommand.initialize_options(self)
+        self.pytest_args = []
+
+    def finalize_options(self):
+['', '/opt/miniconda3/lib/python311.zip', '/opt/miniconda3/lib/python3.11', '/opt/miniconda3/lib/python3.11/lib-dynload', '/opt/miniconda3/lib/python3.11/site-packages']
+
+
+The environment can't even import requests on Python 3.11. SWE-bench instances normally pin an older Python, but here `python` is 3.11.5. There may be multiple conda envs. Let me check.
+
+```bash-action
+ls /opt/miniconda3/envs/ 2>/dev/null; which -a python python3; conda env list 2>/dev/null
+```2026_09_21_10_21_17899861112026_09_21_10_21_1789986112
+executing输出 testbed
+/opt/miniconda3/bin/python
+/usr/bin/python
+/bin/python
+/opt/miniconda3/bin/python3
+/usr/bin/python3
+/bin/python3
+# conda environments:
+#
+base                     /opt/miniconda3
+testbed                  /opt/miniconda3/envs/testbed
+
+
+
+There's a `testbed` conda env. Let me use its python.
+
+```bash-action
+/opt/miniconda3/envs/testbed/bin/python --version && /opt/miniconda3/envs/testbed/bin/python -c "import requests; print(requests.__version__)"
+```2026_09_21_10_21_17899861132026_09_21_10_21_17899861142026_09_21_10_21_1789986114
+executing输出 Python 3.9.20
+2.10.0
+
+
+The `testbed` env works. Now let me reproduce the bug there.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+from requests import Response
+
+r = Response()
+r.status_code = 200
+r.headers['Content-Type'] = 'application/json'
+r._content = b'{\"a\": 1}'
+r.encoding = None
+r._content_consumed = True
+
+print('text:', repr(r.text))
+print('iter_content:', repr(next(r.iter_content(16*1024, decode_unicode=True))))
+"
+```2026_09_21_10_21_17899861142026_09_21_10_21_1789986115
+executing输出 text: '{"a": 1}'
+iter_content: b'{"a": 1}'
+
+
+Bug reproduced. `r.text` returns `'{"a": 1}'` (unicode) but `iter_content(decode_unicode=True)` returns bytes.
+
+**Root cause:** `stream_decode_response_unicode` in `utils.py` bails out and yields raw bytes when `r.encoding is None`. But `r.text` handles `encoding is None` by falling back to `apparent_encoding`. So `iter_content(decode_unicode=True)` should do the same.
+
+Let me look at how `text` derives encoding.
+
+```bash-action
+cd /testbed && sed -n '740,800p' requests/models.py
+```2026_09_21_10_21_17899861152026_09_21_10_21_17899861162026_09_21_10_21_1789986116
+executing输出                 if self._content_consumed:
+                    raise RuntimeError(
+                        'The content for this response was already consumed')
+
+                if self.status_code == 0:
+                    self._content = None
+                else:
+                    self._content = bytes().join(self.iter_content(CONTENT_CHUNK_SIZE)) or bytes()
+
+            except AttributeError:
+                self._content = None
+
+        self._content_consumed = True
+        # don't need to release the connection; that's been handled by urllib3
+        # since we exhausted the data.
+        return self._content
+
+    @property
+    def text(self):
+        """Content of the response, in unicode.
+
+        If Response.encoding is None, encoding will be guessed using
+        ``chardet``.
+
+        The encoding of the response content is determined based solely on HTTP
+        headers, following RFC 2616 to the letter. If you can take advantage of
+        non-HTTP knowledge to make a better guess at the encoding, you should
+        set ``r.encoding`` appropriately before accessing this property.
+        """
+
+        # Try charset from content-type
+        content = None
+        encoding = self.encoding
+
+        if not self.content:
+            return str('')
+
+        # Fallback to auto-detected encoding.
+        if self.encoding is None:
+            encoding = self.apparent_encoding
+
+        # Decode unicode from given encoding.
+        try:
+            content = str(self.content, encoding, errors='replace')
+        except (LookupError, TypeError):
+            # A LookupError is raised if the encoding was not found which could
+            # indicate a misspelling or similar mistake.
+            #
+            # A TypeError can be raised if encoding is None
+            #
+            # So we try blindly encoding.
+            content = str(self.content, errors='replace')
+
+        return content
+
+    def json(self, **kwargs):
+        """Returns the json-encoded content of a response, if any.
+
+        :param \*\*kwargs: Optional arguments that ``json.loads`` takes.
+        """
+
+
+
+Now I understand. `text` falls back to `apparent_encoding` when `encoding is None`. Let me fix `stream_decode_response_unicode` to do the same.
+
+```bash-action
+cd /testbed && sed -n '355,378p' requests/utils.py
+```2026_09_21_10_21_17899861172026_09_21_10_21_1789986118
+executing输出     if 'text' in content_type:
+        return 'ISO-8859-1'
+
+
+def stream_decode_response_unicode(iterator, r):
+    """Stream decodes a iterator."""
+
+    if r.encoding is None:
+        for item in iterator:
+            yield item
+        return
+
+    decoder = codecs.getincrementaldecoder(r.encoding)(errors='replace')
+    for chunk in iterator:
+        rv = decoder.decode(chunk)
+        if rv:
+            yield rv
+    rv = decoder.decode(b'', final=True)
+    if rv:
+        yield rv
+
+
+def iter_slices(string, slice_length):
+    """Iterate over slices of a string."""
+
+
+Now I'll fix it. When `encoding is None`, fall back to `apparent_encoding` like `text` does. If that's also None, we can't decode reliably, so yield bytes (matching prior behavior).
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'requests/utils.py'
+s = open(p).read()
+old = '''def stream_decode_response_unicode(iterator, r):
+    """Stream decodes a iterator."""
+
+    if r.encoding is None:
+        for item in iterator:
+            yield item
+        return
+
+    decoder = codecs.getincrementaldecoder(r.encoding)(errors='replace')'''
+new = '''def stream_decode_response_unicode(iterator, r):
+    """Stream decodes an iterator."""
+
+    if r.encoding is None:
+        for item in iterator:
+            yield item
+        return
+
+    decoder = codecs.getincrementaldecoder(r.encoding)(errors='replace')'''
+# only fix typo check then do real change separately
+EOF
+echo "noop"
+```2026_09_21_10_21_17899861182026_09_21_10_21_17899861182026_09_21_10_21_1789986119
+
+Let me reconsider the cleanest fix. The minimal, correct fix is in `iter_content`: when `decode_unicode=True` and `encoding` is None, use `apparent_encoding`. Actually, the correct place matching `text`'s behavior is `stream_decode_response_unicode` — fall back to `apparent_encoding`.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+p = 'requests/utils.py'
+s = open(p).read()
+old = '''def stream_decode_response_unicode(iterator, r):
+    """Stream decodes a iterator."""
+
+    if r.encoding is None:
+        for item in iterator:
+            yield item
+        return
+
+    decoder = codecs.getincrementaldecoder(r.encoding)(errors='replace')
+    for chunk in iterator:
+        rv = decoder.decode(chunk)
+        if rv:
+            yield rv
+    rv = decoder.decode(b'', final=True)
+    if rv:
+        yield rv'''
+new = '''def stream_decode_response_unicode(iterator, r):
+    """Stream decodes an iterator."""
+
+    if r.encoding is None:
+        for item in iterator:
+            yield item
+        return
+
+    decoder = codecs.getincrementaldecoder(r.encoding)(errors='replace')
+    for chunk in iterator:
+        rv = decoder.decode(chunk)
+        if rv:
+            yield rv
+    rv = decoder.decode(b'', final=True)
+    if rv:
+        yield rv'''
+assert old in s
+EOF
+echo "check done"
+```2026_09_21_10_21_17899861192026_09_21_10_21_1789986119
+
+I'm overcomplicating. Let me directly write the fix: in `iter_content`, when `decode_unicode` is requested, the response's effective encoding should account for `apparent_encoding` fallback. I'll modify `iter_content` to set the fallback.
+
+```bash-action
+cd /testbed && sed -n '690,700p' requests/models.py
+```2026_09_21_10_21_17899861192026_09_21_10_21_1789986120
+executing输出 noop
+
+
+I'll apply the fix in `utils.py`'s `stream_decode_response_unicode` to fall back to `apparent_encoding`, matching `text`.
+
+```bash-action
+cd /testbed && python - <<'PYEOF'
+p = 'requests/utils.py'
+s = open(p).read()
+old = '''def stream_decode_response_unicode(iterator, r):
+    """Stream decodes a iterator."""
+
+    if r.encoding is None:
+        for item in iterator:
+            yield item
+        return
+
+    decoder = codecs.getincrementaldecoder(r.encoding)(errors='replace')'''
+new = '''def stream_decode_response_unicode(iterator, r):
+    """Stream decodes an iterator."""
+
+    if r.encoding is None:
+        encoding = r.apparent_encoding
+    else:
+        encoding = r.encoding
+
+    if encoding is None:
+        for item in iterator:
+            yield item
+        return
+
+    decoder = codecs.getincrementaldecoder(encoding)(errors='replace')'''
+assert old in s, "old block not found"
+s = s.replace(old, new)
+open(p,'w').write(s)
+print("patched")
+PYEOF
+```2026_09_21_10_22_17899861212026_09_21_10_22_17899861222026_09_21_10_22_1789986122
+executing输出 patched
+
+
+Now let me re-run the reproduction script.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+from requests import Response
+
+r = Response()
+r.status_code = 200
+r.headers['Content-Type'] = 'application/json'
+r._content = b'{\"a\": 1}'
+r.encoding = None
+r._content_consumed = True
+
+print('text:', repr(r.text))
+print('iter_content:', repr(next(r.iter_content(16*1024, decode_unicode=True))))
+"
+```2026_09_21_10_22_17899861232026_09_21_10_22_17899861232026_09_21_10_22_1789986124
+executing输出 text: '{"a": 1}'
+iter_content: '{"a": 1}'
+
+
+The bug is fixed. Now let me find and run the existing tests covering this module.
+
+```bash-action
+cd /testbed && grep -rln "stream_decode_response_unicode\|decode_unicode\|iter_content" tests/
+```2026_09_21_10_22_17899861242026_09_21_10_22_17899861252026_09_21_10_22_1789986125
+executing输出 tests/test_requests.py
+
+
+```bash-action
+cd /testbed && grep -n "decode_unicode\|iter_content\|stream_decode" tests/test_requests.py
+```2026_09_21_10_22_17899861262026_09_21_10_22_17899861272026_09_21_10_22_17899861272026_09_21_10_22_1789986128
+executing输出 963:    def test_response_decode_unicode(self):
+965:        When called with decode_unicode, Response.iter_content should always
+973:        chunks = r.iter_content(decode_unicode=True)
+980:        chunks = r.iter_content(decode_unicode=True)
+989:        chunks = r.iter_content(1)
+995:            chunks = r.iter_content("1024")
+1184:        r1.iter_content(8)
+1188:        # read all of the response via iter_content,
+1190:        for _ in r2.iter_content():
+
+
+```bash-action
+cd /testbed && sed -n '955,1000p' tests/test_requests.py
+```2026_09_21_10_22_17899861262026_09_21_10_22_17899861272026_09_21_10_22_17899861272026_09_21_10_22_1789986128
+executing输出 
+        def read_mock(amt, decode_content=None):
+            return read_(amt)
+        setattr(io, 'read', read_mock)
+        r.raw = io
+        assert next(iter(r))
+        io.close()
+
+    def test_response_decode_unicode(self):
+        """
+        When called with decode_unicode, Response.iter_content should always
+        return unicode.
+        """
+        r = requests.Response()
+        r._content_consumed = True
+        r._content = b'the content'
+        r.encoding = 'ascii'
+
+        chunks = r.iter_content(decode_unicode=True)
+        assert all(isinstance(chunk, str) for chunk in chunks)
+
+        # also for streaming
+        r = requests.Response()
+        r.raw = io.BytesIO(b'the content')
+        r.encoding = 'ascii'
+        chunks = r.iter_content(decode_unicode=True)
+        assert all(isinstance(chunk, str) for chunk in chunks)
+
+    def test_response_chunk_size_int(self):
+        """Ensure that chunk_size is passed as an integer, otherwise
+        raise a TypeError.
+        """
+        r = requests.Response()
+        r.raw = io.BytesIO(b'the content')
+        chunks = r.iter_content(1)
+        assert all(len(chunk) == 1 for chunk in chunks)
+
+        r = requests.Response()
+        r.raw = io.BytesIO(b'the content')
+        with pytest.raises(TypeError):
+            chunks = r.iter_content("1024")
+
+    def test_request_and_response_are_pickleable(self, httpbin):
+        r = requests.get(httpbin('get'))
+
+        # verify we can pickle the original request
+
+
+Let me run the relevant tests.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest tests/test_requests.py -k "decode_unicode or chunk_size or iter_content" -x -q 2>&1 | tail -30
+```2026_09_21_10_22_17899861272026_09_21_10_22_17899861282026_09_21_10_22_17899861282026_09_21_10_22_1789986128
+executing输出 ..                                                                       [100%]
+=============================== warnings summary ===============================
+requests/packages/urllib3/_collections.py:2
+requests/packages/urllib3/_collections.py:2
+    from collections import Mapping, MutableMapping
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2 passed, 183 deselected, 2 warnings in 0.12s
+
+
+Let me also run the broader test file portions that don't require network to make sure nothing broke, and check the full file compiles.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest tests/test_requests.py -q 2>&1 | tail -15
+```2026_09_21_10_22_17899861282026_09_21_10_22_17899861292026_09_21_10_22_17899861292026_09_21_10_22_1789986129
+executing输出 ERROR tests/test_requests.py::TestRequests::test_json_param_post_should_not_override_data_param
+ERROR tests/test_requests.py::TestRequests::test_response_iter_lines
+ERROR tests/test_requests.py::TestRequests::test_unconsumed_session_response_closes_connection
+ERROR tests/test_requests.py::TestRequests::test_session_close_proxy_clear
+ERROR tests/test_requests.py::TestRequests::test_response_json_when_content_is_None
+ERROR tests/test_requests.py::TestTimeout::test_stream_timeout
+ERROR tests/test_requests.py::TestTimeout::test_invalid_timeout[timeout0-(connect, read)]
+ERROR tests/test_requests.py::TestTimeout::test_invalid_timeout[foo-must be an int or float]
+ERROR tests/test_requests.py::TestTimeout::test_none_timeout
+ERROR tests/test_requests.py::TestTimeout::test_read_timeout
+ERROR tests/test_requests.py::TestTimeout::test_encoded_methods
+ERROR tests/test_requests.py::test_requests_are_updated_each_time
+ERROR tests/test_requests.py::test_urllib3_retries
+ERROR tests/test_requests.py::test_urllib3_pool_connection_closed
+4 failed, 72 passed, 1 xfailed, 3 warnings, 108 errors in 6.22s
+
+
+The errors are network-related (these tests require an httpbin server, which isn't running). The 4 failures — let me check whether they're related to my change or pre-existing.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest tests/test_requests.py -q 2>&1 | grep -E "^FAILED|failed" | head -20
+```2026_09_21_10_22_17899861362026_09_21_10_22_17899861372026_09_21_10_22_17899861372026_09_21_10_22_17899861372026_09_21_10_22_1789986138
+executing输出 FAILED tests/test_requests.py::TestRequests::test_errors[http://doesnotexist.google.com-ConnectionError]
+FAILED tests/test_requests.py::TestRequests::test_proxy_error - Failed: DID N...
+FAILED tests/test_requests.py::TestTimeout::test_connect_timeout - requests.e...
+FAILED tests/test_requests.py::TestTimeout::test_total_timeout_connect - requ...
+4 failed, 72 passed, 1 xfailed, 3 warnings, 108 errors in 6.27s
+
+
+These 4 failures are all network/DNS related (`doesnotexist.google.com`, proxy error, connect timeout) — unrelated to my change and expected in a sandbox without network. The errors are all httpbin-requiring tests.
+
+Let me confirm these failures are pre-existing by checking they don't touch my code, and run the specific decode_unicode tests once more with the streaming path.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest tests/test_requests.py::TestRequests::test_response_decode_unicode tests/test_requests.py::TestRequests::test_response_chunk_size_int tests/test_requests.py::TestRequests::test_response_iter_lines -q 2>&1 | tail -15
+```2026_09_21_10_22_1789986143
+executing输出 E       recursive dependency involving fixture 'httpbin' detected
+>       available fixtures: cache, capfd, capfdbinary, caplog, capsys, capsysbinary, doctest_namespace, httpbin, httpbin_secure, monkeypatch, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory
+>       use 'pytest --fixtures [testpath]' for help on them.
+
+/testbed/tests/conftest.py:16
+=============================== warnings summary ===============================
+requests/packages/urllib3/_collections.py:2
+requests/packages/urllib3/_collections.py:2
+    from collections import Mapping, MutableMapping
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+ERROR tests/test_requests.py::TestRequests::test_response_iter_lines
+2 passed, 2 warnings, 1 error in 0.02s
+
+
+The two tests relevant to my change pass. `test_response_iter_lines` requires httpbin (network fixture) so it errors in this sandbox — unrelated to my fix.
+
+Now let me verify the diff.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_10_22_17899861452026_09_21_10_22_17899861462026_09_21_10_22_17899861462026_09_21_10_22_17899861472026_09_21_10_22_1789986146
+executing输出 diff --git a/requests/utils.py b/requests/utils.py
+index 8d17b6b2..b73970b7 100755
+--- a/requests/utils.py
++++ b/requests/utils.py
+@@ -357,14 +357,19 @@ def get_encoding_from_headers(headers):
+ 
+ 
+ def stream_decode_response_unicode(iterator, r):
+-    """Stream decodes a iterator."""
++    """Stream decodes an iterator."""
+ 
+     if r.encoding is None:
++        encoding = r.apparent_encoding
++    else:
++        encoding = r.encoding
++
++    if encoding is None:
+         for item in iterator:
+             yield item
+         return
+ 
+-    decoder = codecs.getincrementaldecoder(r.encoding)(errors='replace')
++    decoder = codecs.getincrementaldecoder(encoding)(errors='replace')
+     for chunk in iterator:
+         rv = decoder.decode(chunk)
+         if rv:
+
+
+The diff is exactly what I want:
+- Fall back to `apparent_encoding` when `r.encoding is None` (matching `Response.text` behavior).
+- Only yield raw bytes if we truly can't determine any encoding.
+
+The reproduction now returns unicode, and the relevant existing tests pass. The task is complete.
+
+```bash-action
+exit
+```

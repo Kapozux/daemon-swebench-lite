@@ -1,0 +1,1006 @@
+plan-unwanted
+```bash-action
+cd /testbed && grep -n "resolve_redirects" requests/sessions.py | head -5
+```
+executing输出 84:    def resolve_redirects(self, resp, req, stream=False, timeout=None,
+480:        # Set up variables needed for resolve_redirects and dispatching of hooks
+514:        gen = self.resolve_redirects(r, request,
+
+
+```bash-action
+cd /testbed && sed -n '84,200p' requests/sessions.py
+```2026_09_21_10_18_1789985921
+executing输出     def resolve_redirects(self, resp, req, stream=False, timeout=None,
+                          verify=True, cert=None, proxies=None):
+        """Receives a Response. Returns a generator of Responses."""
+
+        i = 0
+
+        while resp.is_redirect:
+            prepared_request = req.copy()
+
+            resp.content  # Consume socket so it can be released
+
+            if i >= self.max_redirects:
+                raise TooManyRedirects('Exceeded %s redirects.' % self.max_redirects)
+
+            # Release the connection back into the pool.
+            resp.close()
+
+            url = resp.headers['location']
+            method = req.method
+
+            # Handle redirection without scheme (see: RFC 1808 Section 4)
+            if url.startswith('//'):
+                parsed_rurl = urlparse(resp.url)
+                url = '%s:%s' % (parsed_rurl.scheme, url)
+
+            # The scheme should be lower case...
+            parsed = urlparse(url)
+            url = parsed.geturl()
+
+            # Facilitate non-RFC2616-compliant 'location' headers
+            # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
+            # Compliant with RFC3986, we percent encode the url.
+            if not urlparse(url).netloc:
+                url = urljoin(resp.url, requote_uri(url))
+            else:
+                url = requote_uri(url)
+
+            prepared_request.url = to_native_string(url)
+
+            # http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.3.4
+            if (resp.status_code == codes.see_other and
+                    method != 'HEAD'):
+                method = 'GET'
+
+            # Do what the browsers do, despite standards...
+            # First, turn 302s into GETs.
+            if resp.status_code == codes.found and method != 'HEAD':
+                method = 'GET'
+
+            # Second, if a POST is responded to with a 301, turn it into a GET.
+            # This bizarre behaviour is explained in Issue 1704.
+            if resp.statu
+....(省略中间部分)...
+d
+
+            # https://github.com/kennethreitz/requests/issues/1084
+            if resp.status_code not in (codes.temporary, codes.resume):
+                if 'Content-Length' in prepared_request.headers:
+                    del prepared_request.headers['Content-Length']
+
+                prepared_request.body = None
+
+            headers = prepared_request.headers
+            try:
+                del headers['Cookie']
+            except KeyError:
+                pass
+
+            extract_cookies_to_jar(prepared_request._cookies, prepared_request, resp.raw)
+            prepared_request._cookies.update(self.cookies)
+            prepared_request.prepare_cookies(prepared_request._cookies)
+
+            if 'Authorization' in headers:
+                # If we get redirected to a new host, we should strip out any
+                # authentication headers.
+                original_parsed = urlparse(resp.request.url)
+                redirect_parsed = urlparse(url)
+
+                if (original_parsed.hostname != redirect_parsed.hostname):
+                    del headers['Authorization']
+
+            # .netrc might have more auth for us.
+            new_auth = get_netrc_auth(url) if self.trust_env else None
+            if new_auth is not None:
+                prepared_request.prepare_auth(new_auth)
+
+            resp = self.send(
+                prepared_request,
+                stream=stream,
+                timeout=timeout,
+                verify=verify,
+                cert=cert,
+                proxies=proxies,
+                allow_redirects=False,
+            )
+
+            extract_cookies_to_jar(self.cookies, prepared_request, resp.raw)
+
+            i += 1
+            yield resp
+
+
+class Session(SessionRedirectMixin):
+    """A Requests session.
+
+    Provides cookie persistence, connection-pooling, and configuration.
+
+    Basic Usage::
+
+      >>> import requests
+      >>> s = requests.Session()
+      >>> s.get('http://httpbin.org/get')
+      200
+    """
+
+    __attrs__ = [
+
+
+Root cause confirmed: `prepared_request = req.copy()` uses the original `req` every iteration instead of the previous prepared request. So the method of the *original* request is always used, losing intermediate method conversions.
+
+The fix: `req = resp.request` at the start of each loop iteration (so subsequent iterations base off the last request), and copy from there.
+
+Let me view the exact lines to edit:
+
+```bash-action
+cd /testbed && sed -n '92,96p' requests/sessions.py
+```2026_09_21_10_18_17899859212026_09_21_10_18_1789985921
+executing输出 
+            resp.content  # Consume socket so it can be released
+
+            if i >= self.max_redirects:
+                raise TooManyRedirects('Exceeded %s redirects.' % self.max_redirects)
+
+
+The loop starts by copying `req` (the original). The fix is to update `req` to `resp.request` at the end of each iteration so the *previous* request is the basis for the next. Let me look at the body/method handling more precisely:
+
+```bash-action
+cd /testbed && sed -n '130,175p' requests/sessions.py
+```2026_09_21_10_18_17899859232026_09_21_10_18_17899859232026_09_21_10_18_1789985923
+executing输出             if resp.status_code == codes.found and method != 'HEAD':
+                method = 'GET'
+
+            # Second, if a POST is responded to with a 301, turn it into a GET.
+            # This bizarre behaviour is explained in Issue 1704.
+            if resp.status_code == codes.moved and method == 'POST':
+                method = 'GET'
+
+            prepared_request.method = method
+
+            # https://github.com/kennethreitz/requests/issues/1084
+            if resp.status_code not in (codes.temporary, codes.resume):
+                if 'Content-Length' in prepared_request.headers:
+                    del prepared_request.headers['Content-Length']
+
+                prepared_request.body = None
+
+            headers = prepared_request.headers
+            try:
+                del headers['Cookie']
+            except KeyError:
+                pass
+
+            extract_cookies_to_jar(prepared_request._cookies, prepared_request, resp.raw)
+            prepared_request._cookies.update(self.cookies)
+            prepared_request.prepare_cookies(prepared_request._cookies)
+
+            if 'Authorization' in headers:
+                # If we get redirected to a new host, we should strip out any
+                # authentication headers.
+                original_parsed = urlparse(resp.request.url)
+                redirect_parsed = urlparse(url)
+
+                if (original_parsed.hostname != redirect_parsed.hostname):
+                    del headers['Authorization']
+
+            # .netrc might have more auth for us.
+            new_auth = get_netrc_auth(url) if self.trust_env else None
+            if new_auth is not None:
+                prepared_request.prepare_auth(new_auth)
+
+            resp = self.send(
+                prepared_request,
+                stream=stream,
+                timeout=timeout,
+                verify=verify,
+
+
+Now I'll make the fix. The core change is at the top of the loop: base `prepared_request` on `req`, and after each iteration set `req = resp.request`. Since `resp.request` is set by `send`, the next loop's copy will reflect the actual sent (possibly method-converted) request.
+
+```bash-action
+cd /testbed && sed -i 's/            prepared_request = req.copy()/            req = resp.request\n            prepared_request = req.copy()/' requests/sessions.py && sed -n '89,95p' requests/sessions.py
+```2026_09_21_10_18_17899859232026_09_21_10_18_17899859232026_09_21_10_18_1789985924
+executing输出 
+        while resp.is_redirect:
+            req = resp.request
+            prepared_request = req.copy()
+
+            resp.content  # Consume socket so it can be released
+
+
+
+Wait — I need to verify the semantics. `resp.request` on the *first* iteration is the original request (correct). On subsequent iterations, `resp` is the response from the *previous* `self.send`, so `resp.request` is the previously-sent request (with the converted method). That's exactly what we want.
+
+But there's a subtlety: the original code relied on `req` being the initial request for the Authorization stripping logic (`resp.request.url` is used there, not `req`). Let me verify the fix with a reproduction test:
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import requests
+from requests.sessions import Session
+
+s = Session()
+req = requests.Request('POST', 'http://server.example.com/do_something').prepare()
+
+# Simulate a chain: POST -> 303 (becomes GET) -> 307 (should stay GET)
+# Build fake responses
+from requests.models import Response
+from requests.structures import CaseInsensitiveDict
+
+def make_resp(url, status, location=None, method='GET'):
+    r = Response()
+    r.status_code = status
+    r.url = url
+    r.headers = CaseInsensitiveDict()
+    if location:
+        r.headers['location'] = location
+    r.raw = None
+    r.request = requests.Request(method, url).prepare()
+    r._content = b''
+    r._content_consumed = True
+    return r
+
+# We'll monkeypatch send to record methods
+methods_called = []
+def fake_send(prepared_request, **kwargs):
+    methods_called.append(prepared_request.method)
+    if len(methods_called) == 1:
+        return make_resp(prepared_request.url, 303, 'http://server.example.com/new_thing_1513', method='GET')
+    else:
+        return make_resp(prepared_request.url, 307, '//failover.example.com/new_thing_1513', method='GET')
+
+s.send = fake_send
+
+# initial response is the 303
+initial = make_resp('http://server.example.com/do_something', 303, 'http://server.example.com/new_thing_1513', method='POST')
+initial.request = req
+
+list(s.resolve_redirects(initial, req))
+print("Methods issued:", methods_called)
+# Expected: first follow-up GET, then the 307 should preserve GET (not POST)
+assert methods_called[0] == 'GET', methods_called
+assert methods_called[1] == 'GET', "307 should preserve GET, got %s" % methods_called[1]
+print("PASS")
+EOF
+python /tmp/repro.py
+```
+executing输出 Traceback (most recent call last):
+  File "/tmp/repro.py", line 40, in <module>
+    list(s.resolve_redirects(initial, req))
+  File "/opt/miniconda3/lib/python3.11/site-packages/requests/sessions.py", line 191, in resolve_redirects
+    raise TooManyRedirects(
+requests.exceptions.TooManyRedirects: Exceeded 30 redirects.
+
+
+My fake_send returns redirects forever. Let me fix the repro so that the third call returns a non-redirect:
+
+```bash-action
+cd /testbed && sed -i 's/    else:\n        return make_resp.*$//' /tmp/repro.py; cd /testbed && python - <<'EOF'
+import re
+src = open('/tmp/repro.py').read()
+src = src.replace(
+"""    if len(methods_called) == 1:
+        return make_resp(prepared_request.url, 303, 'http://server.example.com/new_thing_1513', method='GET')
+    else:
+        return make_resp(prepared_request.url, 307, '//failover.example.com/new_thing_1513', method='GET')""",
+"""    if len(methods_called) == 1:
+        return make_resp(prepared_request.url, 303, 'http://server.example.com/new_thing_1513', method='GET')
+    elif len(methods_called) == 2:
+        return make_resp(prepared_request.url, 307, '//failover.example.com/new_thing_1513', method='GET')
+    else:
+        return make_resp(prepared_request.url, 200, method='GET')""")
+open('/tmp/repro.py','w').write(src)
+EOF
+python /tmp/repro.py
+```2026_09_21_10_18_1789985931
+executing输出 Methods issued: ['GET', 'GET', 'GET']
+PASS
+
+
+The fix works. Let me verify with the *original* (pre-fix) code that it indeed reproduced the bug, by temporarily reverting:
+
+```bash-action
+cd /testbed && git stash && python /tmp/repro.py; git stash pop
+```2026_09_21_10_18_17899859322026_09_21_10_18_17899859302026_09_21_10_18_1789985930
+executing输出 Saved working directory and index state WIP on main: acb09f0 SWE-bench
+Methods issued: ['GET', 'GET', 'GET']
+PASS
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   requests/sessions.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Dropped refs/stash@{0} (53c2919a138031486b87de53d46d8bee52f7510d)
+
+
+My repro's `fake_send` sets `return make_resp(...).request` to a fixed method, which masks the bug because `resp.request.method` in the copy is hard-coded. Let me make the repro faithful: `send` should set `resp.request = prepared_request` (like the real send does):
+
+```bash-action
+cd /testbed && python - <<'EOF'
+src = open('/tmp/repro.py').read()
+src = src.replace(
+"""def fake_send(prepared_request, **kwargs):
+    methods_called.append(prepared_request.method)
+    if len(methods_called) == 1:
+        return make_resp(prepared_request.url, 303, 'http://server.example.com/new_thing_1513', method='GET')
+    elif len(methods_called) == 2:
+        return make_resp(prepared_request.url, 307, '//failover.example.com/new_thing_1513', method='GET')
+    else:
+        return make_resp(prepared_request.url, 200, method='GET')""",
+"""def fake_send(prepared_request, **kwargs):
+    methods_called.append(prepared_request.method)
+    if len(methods_called) == 1:
+        r = make_resp(prepared_request.url, 303, 'http://server.example.com/new_thing_1513', method='GET')
+    elif len(methods_called) == 2:
+        r = make_resp(prepared_request.url, 307, '//failover.example.com/new_thing_1513', method='GET')
+    else:
+        r = make_resp(prepared_request.url, 200, method='GET')
+    r.request = prepared_request
+    return r""")
+open('/tmp/repro.py','w').write(src)
+EOF
+echo "=== FIXED ===" && python /tmp/repro.py
+echo "=== ORIGINAL ===" && git stash && python /tmp/repro.py; git stash pop
+```2026_09_21_10_18_17899859322026_09_21_10_18_17899859322026_09_21_10_18_1789985932
+executing输出 === FIXED ===
+Methods issued: ['GET', 'GET', 'GET']
+PASS
+=== ORIGINAL ===
+Saved working directory and index state WIP on main: acb09f0 SWE-bench
+Methods issued: ['GET', 'GET', 'GET']
+PASS
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   requests/sessions.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Dropped refs/stash@{0} (cd1b8be725b4a15b5a8ee3851dc11539dc315ca8)
+
+
+My repro still doesn't trigger the bug on original. The issue: in the original, `method = req.method` reads from `req` (the initial POST → then `prepared_request.method = method`). But wait — the 303 branch sets `method='GET'`. Let me trace why original still gives GET for the 307 step.
+
+The problem is on 307: `req` is still the original POST, `method = req.method = 'POST'`. Then no 303/302/301 branch applies (status 307), so `prepared_request.method = 'POST'`. That should issue POST... unless the copy logic differs. Let me add debugging on original:
+
+```bash-action
+cd /testbed && git stash && python - <<'EOF'
+import requests
+from requests.sessions import Session
+from requests.models import Response
+from requests.structures import CaseInsensitiveDict
+
+s = Session()
+req = requests.Request('POST', 'http://server.example.com/do_something').prepare()
+
+def make_resp(url, status, location=None, method='GET'):
+    r = Response()
+    r.status_code = status
+    r.url = url
+    r.headers = CaseInsensitiveDict()
+    if location:
+        r.headers['location'] = location
+    r.request = requests.Request(method, url).prepare()
+    r._content = b''
+    r._content_consumed = True
+    return r
+
+methods_called = []
+def fake_send(prepared_request, **kwargs):
+    methods_called.append(prepared_request.method)
+    if len(methods_called) == 1:
+        r = make_resp(prepared_request.url, 303, 'http://server.example.com/new_thing_1513')
+    elif len(methods_called) == 2:
+        r = make_resp(prepared_request.url, 307, '//failover.example.com/new_thing_1513')
+    else:
+        r = make_resp(prepared_request.url, 200)
+    r.request = prepared_request
+    return r
+
+s.send = fake_send
+initial = make_resp('http://server.example.com/do_something', 303, 'http://server.example.com/new_thing_1513')
+initial.request = req
+list(s.resolve_redirects(initial, req))
+print("Methods:", methods_called)
+EOF
+git stash pop
+```2026_09_21_10_18_1789985936
+executing输出 Saved working directory and index state WIP on main: acb09f0 SWE-bench
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+  File "/testbed/requests/__init__.py", line 58, in <module>
+    from . import utils
+  File "/testbed/requests/utils.py", line 25, in <module>
+    from .compat import parse_http_list as _parse_list_header
+  File "/testbed/requests/compat.py", line 7, in <module>
+    from .packages import chardet
+  File "/testbed/requests/packages/__init__.py", line 3, in <module>
+    from . import urllib3
+  File "/testbed/requests/packages/urllib3/__init__.py", line 24, in <module>
+    from .poolmanager import PoolManager, ProxyManager, proxy_from_url
+  File "/testbed/requests/packages/urllib3/poolmanager.py", line 14, in <module>
+    from ._collections import RecentlyUsedContainer
+  File "/testbed/requests/packages/urllib3/_collections.py", line 7, in <module>
+    from collections import MutableMapping
+ImportError: cannot import name 'MutableMapping' from 'collections' (/opt/miniconda3/lib/python3.11/collections/__init__.py)
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   requests/sessions.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Dropped refs/stash@{0} (6ff315b0a95ad506de1356469867ea97f6384d00)
+
+
+Ah — the earlier "ORIGINAL" runs were actually importing `requests` from `/opt/miniconda3/lib/python3.11/site-packages/requests/sessions.py` (per the first traceback), not `/testbed`. That's why the bug didn't reproduce — we were testing the *installed* requests, not the repo. And reverting via git stash removed my fix but then the import failed, revealing that the installed package had been shadowing.
+
+Wait, but the FIXED run showed `/testbed` path in traceback initially. Let me check: is `/testbed` on sys.path? The first repro traceback showed `/opt/miniconda3/lib/python3.11/site-packages/requests/sessions.py`. So python is importing the installed requests, not /testbed. I must run with `/testbed` on sys.path.
+
+```bash-action
+cd /testbed && python -c "import requests; print(requests.__file__)"
+```2026_09_21_10_18_17899859382026_09_21_10_18_1789985936
+executing输出 Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/testbed/requests/__init__.py", line 58, in <module>
+    from . import utils
+  File "/testbed/requests/utils.py", line 25, in <module>
+    from .compat import parse_http_list as _parse_list_header
+  File "/testbed/requests/compat.py", line 7, in <module>
+    from .packages import chardet
+  File "/testbed/requests/packages/__init__.py", line 3, in <module>
+    from . import urllib3
+  File "/testbed/requests/packages/urllib3/__init__.py", line 24, in <module>
+    from .poolmanager import PoolManager, ProxyManager, proxy_from_url
+  File "/testbed/requests/packages/urllib3/poolmanager.py", line 14, in <module>
+    from ._collections import RecentlyUsedContainer
+  File "/testbed/requests/packages/urllib3/_collections.py", line 7, in <module>
+    from collections import MutableMapping
+ImportError: cannot import name 'MutableMapping' from 'collections' (/opt/miniconda3/lib/python3.11/collections/__init__.py)
+
+
+The local `/testbed/requests` fails to import on Python 3.11 due to vendored urllib3 using `collections.MutableMapping`. This repo is old. The environment likely expects tests run a specific way, or there's a conftest shim. Let me check how the test suite is meant to run — maybe there's a patch/sitecustomize, or tests use tox. Let me look at the repo state:
+
+```bash-action
+cd /testbed && git log --oneline -3 && ls && cat setup.cfg 2>/dev/null; cat tox.ini 2>/dev/null | head -30
+```2026_09_21_10_18_17899859392026_09_21_10_18_1789985938
+executing输出 acb09f0 SWE-bench
+110048f Merge pull request #1916 from schlamar/accept-encoding
+4112b8f Merge pull request #1949 from Lukasa/pickle
+AUTHORS.rst
+HISTORY.rst
+LICENSE
+MANIFEST.in
+Makefile
+My_agent.py
+NOTICE
+README.rst
+__pycache__
+actions.py
+build
+chat_export.py
+chat_history
+docs
+ext
+llm.py
+requests
+requests.egg-info
+requirements.txt
+setup.cfg
+setup.py
+system_prompt.txt
+test_requests.py
+[wheel]
+universal = 1
+
+
+The tests are in `test_requests.py`. The import failure is due to Python 3.11 vs old vendored code. Since the task says "current shell python is the configured test environment", perhaps there's a workaround. Let me test importing via the test file directly, which may already shim collections:
+
+```bash-action
+cd /testbed && python -c "import collections, collections.abc; collections.MutableMapping = collections.abc.MutableMapping; import requests; print(requests.__file__)"
+```2026_09_21_10_18_17899859412026_09_21_10_18_17899859402026_09_21_10_18_1789985940
+executing输出 Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/testbed/requests/__init__.py", line 60, in <module>
+    from .api import request, get, head, post, patch, put, delete, options
+  File "/testbed/requests/api.py", line 14, in <module>
+    from . import sessions
+  File "/testbed/requests/sessions.py", line 12, in <module>
+    from collections import Mapping
+ImportError: cannot import name 'Mapping' from 'collections' (/opt/miniconda3/lib/python3.11/collections/__init__.py)
+
+
+The repo itself also needs shims. The environment must have these patched already somehow at test time. Regardless, I only need to make my repro runnable. Let me shim `collections` before import:
+
+```bash-action
+cd /testbed && python -c "
+import collections, collections.abc
+for n in ('Mapping','MutableMapping','Sequence','Iterable','Callable','Hashable','Set','MutableSet','ItemsView','KeysView','ValuesView'):
+    if not hasattr(collections,n): setattr(collections,n,getattr(collections.abc,n))
+import requests
+print(requests.__file__)
+"
+```2026_09_21_10_19_17899859422026_09_21_10_19_17899859422026_09_21_10_19_17899859412026_09_21_10_19_1789985942
+executing输出 /testbed/requests/__init__.py
+
+
+Now I can import the repo. Let me update the repro to include the shim and rerun both fixed and original:
+
+```bash-action
+cd /testbed && cat > /tmp/repro.py <<'EOF'
+import collections, collections.abc
+for n in ('Mapping','MutableMapping','Sequence','Iterable','Callable','Hashable','Set','MutableSet','ItemsView','KeysView','ValuesView'):
+    if not hasattr(collections, n): setattr(collections, n, getattr(collections.abc, n))
+
+import requests
+print("requests from:", requests.__file__)
+from requests.sessions import Session
+from requests.models import Response
+from requests.structures import CaseInsensitiveDict
+
+s = Session()
+req = requests.Request('POST', 'http://server.example.com/do_something').prepare()
+
+def make_resp(url, status, location=None):
+    r = Response()
+    r.status_code = status
+    r.url = url
+    r.headers = CaseInsensitiveDict()
+    if location:
+        r.headers['location'] = location
+    r._content = b''
+    r._content_consumed = True
+    return r
+
+methods_called = []
+def fake_send(prepared_request, **kwargs):
+    methods_called.append(prepared_request.method)
+    if len(methods_called) == 1:
+        r = make_resp(prepared_request.url, 303, 'http://server.example.com/new_thing_1513')
+    elif len(methods_called) == 2:
+        r = make_resp(prepared_request.url, 307, '//failover.example.com/new_thing_1513')
+    else:
+        r = make_resp(prepared_request.url, 200)
+    r.request = prepared_request
+    return r
+
+s.send = fake_send
+initial = make_resp('http://server.example.com/do_something', 303, 'http://server.example.com/new_thing_1513')
+initial.request = req
+list(s.resolve_redirects(initial, req))
+print("Methods issued:", methods_called)
+assert methods_called == ['GET', 'GET', 'GET'], "FAIL, got %s" % methods_called
+print("PASS")
+EOF
+echo "=== FIXED ===" && python /tmp/repro.py
+echo "=== ORIGINAL ===" && git stash && python /tmp/repro.py; git stash pop
+```2026_09_21_10_19_17899859442026_09_21_10_19_17899859432026_09_21_10_19_17899859432026_09_21_10_19_1789985944
+executing输出 === FIXED ===
+requests from: /opt/miniconda3/lib/python3.11/site-packages/requests/__init__.py
+Methods issued: ['GET', 'GET', 'GET']
+PASS
+=== ORIGINAL ===
+Saved working directory and index state WIP on main: acb09f0 SWE-bench
+requests from: /opt/miniconda3/lib/python3.11/site-packages/requests/__init__.py
+Methods issued: ['GET', 'GET', 'GET']
+PASS
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   requests/sessions.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Dropped refs/stash@{0} (40098dda20b8a9e1e3538d11bf5207269b3012b2)
+
+
+It's importing the **installed** requests (site-packages), not /testbed! Even though cwd is /testbed. That's because there's likely a `.pth` or the installed one shadows. Let me force sys.path[0] and check:
+
+```bash-action
+cd /testbed && python -c "import sys; print(sys.path[:3])" && ls requests/__init__.py
+```2026_09_21_10_19_17899859462026_09_21_10_19_17899859462026_09_21_10_19_1789985946
+executing输出 ['', '/opt/miniconda3/lib/python311.zip', '/opt/miniconda3/lib/python3.11']
+requests/__init__.py
+
+
+`''` (cwd) is first, so it *should* import /testbed. But it printed site-packages. That means the earlier `sys.path` had cwd but PYTHONPATH or something reorders... Actually wait — the repro printed site-packages because `requests` was already imported? No. Let me run directly and print `requests.__file__` with cwd /testbed:
+
+```bash-action
+cd /testbed && python -c "
+import collections, collections.abc
+for n in ('Mapping','MutableMapping'):
+    if not hasattr(collections,n): setattr(collections,n,getattr(collections.abc,n))
+import requests
+print(requests.__file__)
+"
+```
+executing输出 /testbed/requests/__init__.py
+
+
+It does load /testbed. But inside `/tmp/repro.py` it loaded site-packages. The difference: when running `python /tmp/repro.py`, sys.path[0] is `/tmp` (script dir), not cwd! So `/testbed` isn't on path and site-packages wins. Fix: run with `PYTHONPATH=/testbed` or `python -c` with embedded code. Let me run repro from /testbed with `PYTHONPATH`:
+
+```bash-action
+cd /testbed && echo "=== FIXED ===" && PYTHONPATH=/testbed python /tmp/repro.py
+echo "=== ORIGINAL ===" && git stash && PYTHONPATH=/testbed python /tmp/repro.py; git stash pop
+```2026_09_21_10_19_17899859502026_09_21_10_19_17899859492026_09_21_10_19_17899859492026_09_21_10_19_1789985950
+executing输出 === FIXED ===
+requests from: /testbed/requests/__init__.py
+Traceback (most recent call last):
+  File "/tmp/repro.py", line 40, in <module>
+    list(s.resolve_redirects(initial, req))
+  File "/testbed/requests/sessions.py", line 100, in resolve_redirects
+    resp.close()
+  File "/testbed/requests/models.py", line 801, in close
+    return self.raw.release_conn()
+           ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'release_conn'
+=== ORIGINAL ===
+Saved working directory and index state WIP on main: acb09f0 SWE-bench
+requests from: /testbed/requests/__init__.py
+Traceback (most recent call last):
+  File "/tmp/repro.py", line 40, in <module>
+    list(s.resolve_redirects(initial, req))
+  File "/testbed/requests/sessions.py", line 99, in resolve_redirects
+    resp.close()
+  File "/testbed/requests/models.py", line 801, in close
+    return self.raw.release_conn()
+           ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'release_conn'
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   requests/sessions.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Dropped refs/stash@{0} (5f77b4b82be501948f276c821ee358370aeadec2)
+
+
+Now running /testbed. Need a fake `raw` with `release_conn`. Let me add a minimal raw object:
+
+```bash-action
+cd /testbed && python - <<'EOF'
+src = open('/tmp/repro.py').read()
+src = src.replace(
+"""def make_resp(url, status, location=None):
+    r = Response()
+    r.status_code = status
+    r.url = url
+    r.headers = CaseInsensitiveDict()
+    if location:
+        r.headers['location'] = location
+    r._content = b''
+    r._content_consumed = True
+    return r""",
+"""class FakeRaw(object):
+    def release_conn(self): pass
+    def read(self, *a, **k): return b''
+
+def make_resp(url, status, location=None):
+    r = Response()
+    r.status_code = status
+    r.url = url
+    r.headers = CaseInsensitiveDict()
+    if location:
+        r.headers['location'] = location
+    r.raw = FakeRaw()
+    r._content = b''
+    r._content_consumed = True
+    return r""")
+open('/tmp/repro.py','w').write(src)
+EOF
+echo "=== FIXED ===" && PYTHONPATH=/testbed python /tmp/repro.py
+echo "=== ORIGINAL ===" && git stash && PYTHONPATH=/testbed python /tmp/repro.py; git stash pop
+```2026_09_21_10_19_17899859522026_09_21_10_19_17899859512026_09_21_10_19_17899859512026_09_21_10_19_17899859522026_09_21_10_19_1789985951
+executing输出 === FIXED ===
+requests from: /testbed/requests/__init__.py
+Methods issued: ['GET', 'GET', 'GET']
+PASS
+=== ORIGINAL ===
+Saved working directory and index state WIP on main: acb09f0 SWE-bench
+requests from: /testbed/requests/__init__.py
+Methods issued: ['GET', 'GET', 'POST']
+Traceback (most recent call last):
+  File "/tmp/repro.py", line 47, in <module>
+    assert methods_called == ['GET', 'GET', 'GET'], "FAIL, got %s" % methods_called
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: FAIL, got ['GET', 'GET', 'POST']
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   requests/sessions.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Dropped refs/stash@{0} (6e5ec67377dba8bb40300d424b26a17ae92ebacb)
+
+
+Bug confirmed and fixed:
+- **ORIGINAL**: `['GET', 'GET', 'POST']` — the final 307 redirect wrongly re-issued POST.
+- **FIXED**: `['GET', 'GET', 'GET']` — correct.
+
+Now run the repo's existing test suite for the redirect module. Let me run test_requests.py (with the environment shim). First check how tests import:
+
+```bash-action
+cd /testbed && head -20 test_requests.py
+```2026_09_21_10_19_17899859542026_09_21_10_19_17899859532026_09_21_10_19_1789985953
+executing输出 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""Tests for Requests."""
+
+from __future__ import division
+import json
+import os
+import pickle
+import unittest
+
+import requests
+import pytest
+from requests.adapters import HTTPAdapter
+from requests.auth import HTTPDigestAuth
+from requests.compat import (
+    Morsel, cookielib, getproxies, str, urljoin, urlparse)
+from requests.cookies import cookiejar_from_dict, morsel_to_cookie
+from requests.exceptions import InvalidURL, MissingSchema
+from requests.structures import CaseInsensitiveDict
+
+
+The test file uses a local `requests` import. To run it against /testbed I need the collections shim active AND /testbed on path. Let me add a conftest-style shim via a sitecustomize or use `-p` plugin. Simpler: run pytest with `PYTHONSTARTUP` won't work. Use a small trick: create sitecustomize in /tmp and prepend to PYTHONPATH:
+
+```bash-action
+cd /testbed && mkdir -p /tmp/shim && cat > /tmp/shim/sitecustomize.py <<'EOF'
+import collections, collections.abc
+for n in ('Mapping','MutableMapping','Sequence','Iterable','Callable','Hashable','Set','MutableSet','ItemsView','KeysView','ValuesView'):
+    if not hasattr(collections, n): setattr(collections, n, getattr(collections.abc, n))
+EOF
+PYTHONPATH=/testbed:/tmp/shim python -m pytest test_requests.py -k "redirect" -q 2>&1 | tail -40
+```2026_09_21_10_19_17899859552026_09_21_10_19_17899859542026_09_21_10_19_17899859542026_09_21_10_19_1789985955
+executing输出 /opt/miniconda3/bin/python: No module named pytest
+
+
+```bash-action
+cd /testbed && which python && python --version && ls /opt/miniconda3/envs 2>/dev/null; pip list 2>/dev/null | grep -i -E "pytest|requests"
+```2026_09_21_10_19_17899859562026_09_21_10_19_17899859562026_09_21_10_19_17899859562026_09_21_10_19_17899859572026_09_21_10_19_1789985957
+executing输出 /opt/miniconda3/bin/python
+Python 3.11.5
+testbed
+requests                2.31.0
+
+
+There's a conda env `testbed`. Let me use its python:
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python --version && /opt/miniconda3/envs/testbed/bin/python -c "import pytest, requests; print(pytest.__version__, requests.__file__)"
+```2026_09_21_10_19_17899859592026_09_21_10_19_17899859582026_09_21_10_19_17899859582026_09_21_10_19_17899859592026_09_21_10_19_17899859582026_09_21_10_19_1789985959
+executing输出 Python 3.9.20
+7.4.4 /testbed/requests/__init__.py
+
+
+The `testbed` env python: Python 3.9, pytest 7.4.4, and importing /testbed/requests works natively. This is the correct test environment. Let me rerun the repro with it so it's faithful, then run the full redirect tests:
+
+```bash-action
+cd /testbed && echo "=== FIXED (repo python) ===" && PYTHONPATH=/testbed /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py
+echo "=== ORIGINAL (repo python) ===" && git stash && PYTHONPATH=/testbed /opt/miniconda3/envs/testbed/bin/python /tmp/repro.py; git stash pop
+```2026_09_21_10_19_17899859602026_09_21_10_19_17899859602026_09_21_10_19_17899859602026_09_21_10_19_17899859612026_09_21_10_19_17899859602026_09_21_10_19_17899859602026_09_21_10_19_1789985960
+executing输出 === FIXED (repo python) ===
+  if not hasattr(collections, n): setattr(collections, n, getattr(collections.abc, n))
+requests from: /testbed/requests/__init__.py
+Methods issued: ['GET', 'GET', 'GET']
+PASS
+=== ORIGINAL (repo python) ===
+Saved working directory and index state WIP on main: acb09f0 SWE-bench
+  if not hasattr(collections, n): setattr(collections, n, getattr(collections.abc, n))
+requests from: /testbed/requests/__init__.py
+Methods issued: ['GET', 'GET', 'POST']
+Traceback (most recent call last):
+  File "/tmp/repro.py", line 47, in <module>
+    assert methods_called == ['GET', 'GET', 'GET'], "FAIL, got %s" % methods_called
+AssertionError: FAIL, got ['GET', 'GET', 'POST']
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   requests/sessions.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Dropped refs/stash@{0} (b6d88ba598f13e001449f4ab99dcc073f9ceef5f)
+
+
+Bug confirmed and fixed under the real test env. Now run existing tests covering redirects:
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest test_requests.py -k "redirect or Redirect or resolve" -q 2>&1 | tail -40
+```2026_09_21_10_19_17899859622026_09_21_10_19_17899859612026_09_21_10_19_17899859612026_09_21_10_19_1789985961
+executing输出     from collections import MutableMapping
+
+requests/sessions.py:399
+    """Sends a GET request. Returns :class:`Response` object.
+
+requests/sessions.py:409
+    """Sends a OPTIONS request. Returns :class:`Response` object.
+
+requests/sessions.py:419
+    """Sends a HEAD request. Returns :class:`Response` object.
+
+requests/sessions.py:429
+    """Sends a POST request. Returns :class:`Response` object.
+
+requests/sessions.py:439
+    """Sends a PUT request. Returns :class:`Response` object.
+
+requests/sessions.py:449
+    """Sends a PATCH request. Returns :class:`Response` object.
+
+requests/sessions.py:459
+    """Sends a DELETE request. Returns :class:`Response` object.
+
+requests/sessions.py:12
+    from collections import Mapping
+
+test_requests.py::RequestsTestCase::test_HTTP_302_ALLOW_REDIRECT_GET
+    if isinstance(hook, collections.Callable):
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+4 passed, 116 deselected, 10 warnings in 12.71s
+
+
+4 passed (redirect-related tests). The warnings are from deprecated `collections` imports — unrelated to my change (pre-existing). Let me run the full test suite to be sure nothing regressed:
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest test_requests.py -q 2>&1 | tail -20
+```2026_09_21_10_19_17899859752026_09_21_10_19_17899859742026_09_21_10_19_17899859742026_09_21_10_19_1789985975
+executing输出 E           TypeError: 'requests.post(url, data=\'[{"some": "data"}]\', files={\'some\': f})' object (type: <class 'str'>) must be callable
+
+test_requests.py:395: TypeError
+=============================== warnings summary ===============================
+requests/packages/urllib3/_collections.py:7
+    from collections import MutableMapping
+
+requests/sessions.py:12
+    from collections import Mapping
+
+test_requests.py::RequestsTestCase::test_BASICAUTH_TUPLE_HTTP_200_OK_GET
+    if isinstance(hook, collections.Callable):
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED test_requests.py::RequestsTestCase::test_conflicting_post_params - Typ...
+1 failed, 119 passed, 3 warnings in 115.48s (0:01:55)
+
+
+The single failure `test_conflicting_post_params` is unrelated to my change — it's about `requests.post(...)` being passed as a string/object erroneously; a pre-existing incompatibility (likely with the pytest version's behavior since `requests.post` param handling). Let me confirm it fails on the original code too:
+
+```bash-action
+cd /testbed && git stash && /opt/miniconda3/envs/testbed/bin/python -m pytest test_requests.py::RequestsTestCase::test_conflicting_post_params -q 2>&1 | tail -6; git stash pop
+```2026_09_21_10_21_17899860922026_09_21_10_21_17899860912026_09_21_10_21_17899860912026_09_21_10_21_17899860922026_09_21_10_21_17899860922026_09_21_10_21_1789986092
+executing输出 Saved working directory and index state WIP on main: acb09f0 SWE-bench
+    from collections import Mapping
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED test_requests.py::RequestsTestCase::test_conflicting_post_params - Typ...
+1 failed, 9 warnings in 0.06s
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   requests/sessions.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	My_agent.py
+	actions.py
+	chat_export.py
+	chat_history/
+	llm.py
+	system_prompt.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+Dropped refs/stash@{0} (0f54b8ff9f7446aaf35e8a707957cb203502ee95)
+
+
+Confirmed: `test_conflicting_post_params` fails on the **original** code too — pre-existing, unrelated to my change. My change introduces no regressions (119 passed, only the pre-existing failure remains).
+
+Now verify the diff:
+
+```bash-action
+cd /testbed && git diff requests/sessions.py
+```2026_09_21_10_21_17899860942026_09_21_10_21_17899860932026_09_21_10_21_17899860932026_09_21_10_21_17899860942026_09_21_10_21_17899860932026_09_21_10_21_17899860932026_09_21_10_21_17899860942026_09_21_10_21_1789986094
+executing输出 diff --git a/requests/sessions.py b/requests/sessions.py
+index 425db22..5752671 100755
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -88,6 +88,7 @@ class SessionRedirectMixin(object):
+         i = 0
+ 
+         while resp.is_redirect:
++            req = resp.request
+             prepared_request = req.copy()
+ 
+             resp.content  # Consume socket so it can be released
+
+
+The diff is minimal and correct. 
+
+**Summary:**
+- **Root cause**: `Session.resolve_redirects` copied the *original* request (`req`) at the start of every loop iteration, so method conversions from intermediate redirects (e.g. 303 → GET) were lost. A later 307 would then re-issue the original POST.
+- **Fix**: at the top of each iteration, rebase `req` on `resp.request` (the request that produced the current redirect response), so the next iteration copies the most recently-sent request with its already-converted method.
+- **Verification**: reproduction script shows original issues `['GET', 'GET', 'POST']` (wrong) and fixed issues `['GET', 'GET', 'GET']` (correct). Full test suite: 119 passed, 1 pre-existing unrelated failure (also fails on original).
+
+```bash-action
+cd /testbed && git diff --stat && exit 0
+```
+executing输出  requests/sessions.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+
+```bash-action
+exit
+```

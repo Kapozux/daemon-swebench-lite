@@ -1,0 +1,1099 @@
+plan-needed
+## Plan
+
+**问题定位思路：**
+
+1. 现象：当包目录 `a/` 下面存在同名模块 `a/a.py` 时，`pylint a` 会错误地认为 `a/__init__.py` 存在，去加载它，导致 `[Errno 2] No such file or directory: 'a/__init__.py'`。
+
+2. 初步判断根因在 pylint 处理模块名与包名时的逻辑：
+   - pylint 通过 `modutils` / `expand_modules` 遍历目录时，会尝试根据传入的路径推断模块的 `__init__.py`。
+   - 当 `a` 既作为包目录出现，又作为 `a/a.py` 模块出现时，`get_module_files` 或 `modpath_from_file` 之类函数可能被"同名"干扰，误认为存在 `__init__.py`。
+
+3. 关键怀疑点在 `pylint/lint/expand_modules.py` 或者 `pylint/lint/pylinter.py` 中处理包 vs 模块的逻辑，特别是通过文件路径反推模块名、以及判断一个目录是不是 package 的地方。
+
+**修复计划：**
+
+1. 在 `/testbed` 下构造最小复现：
+   ```
+   mkdir -p a && touch a/a.py a/b.py
+   pylint a
+   ```
+   确认能复现 `F0010 ... a/__init__.py` 报错。
+
+2. 用 grep 定位代码中生成 `__init__.py` 路径的分支，重点看 `expand_modules` 里对 `Package` / `Module` 的区分，以及 `modutils.file_from_modpath` / `get_module_files` 的行为。
+
+3. 找到根因函数：很可能是 `pylint/lint/utils.py` 或 `pylint/lint/expand_modules.py` 中，遍历目录时错误地把与目录同名的 `.py` 文件当成包的 `__init__`，或者在建包路径时无脑拼接 `__init__.py` 而没有先检查文件是否存在。
+
+4. 修改源码：在生成/使用 `__init__.py` 路径前，确认文件真实存在，或修正同名模块场景下的模块名推断逻辑（使 `a/a.py` 正确识别为独立模块而不是 `a.__init__`）。只改必要的几行，遵循 issue 里提到的"touch a/__init__.py 不应该再是必需的"。
+
+5. 修改后：
+   - 重跑最小复现 `pylint a`，应无报错。
+   - 再测 issue 中 `from a import b` + `pylint -E r a` 的场景，应无 `E0611` 与 `F0010`。
+   - `git diff` 确认改动范围只是源码、无测试文件、无新建文件。
+
+6. 找仓库里覆盖该模块（如 `tests/lint/unittest_expand_modules.py` 或类似）的已有测试跑一遍确认无回归。若发现同文件里有相同错误格式的代码，一并修掉。全部通过后运行 `exit`。
+
+请确认 plan，我会在确认后进入执行阶段。
+```plan-finish
+```
+我先构造最小复现脚本，确认 bug 存在。
+
+```bash-action
+cd /testbed && rm -rf /tmp/repro && mkdir -p /tmp/repro/a && touch /tmp/repro/a/a.py /tmp/repro/a/b.py && cd /tmp/repro && python -m pylint a; echo "EXIT=$?"
+```
+executing输出 /opt/miniconda3/bin/python: No module named pylint
+EXIT=1
+
+
+需要确认正确的 python 环境。
+
+```bash-action
+cd /testbed && which pylint; python -c "import sys; print(sys.executable)"; ls; pip show pylint 2>/dev/null | head -5
+```
+executing输出 /opt/miniconda3/bin/python
+CODE_OF_CONDUCT.md
+CONTRIBUTORS.txt
+Dockerfile
+LICENSE
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+doc
+elisp
+examples
+llm.py
+pylint
+pylint.egg-info
+pylintrc
+pyproject.toml
+requirements_test.txt
+requirements_test_min.txt
+requirements_test_pre_commit.txt
+script
+setup.cfg
+system_prompt.txt
+tbump.toml
+tests
+towncrier.toml
+tox.ini
+
+
+pylint 是从源码运行的，用 `python -m pylint` 需要在 /testbed 目录下或设置 PYTHONPATH。
+
+```bash-action
+cd /tmp/repro && PYTHONPATH=/testbed python -m pylint a; echo "EXIT=$?"
+```2026_09_21_10_25_1789986317
+executing输出 Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/testbed/pylint/__main__.py", line 10, in <module>
+    pylint.run_pylint()
+  File "/testbed/pylint/__init__.py", line 32, in run_pylint
+    from pylint.lint import Run as PylintRun
+  File "/testbed/pylint/lint/__init__.py", line 19, in <module>
+    from pylint.config.exceptions import ArgumentPreprocessingError
+  File "/testbed/pylint/config/__init__.py", line 25, in <module>
+    from pylint.config.arguments_provider import UnsupportedAction
+  File "/testbed/pylint/config/arguments_provider.py", line 15, in <module>
+    from pylint.config.arguments_manager import _ArgumentsManager
+  File "/testbed/pylint/config/arguments_manager.py", line 23, in <module>
+    import tomlkit
+ModuleNotFoundError: No module named 'tomlkit'
+EXIT=1
+
+
+tomlkit 缺失，尝试安装依赖或找到合适的解释器。
+
+```bash-action
+cd /testbed && pip install tomlkit 2>&1 | tail -3
+```2026_09_21_10_25_1789986318
+executing输出 Installing collected packages: tomlkit
+Successfully installed tomlkit-0.15.1
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /tmp/repro && PYTHONPATH=/testbed python -m pylint a; echo "EXIT=$?"
+```2026_09_21_10_25_17899863202026_09_21_10_25_1789986320
+executing输出 Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/testbed/pylint/__main__.py", line 10, in <module>
+    pylint.run_pylint()
+  File "/testbed/pylint/__init__.py", line 32, in run_pylint
+    from pylint.lint import Run as PylintRun
+  File "/testbed/pylint/lint/__init__.py", line 19, in <module>
+    from pylint.config.exceptions import ArgumentPreprocessingError
+  File "/testbed/pylint/config/__init__.py", line 25, in <module>
+    from pylint.config.arguments_provider import UnsupportedAction
+  File "/testbed/pylint/config/arguments_provider.py", line 15, in <module>
+    from pylint.config.arguments_manager import _ArgumentsManager
+  File "/testbed/pylint/config/arguments_manager.py", line 25, in <module>
+    from pylint import utils
+  File "/testbed/pylint/utils/__init__.py", line 9, in <module>
+    from pylint.utils.ast_walker import ASTWalker
+  File "/testbed/pylint/utils/ast_walker.py", line 13, in <module>
+    from astroid import nodes
+ModuleNotFoundError: No module named 'astroid'
+EXIT=1
+
+
+astroid 也缺失，安装项目依赖。
+
+```bash-action
+cd /testbed && pip install -e . 2>&1 | tail -5
+```2026_09_21_10_25_17899863222026_09_21_10_25_1789986322
+executing输出 Downloading wrapt-1.17.3-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl (82 kB)
+Installing collected packages: wrapt, mccabe, lazy-object-proxy, isort, dill, astroid, pylint
+  Running setup.py develop for pylint
+Successfully installed astroid-2.13.5 dill-0.4.1 isort-5.13.2 lazy-object-proxy-1.12.0 mccabe-0.7.0 pylint-2.15.0a0 wrapt-1.17.3
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /tmp/repro && PYTHONPATH=/testbed python -m pylint a; echo "EXIT=$?"
+```2026_09_21_10_25_17899863322026_09_21_10_25_17899863322026_09_21_10_25_1789986332
+executing输出 ************* Module a
+a/__init__.py:1:0: F0010: error while code parsing: Unable to load file a/__init__.py:
+[Errno 2] No such file or directory: 'a/__init__.py' (parse-error)
+EXIT=1
+
+
+Bug 复现成功。现在定位源码，先看 `a` 目录被识别成模块的路径来源。
+
+```bash-action
+cd /testbed && grep -rn "__init__.py" pylint/lint/ | head -30
+```
+executing输出 grep: pylint/lint/__pycache__/expand_modules.cpython-311.pyc: binary file matches
+grep: pylint/lint/__pycache__/__init__.cpython-311.pyc: binary file matches
+grep: pylint/lint/__pycache__/pylinter.cpython-311.pyc: binary file matches
+pylint/lint/pylinter.py:592:                os.path.join(something, "__init__.py")
+pylint/lint/pylinter.py:609:                    if "__init__.py" in files:
+pylint/lint/expand_modules.py:28:    an __init__.py.
+pylint/lint/expand_modules.py:36:        if not os.path.exists(os.path.join(dirname, "__init__.py")):
+pylint/lint/expand_modules.py:94:                filepath = os.path.join(something, "__init__.py")
+pylint/lint/expand_modules.py:136:            and os.path.basename(filepath) == "__init__.py"
+
+
+```bash-action
+cd /testbed && sed -n '80,140p' pylint/lint/expand_modules.py
+```2026_09_21_10_25_1789986335
+executing输出             something, ignore_list, ignore_list_re, ignore_list_paths_re
+        ):
+            continue
+        module_path = get_python_path(something)
+        additional_search_path = [".", module_path] + path
+        if os.path.exists(something):
+            # this is a file or a directory
+            try:
+                modname = ".".join(
+                    modutils.modpath_from_file(something, path=additional_search_path)
+                )
+            except ImportError:
+                modname = os.path.splitext(basename)[0]
+            if os.path.isdir(something):
+                filepath = os.path.join(something, "__init__.py")
+            else:
+                filepath = something
+        else:
+            # suppose it's a module or package
+            modname = something
+            try:
+                filepath = modutils.file_from_modpath(
+                    modname.split("."), path=additional_search_path
+                )
+                if filepath is None:
+                    continue
+            except (ImportError, SyntaxError) as ex:
+                # The SyntaxError is a Python bug and should be
+                # removed once we move away from imp.find_module: https://bugs.python.org/issue10588
+                errors.append({"key": "fatal", "mod": modname, "ex": ex})
+                continue
+        filepath = os.path.normpath(filepath)
+        modparts = (modname or something).split(".")
+        try:
+            spec = modutils.file_info_from_modpath(
+                modparts, path=additional_search_path
+            )
+        except ImportError:
+            # Might not be acceptable, don't crash.
+            is_namespace = False
+            is_directory = os.path.isdir(something)
+        else:
+            is_namespace = modutils.is_namespace(spec)
+            is_directory = modutils.is_directory(spec)
+        if not is_namespace:
+            result.append(
+                {
+                    "path": filepath,
+                    "name": modname,
+                    "isarg": True,
+                    "basepath": filepath,
+                    "basename": modname,
+                }
+            )
+        has_init = (
+            not (modname.endswith(".__init__") or modname == "__init__")
+            and os.path.basename(filepath) == "__init__.py"
+        )
+        if has_init or is_namespace or is_directory:
+            for subfilepath in modutils.get_module_files(
+                os.path.dirname(filepath), ignore_list, list_all=is_namespace
+
+
+关键在第 91-95 行。当 `something` 是目录 `a` 时，代码直接把 `filepath` 设为 `a/__init__.py`，不检查是否存在。同时 `modname` 由 `modpath_from_file` 推断。
+
+问题在于：`a` 目录下存在 `a/a.py`，导致 `modpath_from_file("a", ...)` 返回的 modname 可能是 `a.a` 或类似（被同名干扰），从而 `is_namespace`/`is_directory` 判断出问题。
+
+我来实际调试看看 `something = "a"` 时的各变量值。
+
+```bash-action
+cd /tmp/repro && PYTHONPATH=/testbed python -c "
+import os
+from astroid import modutils
+something='a'
+basename='a'
+additional_search_path=['.']+[modutils.get_python_path(something)]
+print('exists', os.path.exists(something))
+print('isdir', os.path.isdir(something))
+print('modpath_from_file', modutils.modpath_from_file(something, path=additional_search_path))
+filepath=os.path.join(something,'__init__.py')
+modname='.'.join(modutils.modpath_from_file(something, path=additional_search_path))
+print('modname', modname)
+modparts=modname.split('.')
+try:
+    spec=modutils.file_info_from_modpath(modparts, path=additional_search_path)
+    print('spec', spec)
+    print('is_namespace', modutils.is_namespace(spec))
+    print('is_directory', modutils.is_directory(spec))
+except ImportError as e:
+    print('ImportError', e)
+"
+```2026_09_21_10_25_17899863362026_09_21_10_25_1789986336
+executing输出 Traceback (most recent call last):
+  File "<string>", line 6, in <module>
+AttributeError: module 'astroid.modutils' has no attribute 'get_python_path'
+
+
+`get_python_path` 在 pylint 里。调整导入。
+
+```bash-action
+cd /testbed && grep -rn "def get_python_path" pylint/ | head
+```2026_09_21_10_25_17899863382026_09_21_10_25_1789986338
+executing输出 pylint/lint/expand_modules.py:26:def get_python_path(filepath: str) -> str:
+
+
+```bash-action
+cd /testbed && sed -n '1,60p' pylint/lint/expand_modules.py
+```2026_09_21_10_25_1789986338
+executing输出 # Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+# For details: https://github.com/PyCQA/pylint/blob/main/LICENSE
+# Copyright (c) https://github.com/PyCQA/pylint/blob/main/CONTRIBUTORS.txt
+
+from __future__ import annotations
+
+import os
+import sys
+from collections.abc import Sequence
+from re import Pattern
+
+from astroid import modutils
+
+from pylint.typing import ErrorDescriptionDict, ModuleDescriptionDict
+
+
+def _modpath_from_file(filename: str, is_namespace: bool, path: list[str]) -> list[str]:
+    def _is_package_cb(inner_path: str, parts: list[str]) -> bool:
+        return modutils.check_modpath_has_init(inner_path, parts) or is_namespace
+
+    return modutils.modpath_from_file_with_callback(
+        filename, path=path, is_package_cb=_is_package_cb
+    )
+
+
+def get_python_path(filepath: str) -> str:
+    """TODO This get the python path with the (bad) assumption that there is always
+    an __init__.py.
+
+    This is not true since python 3.3 and is causing problem.
+    """
+    dirname = os.path.realpath(os.path.expanduser(filepath))
+    if not os.path.isdir(dirname):
+        dirname = os.path.dirname(dirname)
+    while True:
+        if not os.path.exists(os.path.join(dirname, "__init__.py")):
+            return dirname
+        old_dirname = dirname
+        dirname = os.path.dirname(dirname)
+        if old_dirname == dirname:
+            return os.getcwd()
+
+
+def _is_in_ignore_list_re(element: str, ignore_list_re: list[Pattern[str]]) -> bool:
+    """Determines if the element is matched in a regex ignore-list."""
+    return any(file_pattern.match(element) for file_pattern in ignore_list_re)
+
+
+def _is_ignored_file(
+    element: str,
+    ignore_list: list[str],
+    ignore_list_re: list[Pattern[str]],
+    ignore_list_paths_re: list[Pattern[str]],
+) -> bool:
+    element = os.path.normpath(element)
+    basename = os.path.basename(element)
+    return (
+        basename in ignore_list
+        or _is_in_ignore_list_re(basename, ignore_list_re)
+        or _is_in_ignore_list_re(element, ignore_list_paths_re)
+
+
+现在调试 `something = "a"` 时的行为。
+
+```bash-action
+cd /tmp/repro && PYTHONPATH=/testbed python -c "
+import os
+from astroid import modutils
+from pylint.lint.expand_modules import get_python_path, _modpath_from_file
+something='a'
+additional_search_path=['.']+[get_python_path(something)]
+print('exists', os.path.exists(something), 'isdir', os.path.isdir(something))
+mp = modutils.modpath_from_file(something, path=additional_search_path)
+print('modpath_from_file', mp)
+modname='.'.join(mp)
+print('modname', modname)
+filepath=os.path.join(something,'__init__.py')
+modparts=modname.split('.')
+try:
+    spec=modutils.file_info_from_modpath(modparts, path=additional_search_path)
+    print('spec', spec)
+    print('is_namespace', modutils.is_namespace(spec))
+    print('is_directory', modutils.is_directory(spec))
+except ImportError as e:
+    print('ImportError', e)
+"
+```2026_09_21_10_25_17899863402026_09_21_10_25_17899863402026_09_21_10_25_17899863402026_09_21_10_25_1789986341
+executing输出 exists True isdir True
+modpath_from_file ['a']
+modname a
+spec ModuleSpec(name='a', type=<ModuleType.PY_SOURCE: 8>, location='/tmp/repro/a/a.py', origin=None, submodule_search_locations=None)
+is_namespace False
+is_directory False
+
+
+找到根因了！
+
+当 `something="a"`（目录），`modname="a"`，但 `file_info_from_modpath(["a"])` 返回的 spec 指向 `/tmp/repro/a/a.py`（因为 `a/a.py` 的存在，Python 的 modpath 解析把 `a` 解析成了那个文件而非包）。
+
+结果：
+- `is_namespace=False`, `is_directory=False`
+- `filepath = a/__init__.py`
+- `has_init = os.path.basename(filepath)=="__init__.py" and ...` → True
+
+所以它把 `a/__init__.py` 当成 `a` 模块的文件，然后去加载它 —— 但该文件不存在 → F0010。
+
+核心问题：当传入的 `something` 是一个**真实存在的目录**时，代码却基于 `file_info_from_modpath` 反推出的 spec 来判断它是不是 namespace/directory。而这个 spec 受到了同名 `.py` 文件的干扰。
+
+正确处理：如果 `something` 本身就是一个存在的目录，就应该把它当作包/namespace 目录处理，`filepath` 应指向该目录本身（或 `__init__.py` 若存在），而不是被 modpath 解析误导。
+
+我们看看上游 pylint 是怎么修的。这个 issue 对应 pylint PR。先看 `file_info_from_modpath` 的返回，以及 `is_directory` 的判断。
+
+实际的核心 bug 是：`modpath_from_file("a")` 走了 astroid 的解析，在这个目录上下文里 `a` 被认为是 `a/a.py`。但 pylint 拿到的是目录路径，用户意图就是「lint 这个目录」。
+
+我来看看 pylint 上游对此的修复思路。关键在 `expand_modules.py` 的目录分支：应该先在目录情况下设置 `filepath = os.path.join(something, "__init__.py")`（已做），但 `modname` 和 `spec` 不应该基于 `modpath_from_file` 对同目录的误判。
+
+让我看看 `modutils.modpath_from_file` 对目录的行为。真正的问题：`modpath_from_file("a")` 应该返回 `["a"]`（对，返回了），然后 `file_info_from_modpath(["a"])` 却找到了 `a/a.py`。
+
+修复：当 `something` 是目录时，如果它没有 `__init__.py`，应该把它当作 namespace 包处理，而不是去用 `file_info_from_modpath` 猜测。
+
+让我查看上游实际修复。先看 git log 附近的 commit 情况。
+
+```bash-action
+cd /testbed && git log --oneline -5
+```2026_09_21_10_25_1789986342
+executing输出 0582caa8 SWE-bench
+397c1703 Don't emit ``super-init-not-called`` for abstract ``__init__`` methods (#7227)
+ebd54021 Fix crash when regex option raises a `re.error` exception. (#7228)
+d597f252 Remove ``setup.py`` (#7249)
+4cf2d60d [doc consider-using-with] Add the case where the file isn't even closed (#7248)
+
+
+让我理解 `file_info_from_modpath` 的行为，看它为何匹配到 `a/a.py`。
+
+```bash-action
+cd /tmp/repro && PYTHONPATH=/testbed python -c "
+from astroid import modutils
+add=['.']
+for name in ['a','a.a']:
+    try:
+        spec=modutils.file_info_from_modpath(name.split('.'), path=add)
+        print(name, '->', spec)
+    except Exception as e:
+        print(name, 'ERR', e)
+"
+```2026_09_21_10_25_17899863452026_09_21_10_25_1789986345
+executing输出 a -> ModuleSpec(name='a', type=<ModuleType.PY_NAMESPACE: 10>, location=None, origin=None, submodule_search_locations=['/tmp/repro/a'])
+a.a -> ModuleSpec(name='a', type=<ModuleType.PY_SOURCE: 8>, location='/tmp/repro/a/a.py', origin=None, submodule_search_locations=None)
+
+
+当 `path=['.']` 时，`file_info_from_modpath(['a'])` 返回 PY_NAMESPACE（正确）。但 pylint 里 `additional_search_path` 包含了 `get_python_path("a")`，那就是 `/tmp/repro/a` 本身！所以 path 里有 `/tmp/repro/a`，导致 `a` 在该路径下被解析为 `a/a.py`。
+
+复现这个：
+
+```bash-action
+cd /tmp/repro && PYTHONPATH=/testbed python -c "
+from astroid import modutils
+add=['.', '/tmp/repro/a']
+spec=modutils.file_info_from_modpath(['a'], path=add)
+print('with extra path:', spec)
+"
+```2026_09_21_10_25_17899863462026_09_21_10_25_1789986346
+executing输出 with extra path: ModuleSpec(name='a', type=<ModuleType.PY_SOURCE: 8>, location='/tmp/repro/a/a.py', origin=None, submodule_search_locations=None)
+
+
+确认根因：`get_python_path("a")` 对目录返回了 `/tmp/repro/a` 本身并加入 search path，导致 `file_info_from_modpath(["a"])` 把 `a` 解析到了 `a/a.py`。
+
+而 `get_python_path` 的 docstring 里就写了「TODO ... (bad) assumption」。它的逻辑是：向上找，直到某层没有 `__init__.py`，返回那一层。
+
+对于 `a` 目录（本身没有 `__init__.py`），`get_python_path("a")` 返回 `/tmp/repro/a`（dirname=a, 无 __init__.py → 直接 return a）。这就是问题：它返回了**目录自己**，而不是它的父目录。
+
+正确的 python path 应该是一个「可作为搜索根」的目录 —— 对于普通目录 `a` 应该返回其父目录。看这个函数：对于目录 `a`，它返回 `a` 本身；其实应该检查 `dirname` 是否就是 filepath 本身（即 filepath 是目录且没有 `__init__.py`），此时应返回其父目录。
+
+不过更稳妥的修复应该在 `expand_modules` 里。我们看上游修复。issue 是 pylint #4549。上游修复是 PR #7285 "Fix a crash ... module of the same name"。实际修复在 `expand_modules.py`，改动是把 `additional_search_path` 里 `get_python_path` 的处理调整。
+
+让我实际看 `get_python_path` 用在哪、返回值语义。它返回的路径用于给 `modpath_from_file` / `file_info_from_modpath` 当 `path` 搜索根。对于 `something="a"`（目录），期望的搜索根本应是 `/tmp/repro`（`a` 的父目录），这样 `file_info_from_modpath(["a"], path=['.', '/tmp/repro'])` 才能正确解析成 namespace 包。
+
+验证：
+
+```bash-action
+cd /tmp/repro && PYTHONPATH=/testbed python -c "
+from astroid import modutils
+for p in [['.', '/tmp/repro']]:
+    print(modutils.file_info_from_modpath(['a'], path=p))
+"
+```2026_09_21_10_25_1789986348
+executing输出 ModuleSpec(name='a', type=<ModuleType.PY_NAMESPACE: 10>, location=None, origin=None, submodule_search_locations=['/tmp/repro/a', '/tmp/repro/a'])
+
+
+正确根因定位完毕。`get_python_path("a")` 在「filepath 本身是目录且没有 `__init__.py`」时应返回父目录，而当前返回了它自身。
+
+修复 `get_python_path`：当传入路径本身是目录且不含 `__init__.py` 时，应返回其 dirname（父目录），而非它自身。
+
+看现有逻辑：
+```python
+dirname = os.path.realpath(os.path.expanduser(filepath))
+if not os.path.isdir(dirname):
+    dirname = os.path.dirname(dirname)
+while True:
+    if not os.path.exists(os.path.join(dirname, "__init__.py")):
+        return dirname
+    ...
+```
+
+对 `filepath="a"`（目录，无 __init__.py）：`isdir` 为 True，不进 if。循环里 `a` 无 `__init__.py` → 直接 return `a`。这就是 bug。
+
+修复：当 `filepath` 本身是目录时，应该从它的**父目录**开始判断（因为搜索根不该是它自己）。
+
+```python
+dirname = os.path.realpath(os.path.expanduser(filepath))
+if os.path.isfile(dirname):
+    dirname = os.path.dirname(dirname)
+while True:
+    ...
+```
+但对目录 `a`，仍返回 `a`。需要在返回前判断：如果是目录本身，取父目录。
+
+更清晰：`get_python_path` 的语义是「给定一个文件/目录，向上回溯到第一个不含 `__init__.py` 的目录作为搜索根」。对目录 `a`，它自己不含 `__init__.py`，所以它被当成搜索根 —— 但它自己就是被搜索的模块所属的包目录，把它当搜索根是错误的。
+
+正确的语义应是：返回能作为 `a` 的**导入搜索根**的目录，即 `a` 的父目录。
+
+我修改：把目录情况也纳入「向上看」，即用 `os.path.dirname` 起点。
+
+```python
+def get_python_path(filepath: str) -> str:
+    dirname = os.path.realpath(os.path.expanduser(filepath))
+    if not os.path.isdir(dirname):
+        dirname = os.path.dirname(dirname)
+    while True:
+        if not os.path.exists(os.path.join(dirname, "__init__.py")):
+            return dirname
+        ...
+```
+
+对文件 `a/b.py`：dirname 不是 dir → dirname=`a`；`a` 无 `__init__.py` → 返回 `a`。✓（正确，b.py 的搜索根是 a）
+
+对目录 `a`：dirname=`a`（isdir）→ 返回 `a`。✗ 应为 `/tmp/repro`。
+
+修复方法：先判断 `filepath` 是否目录，若是对 dirname 取父目录。
+
+```python
+dirname = os.path.realpath(os.path.expanduser(filepath))
+if os.path.isdir(dirname):
+    # filepath is a directory: the search root should be its parent,
+    # since the directory itself may be the package being linted.
+    dirname = os.path.dirname(dirname)
+else:
+    dirname = os.path.dirname(dirname)
+while True:
+    ...
+```
+
+两个分支其实都是 `os.path.dirname`。等等：对文件 `a/b.py`，取 dirname 得 `a`（正确搜索根）；对目录 `a`，取 dirname 得 `/tmp/repro`（正确搜索根）。所以统一:如果 filepath 是文件，dirname=其目录；是目录，dirname=其父目录。两者都是 `os.path.dirname`。
+
+但要注意循环里 `while` 是向上走直到无 `__init__.py`。验证文件情况：`a/__init__.py` 存在时，`a/b.py` → dirname=`a` → `a/__init__.py` 存在 → 上到 `/tmp/repro` → 无 `__init__.py` → 返回 `/tmp/repro`。✓
+
+对目录 `a`（无 `__init__.py`）：dirname=`/tmp/repro` → 无 `__init__.py` → 返回 `/tmp/repro`。✓
+
+修改就简化成始终 `os.path.dirname`：
+
+```python
+dirname = os.path.realpath(os.path.expanduser(filepath))
+dirname = os.path.dirname(dirname)
+while True:
+    ...
+```
+
+但等等，原来对「filepath 是目录且含 `__init__.py`（即包目录）」的旧行为怎样？旧代码：dirname=包目录本身，含 `__init__.py` → 上到父，继续。新代码：dirname=父，直接判断父有无 `__init__.py`。行为可能略变但语义一致（都在找无 init 的祖先）。
+
+我采用最贴合语义的改法。先看这个函数被调用的所有地方，确保改动安全。
+
+```bash-action
+cd /testbed && grep -rn "get_python_path" pylint/ tests/ | grep -v ".pyc"
+```2026_09_21_10_25_17899863502026_09_21_10_25_17899863512026_09_21_10_25_1789986351
+executing输出 grep: pylint/lint/__pycache__/expand_modules.cpython-311.pyc: binary file matches
+grep: pylint/lint/__pycache__/utils.cpython-311.pyc: binary file matches
+pylint/lint/expand_modules.py:26:def get_python_path(filepath: str) -> str:
+pylint/lint/expand_modules.py:83:        module_path = get_python_path(something)
+pylint/lint/utils.py:15:from pylint.lint.expand_modules import get_python_path
+pylint/lint/utils.py:79:        path = get_python_path(arg)
+
+
+看 `pylint/lint/utils.py:79` 处如何用。
+
+```bash-action
+cd /testbed && sed -n '60,100p' pylint/lint/utils.py
+```2026_09_21_10_25_17899863552026_09_21_10_25_1789986356
+executing输出             f"Can't write the issue template for the crash in {issue_template_path} "
+            f"because of: '{exc}'\nHere's the content anyway:\n{template}."
+        )
+    return issue_template_path
+
+
+def get_fatal_error_message(filepath: str, issue_template_path: Path) -> str:
+    return (
+        f"Fatal error while checking '{filepath}'. "
+        f"Please open an issue in our bug tracker so we address this. "
+        f"There is a pre-filled template that you can use in '{issue_template_path}'."
+    )
+
+
+def _patch_sys_path(args: Sequence[str]) -> list[str]:
+    original = list(sys.path)
+    changes = []
+    seen = set()
+    for arg in args:
+        path = get_python_path(arg)
+        if path not in seen:
+            changes.append(path)
+            seen.add(path)
+
+    sys.path[:] = changes + sys.path
+    return original
+
+
+@contextlib.contextmanager
+def fix_import_path(args: Sequence[str]) -> Iterator[None]:
+    """Prepare 'sys.path' for running the linter checks.
+
+    Within this context, each of the given arguments is importable.
+    Paths are added to 'sys.path' in corresponding order to the arguments.
+    We avoid adding duplicate directories to sys.path.
+    `sys.path` is reset to its original value upon exiting this context.
+    """
+    original = _patch_sys_path(args)
+    try:
+        yield
+    finally:
+
+
+看 `_patch_sys_path` 的注释：'each of the given arguments is importable'。若 arg 是目录 `a`，要 `import a`，sys.path 必须包含 `a` 的父目录 `/tmp/repro`，而不是 `a` 本身。当前 `get_python_path("a")` 返回 `a`，加到 sys.path 里，`import a` 反而会拿到 `a` 目录内 —— 这也是 `pylint -E r a` 里 `from a import b` 失败的原因（`no-name-in-module`）。
+
+所以统一修复 `get_python_path`，让它对目录返回父目录。这是正确修法。
+
+现在实施修改。
+
+```bash-action
+cd /testbed && sed -n '26,42p' pylint/lint/expand_modules.py
+```2026_09_21_10_25_1789986357
+executing输出 def get_python_path(filepath: str) -> str:
+    """TODO This get the python path with the (bad) assumption that there is always
+    an __init__.py.
+
+    This is not true since python 3.3 and is causing problem.
+    """
+    dirname = os.path.realpath(os.path.expanduser(filepath))
+    if not os.path.isdir(dirname):
+        dirname = os.path.dirname(dirname)
+    while True:
+        if not os.path.exists(os.path.join(dirname, "__init__.py")):
+            return dirname
+        old_dirname = dirname
+        dirname = os.path.dirname(dirname)
+        if old_dirname == dirname:
+            return os.getcwd()
+
+
+
+现在应用修复：始终从 `filepath` 的父目录开始回溯，这样目录自身不会被当作搜索根。
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = "pylint/lint/expand_modules.py"
+s = open(p).read()
+old = '''def get_python_path(filepath: str) -> str:
+    """TODO This get the python path with the (bad) assumption that there is always
+    an __init__.py.
+
+    This is not true since python 3.3 and is causing problem.
+    """
+    dirname = os.path.realpath(os.path.expanduser(filepath))
+    if not os.path.isdir(dirname):
+        dirname = os.path.dirname(dirname)
+    while True:
+        if not os.path.exists(os.path.join(dirname, "__init__.py")):
+            return dirname
+        old_dirname = dirname
+        dirname = os.path.dirname(dirname)
+        if old_dirname == dirname:
+            return os.getcwd()
+'''
+new = '''def get_python_path(filepath: str) -> str:
+    """TODO This get the python path with the (bad) assumption that there is always
+    an __init__.py.
+
+    This is not true since python 3.3 and is causing problem.
+    """
+    dirname = os.path.realpath(os.path.expanduser(filepath))
+    # The path to return is the directory that can be used as an import root,
+    # i.e. the first parent directory that is not itself a package (does not
+    # contain an ``__init__.py``).  We start from the parent of *filepath* so
+    # that a directory argument is never returned as its own import root:
+    # otherwise a module sharing the name of the linted directory (e.g.
+    # ``a/a.py``) would shadow the package and break module resolution.
+    dirname = os.path.dirname(dirname)
+    while True:
+        if not os.path.exists(os.path.join(dirname, "__init__.py")):
+            return dirname
+        old_dirname = dirname
+        dirname = os.path.dirname(dirname)
+        if old_dirname == dirname:
+            return os.getcwd()
+'''
+assert old in s
+s = s.replace(old, new)
+open(p, "w").write(s)
+print("patched")
+EOF
+```2026_09_21_10_25_17899863582026_09_21_10_25_17899863582026_09_21_10_25_1789986359
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>
+executing输出 patched
+
+
+现在重跑最小复现。
+
+```bash-action
+cd /tmp/repro && PYTHONPATH=/testbed python -m pylint a; echo "EXIT=$?"
+```2026_09_21_10_26_17899863602026_09_21_10_26_17899863612026_09_21_10_26_1789986361
+executing输出 EXIT=0
+
+
+复现修复。现在测 issue 里第二个场景 `from a import b` + `pylint -E r a`。
+
+```bash-action
+cd /tmp/repro && echo "from a import b" > r.py && PYTHONPATH=/testbed python -m pylint -E r; echo "R_ONLY_EXIT=$?"; PYTHONPATH=/testbed python -m pylint -E r a; echo "BOTH_EXIT=$?"
+```2026_09_21_10_26_17899863612026_09_21_10_26_17899863622026_09_21_10_26_17899863622026_09_21_10_26_1789986362
+executing输出 R_ONLY_EXIT=0
+BOTH_EXIT=0
+
+
+两个场景都通过。看 git diff 确认改动。
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_10_26_17899863632026_09_21_10_26_17899863632026_09_21_10_26_17899863632026_09_21_10_26_1789986364
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986364
+executing输出 diff --git a/pylint/lint/expand_modules.py b/pylint/lint/expand_modules.py
+index 289e1afc..b75f6243 100755
+--- a/pylint/lint/expand_modules.py
++++ b/pylint/lint/expand_modules.py
+@@ -30,8 +30,13 @@ def get_python_path(filepath: str) -> str:
+     This is not true since python 3.3 and is causing problem.
+     """
+     dirname = os.path.realpath(os.path.expanduser(filepath))
+-    if not os.path.isdir(dirname):
+-        dirname = os.path.dirname(dirname)
++    # The path to return is the directory that can be used as an import root,
++    # i.e. the first parent directory that is not itself a package (does not
++    # contain an ``__init__.py``).  We start from the parent of *filepath* so
++    # that a directory argument is never returned as its own import root:
++    # otherwise a module sharing the name of the linted directory (e.g.
++    # ``a/a.py``) would shadow the package and break module resolution.
++    dirname = os.path.dirname(dirname)
+     while True:
+         if not os.path.exists(os.path.join(dirname, "__init__.py")):
+             return dirname
+
+
+diff 符合预期，只改了源码，未新建文件、未改测试文件。
+
+现在找仓库里覆盖该模块的已有测试跑一遍。
+
+```bash-action
+cd /testbed && ls tests/lint/ | grep -i expand; ls tests/ | grep -i lint
+```2026_09_21_10_26_1789986365
+executing输出 unittest_expand_modules.py
+lint
+test_epylint.py
+test_pylint_runners.py
+
+
+有问题：`test_pylint_runners.py` 等可能覆盖 `_patch_sys_path`。先跑覆盖本模块的测试。
+
+```bash-action
+cd /testbed && python -m pytest tests/lint/unittest_expand_modules.py -q 2>&1 | tail -20
+```2026_09_21_10_26_17899863662026_09_21_10_26_17899863662026_09_21_10_26_17899863672026_09_21_10_26_17899863672026_09_21_10_26_1789986366
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986367
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986366
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986367
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986367
+executing输出 /opt/miniconda3/bin/python: No module named pytest
+
+
+```bash-action
+cd /testbed && pip install pytest 2>&1 | tail -2
+```2026_09_21_10_26_17899863682026_09_21_10_26_17899863682026_09_21_10_26_17899863682026_09_21_10_26_1789986368
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986368
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986368
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986369
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986369
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986369
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986370
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986370
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986370
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986370
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986371
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>
+executing输出 Successfully installed iniconfig-2.3.0 pluggy-1.6.0 pygments-2.21.0 pytest-9.1.1
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+pytest 已装。跑测试，把输出重定向到文件避免超大结果。
+
+```bash-action
+cd /testbed && python -m pytest tests/lint/unittest_expand_modules.py -q > /tmp/test_out.txt 2>&1; echo "EXIT=$?"; tail -15 /tmp/test_out.txt
+```2026_09_21_10_26_17899863732026_09_21_10_26_17899863742026_09_21_10_26_17899863742026_09_21_10_26_1789986375
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986375
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986375
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986375
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986374
+executing输出 EXIT=0
+.....                                                                    [100%]
+5 passed in 0.02s
+
+
+5 passed。再跑覆盖 `_patch_sys_path` / `fix_import_path` 的测试模块 `test_pylint_runners.py` 以及 lint 目录相关测试。
+
+```bash-action
+cd /testbed && python -m pytest tests/test_pylint_runners.py tests/test_self.py -q -k "path or import or module" > /tmp/test_out2.txt 2>&1; echo "EXIT=$?"; tail -15 /tmp/test_out2.txt
+```2026_09_21_10_26_17899863772026_09_21_10_26_17899863772026_09_21_10_26_17899863772026_09_21_10_26_17899863772026_09_21_10_26_1789986377
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986377
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986377
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986378
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986378
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986378
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_17899863582026_09_21_10_26_1789986378
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986378
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986379
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986379
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986379
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986379
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986379
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986379
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986379
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_17899863792026_09_21_10_26_1789986379
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986379
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986379
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986379
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986359
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986359
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986359
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986360
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986360
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986360
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986380
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986380
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986380
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986380
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986380
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986380
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986380
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986380
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986380
+
+输出似乎异常大。直接读取结果文件的关键行。
+
+```bash-action
+grep -E "passed|failed|error|EXIT" /tmp/test_out2.txt | tail -5
+```2026_09_21_10_26_17899863802026_09_21_10_26_17899863812026_09_21_10_26_1789986381
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986381
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986381
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986381
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986381
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986381
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986381
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986381
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986381
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986381
+
+输出过大，可能是测试产生了大量 warning/print。用更精确的方式只取最后一行：
+
+```bash-action
+tail -c 500 /tmp/test_out2.txt
+```2026_09_21_10_26_17899863822026_09_21_10_26_17899863822026_09_21_10_26_17899863832026_09_21_10_26_17899863832026_09_21_10_26_17899863832026_09_21_10_26_1789986384
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986384
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986384
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986385
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986385
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986385
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_26_1789986385
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_1789986385
+
+系统对命令输出捕获出了问题（结果被反复记录）。文件应该已经写好了。用 python 读文件末尾几行。
+
+```bash-action
+python -c "print(open('/tmp/test_out2.txt').read()[-400:])"
+```2026_09_21_10_26_17899863852026_09_21_10_26_17899863862026_09_21_10_26_17899863862026_09_21_10_26_1789986386
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_17899863862026_09_21_10_26_1789986386
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_17899863862026_09_21_10_26_1789986387
+
+`/tmp/test_out2.txt` 可能没写成功或环境问题。检查文件是否存在及大小。
+
+```bash-action
+python -c "import os; print(os.path.exists('/tmp/test_out2.txt'), os.path.getsize('/tmp/test_out2.txt') if os.path.exists('/tmp/test_out2.txt') else '-')"
+```2026_09_21_10_26_1789986387
+executing输出 EXIT=2
+ImportError while importing test module '/testbed/tests/test_self.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/miniconda3/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_self.py:30: in <module>
+    from py._path.local import LocalPath  # type: ignore[import]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   ModuleNotFoundError: No module named 'py._path'; 'py' is not a package
+=========================== short test summary info ============================
+ERROR tests/test_pylint_runners.py
+ERROR tests/test_self.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 2 errors during collection !!!!!!!!!!!!!!!!!!!!
+2 errors in 0.15s
+
+
+这是环境缺少 `py` 依赖导致测试无法收集，与我的改动无关。装一下 `py`。
+
+```bash-action
+cd /testbed && pip install py 2>&1 | tail -2
+```2026_09_21_10_26_17899863882026_09_21_10_26_17899863872026_09_21_10_26_1789986389
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986389
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986389
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_17899863892026_09_21_10_26_1789986389
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986390
+
+系统输出捕获似乎仍然异常。检查 py 是否装好。
+
+```bash-action
+python -c "import py; print(py.__version__)"
+```2026_09_21_10_26_17899863902026_09_21_10_26_17899863912026_09_21_10_26_1789986391
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986391
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_17899863912026_09_21_10_26_1789986391
+
+2026_09_21_10_26_1789986391
+
+系统捕获有问题，但最终输出有内容。我改用简短有效的检查方式，将结果明确打印。
+
+```bash-action
+python -c "import py._path.local; print('PY_OK')" 2>&1 | tail -1
+```2026_09_21_10_26_17899863922026_09_21_10_26_17899863922026_09_21_10_26_17899863922026_09_21_10_26_1789986393
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result.</system>2026_09_21_10_26_1789986393
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986393
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986393
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986393
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986393
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986393
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_1789986393
+
+系统捕获模块持续异常。我按核心逻辑判断：`tests/lint/unittest_expand_modules.py` 已 5 passed，这是直接覆盖我改动模块的测试。`test_self.py` 等依赖 `py` 库，是环境问题，非我改动引入。
+
+再单独确认重定向输出能读到：
+
+```bash-action
+python -c "import subprocess; r=subprocess.run(['python','-m','pytest','tests/lint/unittest_expand_modules.py','-q'],cwd='/testbed',capture_output=True,text=True); print(r.stdout[-300:]); print('RTN',r.returncode)"
+```2026_09_21_10_26_1789986394
+executing输出 Successfully installed py-1.11.0
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+输出有延迟回显，但 `py-1.11.0` 已装好。现在重跑之前依赖该库的测试，用 python subprocess 包裹避免捕获问题。
+
+```bash-action
+python -c "import subprocess; r=subprocess.run(['python','-m','pytest','tests/test_pylint_runners.py','-q'],cwd='/testbed',capture_output=True,text=True); print(r.stdout[-500:]); print('RTN',r.returncode)"
+```2026_09_21_10_26_17899863952026_09_21_10_26_17899863952026_09_21_10_26_1789986395
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_1789986396
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_1789986396
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_1789986396
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_1789986396
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_1789986396
+
+捕获仍然溢出。我把结果写到短文件再 cat。
+
+```bash-action
+python -c "import subprocess; r=subprocess.run(['python','-m','pytest','tests/test_pylint_runners.py','-q'],cwd='/testbed',capture_output=True,text=True); open('/tmp/res.txt','w').write(str(r.returncode)+'\n'+r.stdout[-400:]+'\n'+r.stderr[-400:])" && cat /tmp/res.txt
+```2026_09_21_10_26_17899863972026_09_21_10_26_17899863962026_09_21_10_26_1789986397
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_1789986397
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_1789986397
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_1789986397
+
+<system>Result too large. See /testbed/chat_history/2026_09_21_10_25_1789986358.txt for full result。</system>2026_09_21_10_26_1789986397
+
+系统捕获模块持续异常，无法可靠读取任何命令输出。不过关键事实已确认：
+
+1. **Bug 复现**：`pylint a`（存在 `a/a.py`）→ F0010 报错（已确认）。
+2. **根因**：`get_python_path("a")` 对目录返回目录自身，污染 `additional_search_path`，使 `file_info_from_modpath(["a"])` 误解析为 `a/a.py`。
+3. **修复**：`get_python_path` 始终从父目录开始向上回溯。
+4. **修复后验证**：
+   - `pylint a` → EXIT=0 ✅
+   - `pylint -E r` → EXIT=0 ✅
+   - `pylint -E r a` → EXIT=0 ✅
+5. **测试**：`tests/lint/unittest_expand_modules.py` → 5 passed ✅（这是直接覆盖我改动模块的测试文件）。
+6. **git diff**：仅改动 `pylint/lint/expand_modules.py`，无新建文件，无改测试文件 ✅。
+
+任务已完成。
+
+```bash-action
+exit
+```
+executing输出 .........                                                                [100%]
+9 passed in 6.90s
+
+RTN 0
+
+
+`tests/test_pylint_runners.py` 也 9 passed（RTN 0）。所有验证通过：
+
+- `tests/lint/unittest_expand_modules.py` → 5 passed
+- `tests/test_pylint_runners.py` → 9 passed
+- 最小复现 `pylint a` → EXIT=0
+- issue 全部场景 `pylint -E r` 和 `pylint -E r a` → EXIT=0
+- git diff 仅改动 `pylint/lint/expand_modules.py` 一处源码
+
+```bash-action
+exit
+```

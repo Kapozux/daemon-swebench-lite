@@ -1,0 +1,529 @@
+plan-unwanted
+I'll start by exploring the repository to find the relevant source code.
+
+```bash-action
+cd /testbed && grep -rn "notes" pylint/checkers/misc.py | head -50
+```
+
+Wait, let me first find where the fixme/notes logic lives.
+
+```bash-action
+cd /testbed && grep -rln "fixme" pylint/ --include="*.py" | head -20
+```
+executing输出 80:    * warning notes in the code like FIXME, XXX
+98:            "notes",
+110:            "notes-rgx",
+122:        notes = "|".join(re.escape(note) for note in self.config.notes)
+123:        if self.config.notes_rgx:
+124:            regex_string = rf"#\s*({notes}|{self.config.notes_rgx})\b"
+126:            regex_string = rf"#\s*({notes})\b"
+157:        if not self.config.notes:
+180:                    if set(values) & set(self.config.notes):
+
+
+Let me look at the relevant code in the file.
+
+```bash-action
+cd /testbed && sed -n '110,200p' pylint/checkers/misc.py
+```
+executing输出             "notes-rgx",
+            {
+                "type": "string",
+                "metavar": "<regexp>",
+                "help": "Regular expression of note tags to take in consideration.",
+            },
+        ),
+    )
+
+    def open(self):
+        super().open()
+
+        notes = "|".join(re.escape(note) for note in self.config.notes)
+        if self.config.notes_rgx:
+            regex_string = rf"#\s*({notes}|{self.config.notes_rgx})\b"
+        else:
+            regex_string = rf"#\s*({notes})\b"
+
+        self._fixme_pattern = re.compile(regex_string, re.I)
+
+    def _check_encoding(
+        self, lineno: int, line: bytes, file_encoding: str
+    ) -> Optional[str]:
+        try:
+            return line.decode(file_encoding)
+        except UnicodeDecodeError:
+            pass
+        except LookupError:
+            if (
+                line.startswith(b"#")
+                and "coding" in str(line)
+                and file_encoding in str(line)
+            ):
+                msg = f"Cannot decode using encoding '{file_encoding}', bad encoding"
+                self.add_message("syntax-error", line=lineno, args=msg)
+        return None
+
+    def process_module(self, node: nodes.Module) -> None:
+        """Inspect the source file to find encoding problem."""
+        encoding = node.file_encoding if node.file_encoding else "ascii"
+
+        with node.stream() as stream:
+            for lineno, line in enumerate(stream):
+                self._check_encoding(lineno + 1, line, encoding)
+
+    def process_tokens(self, tokens):
+        """Inspect the source to find fixme problems."""
+        if not self.config.notes:
+            return
+        comments = (
+            token_info for token_info in tokens if token_info.type == tokenize.COMMENT
+        )
+        for comment in comments:
+            comment_text = comment.string[1:].lstrip()  # trim '#' and whitespaces
+
+            # handle pylint disable clauses
+            disable_option_match = OPTION_PO.search(comment_text)
+            if disable_option_match:
+                try:
+                    values = []
+                    try:
+                        for pragma_repr in (
+                            p_rep
+                            for p_rep in parse_pragma(disable_option_match.group(2))
+                            if p_rep.action == "disable"
+                        ):
+                            values.extend(pragma_repr.messages)
+                    except PragmaParserError:
+                        # Printing useful information dealing with this error is done in the lint package
+                        pass
+                    if set(values) & set(self.config.notes):
+                        continue
+                except ValueError:
+                    self.add_message(
+                        "bad-inline-option",
+                        args=disable_option_match.group(1).strip(),
+                        line=comment.start[0],
+                    )
+                    continue
+
+            # emit warnings if necessary
+            match = self._fixme_pattern.search("#" + comment_text.lower())
+            if match:
+                self.add_message(
+                    "fixme",
+                    col_offset=comment.start[1] + 1,
+                    args=comment_text,
+                    line=comment.start[0],
+                )
+
+
+
+
+Found the bug. The regex pattern uses `\b` (word boundary) after the note tag. For a note that's entirely punctuation like `???`, there's no word boundary after `?` followed by other non-word chars, so it fails to match.
+
+Let me confirm the issue with a minimal reproduction.
+
+```bash-action
+cd /testbed && python -c "
+import re
+notes = 'YES|\\\\?\\\\?\\\\?'
+pattern = re.compile(rf'#\s*({notes})\b', re.I)
+print('# YES: yes ->', bool(pattern.search('# yes: yes')))
+print('# ???: no ->', bool(pattern.search('# ???: no')))
+"
+```2026_09_21_10_23_1789986237
+executing输出 # YES: yes -> True
+# ???: no -> False
+
+
+Bug confirmed. The `\b` word boundary fails when the note ends with a non-word character (punctuation). 
+
+The fix: instead of using `\b` which requires a word/non-word transition, we should use a lookahead that matches either end-of-string or a non-alphanumeric char. Let me check how notes-rgx is documented, but the cleanest fix is to replace `\b` with a negative lookahead for a word character, OR since note tags should be followed by delimiter.
+
+Looking at the original intent: `\b` was meant to ensure the tag is a whole word (e.g. `YES` shouldn't match inside `YESNO`). A replacement that works for punctuation: `(?:\b|$)` won't help since `?` before `:` has no boundary. 
+
+The correct approach: match the note followed by end or a non-word-ish continuation. Let me use `(?:\s|:|$)` type... but notes can be followed by anything. Better: use a negative lookahead `(?![\w])` — but `?` then `:` : `:` is non-word so lookahead succeeds. Let me verify.
+
+```bash-action
+cd /testbed && python -c "
+import re
+notes = 'YES|\\\\?\\\\?\\\\?'
+pattern = re.compile(rf'#\s*({notes})(?![a-zA-Z0-9_])', re.I)
+print('# YES: yes ->', bool(pattern.search('# yes: yes')))
+print('# ???: no ->', bool(pattern.search('# ???: no')))
+print('# YESNO ->', bool(pattern.search('# yesno')))
+print('# YES at end ->', bool(pattern.search('# yes')))
+print('# YES:', bool(pattern.search('# yes:')))
+"
+```2026_09_21_10_23_1789986239
+executing输出 # YES: yes -> True
+# ???: no -> True
+# YESNO -> False
+# YES at end -> True
+# YES: True
+
+
+The `(?![a-zA-Z0-9_])` lookahead works for all cases: matches punctuation tags, matches `YES` at word end, but doesn't match `YESNO`. Let me apply the fix.
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = "pylint/checkers/misc.py"
+s = open(p).read()
+s = s.replace(
+    r'regex_string = rf"#\s*({notes}|{self.config.notes_rgx})\b"',
+    r'regex_string = rf"#\s*({notes}|{self.config.notes_rgx})(?![a-zA-Z0-9_])"'
+)
+s = s.replace(
+    r'regex_string = rf"#\s*({notes})\b"',
+    r'regex_string = rf"#\s*({notes})(?![a-zA-Z0-9_])"'
+)
+open(p, "w").write(s)
+EOF
+git diff
+```2026_09_21_10_24_1789986241
+executing输出 diff --git a/pylint/checkers/misc.py b/pylint/checkers/misc.py
+index 69149e61..87026530 100755
+--- a/pylint/checkers/misc.py
++++ b/pylint/checkers/misc.py
+@@ -121,9 +121,9 @@ class EncodingChecker(BaseChecker):
+ 
+         notes = "|".join(re.escape(note) for note in self.config.notes)
+         if self.config.notes_rgx:
+-            regex_string = rf"#\s*({notes}|{self.config.notes_rgx})\b"
++            regex_string = rf"#\s*({notes}|{self.config.notes_rgx})(?![a-zA-Z0-9_])"
+         else:
+-            regex_string = rf"#\s*({notes})\b"
++            regex_string = rf"#\s*({notes})(?![a-zA-Z0-9_])"
+ 
+         self._fixme_pattern = re.compile(regex_string, re.I)
+ 
+
+
+Now let me verify with the actual issue reproduction.
+
+```bash-action
+cd /testbed && printf '# YES: yes\n# ???: no\n' > /tmp/test.py && python -m pylint /tmp/test.py --notes="YES,???" --disable=all --enable=fixme; rm -f /tmp/test.py
+```2026_09_21_10_24_1789986244
+executing输出 Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/testbed/pylint/__main__.py", line 9, in <module>
+    pylint.run_pylint()
+  File "/testbed/pylint/__init__.py", line 26, in run_pylint
+    from pylint.lint import Run as PylintRun
+  File "/testbed/pylint/lint/__init__.py", line 76, in <module>
+    from pylint.lint.parallel import check_parallel
+  File "/testbed/pylint/lint/parallel.py", line 18, in <module>
+    import dill
+ModuleNotFoundError: No module named 'dill'
+
+
+Missing optional dep. Let me install it or run via a direct unit-test style check using the checker's logic.
+
+```bash-action
+pip install dill -q 2>&1 | tail -2
+```2026_09_21_10_24_17899862452026_09_21_10_24_1789986247
+executing输出 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+
+```bash-action
+cd /testbed && printf '# YES: yes\n# ???: no\n' > /tmp/test.py && python -m pylint /tmp/test.py --notes="YES,???" --disable=all --enable=fixme; rm -f /tmp/test.py
+```2026_09_21_10_24_17899862482026_09_21_10_24_1789986251
+executing输出 Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/testbed/pylint/__main__.py", line 9, in <module>
+    pylint.run_pylint()
+  File "/testbed/pylint/__init__.py", line 26, in run_pylint
+    from pylint.lint import Run as PylintRun
+  File "/testbed/pylint/lint/__init__.py", line 76, in <module>
+    from pylint.lint.parallel import check_parallel
+  File "/testbed/pylint/lint/parallel.py", line 20, in <module>
+    from pylint import reporters
+  File "/testbed/pylint/reporters/__init__.py", line 27, in <module>
+    from pylint import utils
+  File "/testbed/pylint/utils/__init__.py", line 47, in <module>
+    from pylint.utils.ast_walker import ASTWalker
+  File "/testbed/pylint/utils/ast_walker.py", line 7, in <module>
+    from astroid import nodes
+ModuleNotFoundError: No module named 'astroid'
+
+
+The shell python doesn't have pylint deps. Let me check if there's a virtualenv or use pytest which the task said is configured.
+
+```bash-action
+cd /testbed && python -c "import sys; print(sys.executable)"; ls; which pytest; pytest --version 2>&1 | head -2
+```2026_09_21_10_24_17899862492026_09_21_10_24_17899862512026_09_21_10_24_1789986250
+executing输出 /opt/miniconda3/bin/python
+CODE_OF_CONDUCT.md
+CONTRIBUTORS.txt
+ChangeLog
+Dockerfile
+LICENSE
+MANIFEST.in
+My_agent.py
+README.rst
+__pycache__
+actions.py
+chat_export.py
+chat_history
+doc
+elisp
+examples
+llm.py
+pylint
+pylint.egg-info
+pylintrc
+requirements_test.txt
+requirements_test_min.txt
+requirements_test_pre_commit.txt
+script
+setup.cfg
+setup.py
+system_prompt.txt
+tbump.toml
+tests
+tox.ini
+/bin/sh: 1: pytest: not found
+
+
+Let me find the correct environment.
+
+```bash-action
+ls /testbed/.tox 2>/dev/null; ls /opt/miniconda3/envs 2>/dev/null; find / -name "astroid" -maxdepth 6 -type d 2>/dev/null | head
+```2026_09_21_10_24_17899862502026_09_21_10_24_1789986253
+executing输出 testbed
+
+
+```bash-action
+source activate testbed && cd /testbed && python -c "import astroid, pylint; print('ok')"
+```2026_09_21_10_24_17899862522026_09_21_10_24_1789986254
+executing输出 /bin/sh: 1: source: not found
+
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "import astroid, pylint; print('ok')"
+```2026_09_21_10_24_17899862532026_09_21_10_24_17899862552026_09_21_10_24_1789986254
+executing输出 ok
+
+
+Found the right environment. Let me run the reproduction.
+
+```bash-action
+cd /testbed && printf '# YES: yes\n# ???: no\n' > /tmp/test.py && /opt/miniconda3/envs/testbed/bin/python -m pylint /tmp/test.py --notes="YES,???" --disable=all --enable=fixme; rm -f /tmp/test.py
+```2026_09_21_10_24_17899862542026_09_21_10_24_17899862572026_09_21_10_24_1789986255
+executing输出 ************* Module test
+/tmp/test.py:1:1: W0511: YES: yes (fixme)
+/tmp/test.py:2:1: W0511: ???: no (fixme)
+
+
+Both lines now report the fixme warning as expected. Now let me find and run the existing test file covering this module.
+
+```bash-action
+cd /testbed && ls tests/checkers/ | grep -i misc
+```2026_09_21_10_24_17899862572026_09_21_10_23_1789986237
+executing输出 unittest_misc.py
+
+
+Let me check what test config for notes exists, and grep for other occurrences of the same `\b` bug pattern in this file/repo.
+
+```bash-action
+cd /testbed && grep -n "notes" tests/checkers/unittest_misc.py | head -30; echo "---"; grep -rn ')\\b"' pylint/checkers/misc.py
+```2026_09_21_10_24_17899862572026_09_21_10_24_1789986258
+executing输出 71:    @set_config(notes=[])
+81:    @set_config(notes=["CODETAG"])
+---
+
+
+```bash-action
+cd /testbed && sed -n '1,120p' tests/checkers/unittest_misc.py
+```2026_09_21_10_24_1789986259
+executing输出 # Copyright (c) 2013-2014, 2016-2020 Claudiu Popa <pcmanticore@gmail.com>
+# Copyright (c) 2013-2014 Google, Inc.
+# Copyright (c) 2013-2014 LOGILAB S.A. (Paris, FRANCE) <contact@logilab.fr>
+# Copyright (c) 2014 Arun Persaud <arun@nubati.net>
+# Copyright (c) 2015 Ionel Cristian Maries <contact@ionelmc.ro>
+# Copyright (c) 2016 Derek Gustafson <degustaf@gmail.com>
+# Copyright (c) 2016 glegoux <gilles.legoux@gmail.com>
+# Copyright (c) 2018 Rogalski, Lukasz <lukasz.rogalski@intel.com>
+# Copyright (c) 2018 Anthony Sottile <asottile@umich.edu>
+# Copyright (c) 2019-2021 Pierre Sassoulas <pierre.sassoulas@gmail.com>
+# Copyright (c) 2019 Ashley Whetter <ashley@awhetter.co.uk>
+# Copyright (c) 2020 hippo91 <guillaume.peillex@gmail.com>
+# Copyright (c) 2021 Daniël van Noord <13665637+DanielNoord@users.noreply.github.com>
+# Copyright (c) 2021 Marc Mueller <30130371+cdce8p@users.noreply.github.com>
+
+# Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+# For details: https://github.com/PyCQA/pylint/blob/main/LICENSE
+
+"""Tests for the misc checker."""
+
+from pylint.checkers import misc
+from pylint.testutils import CheckerTestCase, MessageTest, _tokenize_str, set_config
+
+
+class TestFixme(CheckerTestCase):
+    CHECKER_CLASS = misc.EncodingChecker
+
+    def test_fixme_with_message(self) -> None:
+        code = """a = 1
+                # FIXME message
+                """
+        with self.assertAddsMessages(
+            MessageTest(msg_id="fixme", line=2, args="FIXME message", col_offset=17)
+        ):
+            self.checker.process_tokens(_tokenize_str(code))
+
+    def test_todo_without_message(self) -> None:
+        code = """a = 1
+                # TODO
+                """
+        with self.assertAddsMessages(
+            MessageTest(msg_id="fixme", line=2, args="TODO", col_offset=17)
+        ):
+            self.checker.process_tokens(_tokenize_str(code))
+
+    def test_xxx_without_space(self) -> None:
+        code = """a = 1
+                #XXX
+            
+....(省略中间部分)...
+          MessageTest(msg_id="fixme", line=2, args="FIXME", col_offset=17)
+        ):
+            self.checker.process_tokens(_tokenize_str(code))
+
+    @set_config(notes=[])
+    def test_absent_codetag(self) -> None:
+        code = """a = 1
+                # FIXME	                # FIXME
+                # TODO	                # TODO
+                # XXX	                # XXX
+                """
+        with self.assertNoMessages():
+            self.checker.process_tokens(_tokenize_str(code))
+
+    @set_config(notes=["CODETAG"])
+    def test_other_present_codetag(self) -> None:
+        code = """a = 1
+                # CODETAG
+                # FIXME
+                """
+        with self.assertAddsMessages(
+            MessageTest(msg_id="fixme", line=2, args="CODETAG", col_offset=17)
+        ):
+            self.checker.process_tokens(_tokenize_str(code))
+
+    def test_issue_2321_should_not_trigger(self) -> None:
+        code = 'print("# TODO this should not trigger a fixme")'
+        with self.assertNoMessages():
+            self.checker.process_tokens(_tokenize_str(code))
+
+    def test_issue_2321_should_trigger(self) -> None:
+        code = "# TODO this should not trigger a fixme"
+        with self.assertAddsMessages(
+            MessageTest(
+                msg_id="fixme",
+                line=1,
+                args="TODO this should not trigger a fixme",
+                col_offset=1,
+            )
+        ):
+            self.checker.process_tokens(_tokenize_str(code))
+
+    def test_dont_trigger_on_todoist(self) -> None:
+        code = """
+        # Todoist API: What is this task about?
+        # Todoist API: Look up a task's due date
+        # Todoist API: Look up a Project/Label/Task ID
+        # Todoist API: Fetch all labels
+        # Todoist API: "Name" value
+        # Todoist API: Get a task's priority
+        # Todoist API: Look up the Project ID a Task belongs to
+        # Todoist API: Fetch all Projects
+        # Todoist API: Fetch all Tasks
+        """
+
+
+Let me run the existing test suite for this module to make sure nothing broke.
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest tests/checkers/unittest_misc.py -q 2>&1 | tail -15
+```2026_09_21_10_24_17899862602026_09_21_10_23_17899862372026_09_21_10_24_1789986262
+executing输出 ..........                                                               [100%]
+=============================== warnings summary ===============================
+../opt/miniconda3/envs/testbed/lib/python3.9/site-packages/astroid/interpreter/_import/util.py:7
+    import pkg_resources
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+10 passed, 1 warning in 0.01s
+
+
+All 10 existing tests pass. Let me also verify the `notes-rgx` path and a couple of edge cases (like Todoist not triggering, and a punctuation note regex).
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+from pylint.checkers import misc
+from pylint.testutils import CheckerTestCase, MessageTest, _tokenize_str, set_config, UnittestLinter
+from pylint.utils.ast_walker import ASTWalker
+
+class T(CheckerTestCase):
+    CHECKER_CLASS = misc.EncodingChecker
+
+t = T()
+t.setup_method()
+t.checker.config.notes_rgx = ''
+t.checker.config.notes = ['YES','???']
+t.checker.open()
+import tokenize, io
+def toks(code):
+    return list(tokenize.generate_tokens(io.StringIO(code).readline))
+t.checker.process_tokens(toks('# YES: yes\n# ???: no\n'))
+print('msgs:', [m.msg_id for m in t.linter.release_messages()])
+"
+```2026_09_21_10_24_17899862622026_09_21_10_24_17899862642026_09_21_10_24_1789986262
+executing输出 msgs: ['fixme', 'fixme']
+
+
+Both the punctuation note (`???`) and the regular note (`YES`) are detected. The fix works and existing tests pass.
+
+Let me do a final review of the diff.
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_10_24_17899862662026_09_21_10_23_17899862372026_09_21_10_24_17899862682026_09_21_10_24_1789986266
+executing输出 diff --git a/pylint/checkers/misc.py b/pylint/checkers/misc.py
+index 69149e61..87026530 100755
+--- a/pylint/checkers/misc.py
++++ b/pylint/checkers/misc.py
+@@ -121,9 +121,9 @@ class EncodingChecker(BaseChecker):
+ 
+         notes = "|".join(re.escape(note) for note in self.config.notes)
+         if self.config.notes_rgx:
+-            regex_string = rf"#\s*({notes}|{self.config.notes_rgx})\b"
++            regex_string = rf"#\s*({notes}|{self.config.notes_rgx})(?![a-zA-Z0-9_])"
+         else:
+-            regex_string = rf"#\s*({notes})\b"
++            regex_string = rf"#\s*({notes})(?![a-zA-Z0-9_])"
+ 
+         self._fixme_pattern = re.compile(regex_string, re.I)
+ 
+
+
+The fix is complete and verified:
+
+1. **Root cause**: The regex used `\b` (word boundary) after the note tag. `\b` requires a transition between a word char and non-word char. When a note tag is entirely punctuation (e.g. `???`), there's no such transition after the tag, so the pattern never matched.
+
+2. **Fix**: Replaced `\b` with a negative lookahead `(?![a-zA-Z0-9_])`, which still prevents matching a note inside a longer word (e.g. `YESNO`) while correctly allowing notes that end in punctuation.
+
+3. **Verification**:
+   - Reproduced the issue: `???` note was ignored before, now both `YES` and `???` emit W0511.
+   - Existing tests in `tests/checkers/unittest_misc.py` all pass (10 passed).
+   - Edge case `YESNO` still not falsely matched.
+   - Both `notes` and `notes_rgx` code paths updated.
+
+The change is minimal and touches only the two `\b` occurrences (same bug pattern in both branches of the `if`), no test files or new files created.
+
+```bash-action
+exit
+```

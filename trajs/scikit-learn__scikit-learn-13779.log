@@ -1,0 +1,278 @@
+plan-unwanted
+我先复现这个 bug，定位出问题的源码。
+
+```bash-action
+cd /testbed && python -c "
+import numpy as np
+from sklearn.datasets import load_iris
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+X, y = load_iris(return_X_y=True)
+voter = VotingClassifier(estimators=[('lr', LogisticRegression()), ('rf', RandomForestClassifier())])
+voter.fit(X, y, sample_weight=np.ones(y.shape))
+voter.set_params(lr=None)
+voter.fit(X, y, sample_weight=np.ones(y.shape))
+print('no error')
+"
+```
+executing输出 Traceback (most recent call last):
+  File "<string>", line 2, in <module>
+ModuleNotFoundError: No module named 'numpy'
+
+
+环境里的 python 可能路径不对，我查一下正确的解释器。
+
+```bash-action
+cd /testbed && which python python3; python3 -c "import numpy; print(numpy.__version__)"; ls
+```2026_09_21_10_33_1789986810
+executing输出 /opt/miniconda3/bin/python
+/opt/miniconda3/bin/python3
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'numpy'
+CONTRIBUTING.md
+COPYING
+ISSUE_TEMPLATE.md
+MANIFEST.in
+Makefile
+My_agent.py
+PULL_REQUEST_TEMPLATE.md
+README.rst
+__pycache__
+actions.py
+appveyor.yml
+azure-pipelines.yml
+benchmarks
+build
+build_tools
+chat_export.py
+chat_history
+conftest.py
+doc
+examples
+lgtm.yml
+llm.py
+maint_tools
+scikit_learn.egg-info
+setup.cfg
+setup.py
+site.cfg
+sklearn
+system_prompt.txt
+
+
+也许有单独的 conda 环境。我看看有哪些环境。
+
+```bash-action
+conda env list; ls /opt/miniconda3/envs/ 2>/dev/null
+```2026_09_21_10_33_17899868112026_09_21_10_33_1789986811
+executing输出 # conda environments:
+#
+base                     /opt/miniconda3
+testbed                  /opt/miniconda3/envs/testbed
+
+testbed
+
+
+用 testbed 环境的 python。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import numpy as np
+from sklearn.datasets import load_iris
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+X, y = load_iris(return_X_y=True)
+voter = VotingClassifier(estimators=[('lr', LogisticRegression()), ('rf', RandomForestClassifier())])
+voter.fit(X, y, sample_weight=np.ones(y.shape))
+voter.set_params(lr=None)
+voter.fit(X, y, sample_weight=np.ones(y.shape))
+print('no error')
+"
+```2026_09_21_10_33_17899868122026_09_21_10_33_1789986812
+executing输出 Traceback (most recent call last):
+  File "<string>", line 10, in <module>
+  File "/testbed/sklearn/ensemble/voting.py", line 273, in fit
+    return super().fit(X, transformed_y, sample_weight)
+  File "/testbed/sklearn/ensemble/voting.py", line 81, in fit
+    if not has_fit_parameter(step, 'sample_weight'):
+  File "/testbed/sklearn/utils/validation.py", line 808, in has_fit_parameter
+    return parameter in signature(estimator.fit).parameters
+AttributeError: 'NoneType' object has no attribute 'fit'
+
+
+Bug 复现成功。我看一下 `voting.py` 第 81 行附近的代码。
+
+```bash-action
+cd /testbed && sed -n '60,110p' sklearn/ensemble/voting.py
+```2026_09_21_10_33_1789986815
+executing输出         """Collect results from clf.predict calls. """
+        return np.asarray([clf.predict(X) for clf in self.estimators_]).T
+
+    @abstractmethod
+    def fit(self, X, y, sample_weight=None):
+        """
+        common fit operations.
+        """
+        if self.estimators is None or len(self.estimators) == 0:
+            raise AttributeError('Invalid `estimators` attribute, `estimators`'
+                                 ' should be a list of (string, estimator)'
+                                 ' tuples')
+
+        if (self.weights is not None and
+                len(self.weights) != len(self.estimators)):
+            raise ValueError('Number of `estimators` and weights must be equal'
+                             '; got %d weights, %d estimators'
+                             % (len(self.weights), len(self.estimators)))
+
+        if sample_weight is not None:
+            for name, step in self.estimators:
+                if not has_fit_parameter(step, 'sample_weight'):
+                    raise ValueError('Underlying estimator \'%s\' does not'
+                                     ' support sample weights.' % name)
+
+        names, clfs = zip(*self.estimators)
+        self._validate_names(names)
+
+        n_isnone = np.sum([clf is None for _, clf in self.estimators])
+        if n_isnone == len(self.estimators):
+            raise ValueError('All estimators are None. At least one is '
+                             'required!')
+
+        self.estimators_ = Parallel(n_jobs=self.n_jobs)(
+                delayed(_parallel_fit_estimator)(clone(clf), X, y,
+                                                 sample_weight=sample_weight)
+                for clf in clfs if clf is not None)
+
+        self.named_estimators_ = Bunch()
+        for k, e in zip(self.estimators, self.estimators_):
+            self.named_estimators_[k[0]] = e
+        return self
+
+    def set_params(self, **params):
+        """ Setting the parameters for the ensemble estimator
+
+        Valid parameter keys can be listed with get_params().
+
+        Parameters
+        ----------
+        **params : keyword arguments
+
+
+找到根因了。第 80-84 行的 sample_weight 检查循环遍历所有 estimator，包括 `None` 的，没有跳过 `None`。我先 grep 一下同类文件是否有相同格式问题。
+
+```bash-action
+cd /testbed && grep -rn "has_fit_parameter" sklearn/ensemble/
+```
+executing输出 sklearn/ensemble/bagging.py:23:from ..utils.validation import has_fit_parameter, check_is_fitted
+sklearn/ensemble/bagging.py:69:    support_sample_weight = has_fit_parameter(ensemble.base_estimator_,
+grep: sklearn/ensemble/__pycache__/weight_boosting.cpython-36.pyc: binary file matches
+grep: sklearn/ensemble/__pycache__/voting.cpython-36.pyc: binary file matches
+grep: sklearn/ensemble/__pycache__/bagging.cpython-36.pyc: binary file matches
+sklearn/ensemble/weight_boosting.py:40:from ..utils.validation import has_fit_parameter
+sklearn/ensemble/weight_boosting.py:443:        if not has_fit_parameter(self.base_estimator_, "sample_weight"):
+sklearn/ensemble/voting.py:25:from ..utils.validation import has_fit_parameter, check_is_fitted
+sklearn/ensemble/voting.py:81:                if not has_fit_parameter(step, 'sample_weight'):
+
+
+只有 `voting.py` 的循环里会遍历可能为 None 的 estimator。同样地，`VotingRegressor` 也复用这个 `_BaseVoting.fit`，所以改一处即可覆盖两者。
+
+我看一下这一段的完整上下文，确认修改点。
+
+```bash-action
+cd /testbed && sed -n '78,86p' sklearn/ensemble/voting.py
+```2026_09_21_10_33_1789986817
+executing输出 
+        if sample_weight is not None:
+            for name, step in self.estimators:
+                if not has_fit_parameter(step, 'sample_weight'):
+                    raise ValueError('Underlying estimator \'%s\' does not'
+                                     ' support sample weights.' % name)
+
+        names, clfs = zip(*self.estimators)
+        self._validate_names(names)
+
+
+修改循环，跳过 `None` 的 estimator。
+
+```bash-action
+cd /testbed && python - <<'EOF'
+import re
+p = 'sklearn/ensemble/voting.py'
+s = open(p).read()
+old = """        if sample_weight is not None:
+            for name, step in self.estimators:
+                if not has_fit_parameter(step, 'sample_weight'):
+                    raise ValueError('Underlying estimator \\'%s\\' does not'
+                                     ' support sample weights.' % name)
+"""
+new = """        if sample_weight is not None:
+            for name, step in self.estimators:
+                if step is None:
+                    continue
+                if not has_fit_parameter(step, 'sample_weight'):
+                    raise ValueError('Underlying estimator \\'%s\\' does not'
+                                     ' support sample weights.' % name)
+"""
+assert old in s, "old block not found"
+s = s.replace(old, new)
+open(p, 'w').write(s)
+print("patched")
+EOF
+```2026_09_21_10_33_17899868182026_09_21_10_33_1789986818
+executing输出 patched
+
+
+重新跑复现脚本确认修好。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -c "
+import numpy as np
+from sklearn.datasets import load_iris
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+X, y = load_iris(return_X_y=True)
+voter = VotingClassifier(estimators=[('lr', LogisticRegression()), ('rf', RandomForestClassifier())])
+voter.fit(X, y, sample_weight=np.ones(y.shape))
+voter.set_params(lr=None)
+voter.fit(X, y, sample_weight=np.ones(y.shape))
+print('no error')
+"
+```2026_09_21_10_33_17899868192026_09_21_10_33_1789986819
+executing输出 no error
+
+
+修复生效。跑一下覆盖 voting 模块的已有测试文件。
+
+```bash-action
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest sklearn/ensemble/tests/test_voting.py -q 2>&1 | tail -20
+```2026_09_21_10_33_17899868212026_09_21_10_33_17899868212026_09_21_10_33_1789986822
+executing输出 ..................                                                       [100%]
+18 passed, 1 warning in 1.57s
+
+
+测试全部通过。最后确认 git diff。
+
+```bash-action
+cd /testbed && git diff
+```2026_09_21_10_33_17899868242026_09_21_10_33_17899868242026_09_21_10_33_1789986825
+executing输出 diff --git a/sklearn/ensemble/voting.py b/sklearn/ensemble/voting.py
+index 7afa7180c..d8e14b152 100755
+--- a/sklearn/ensemble/voting.py
++++ b/sklearn/ensemble/voting.py
+@@ -78,6 +78,8 @@ class _BaseVoting(_BaseComposition, TransformerMixin):
+ 
+         if sample_weight is not None:
+             for name, step in self.estimators:
++                if step is None:
++                    continue
+                 if not has_fit_parameter(step, 'sample_weight'):
+                     raise ValueError('Underlying estimator \'%s\' does not'
+                                      ' support sample weights.' % name)
+
+
+改动确认无误：只在 sample_weight 检查循环里跳过了 `None` 的 estimator，这是最小必要的修复，能同时覆盖 `VotingClassifier` 和 `VotingRegressor`。
+
+```bash-action
+exit
+```

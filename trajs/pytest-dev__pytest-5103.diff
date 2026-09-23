@@ -1,0 +1,208 @@
+diff --git a/src/_pytest/assertion/rewrite.py b/src/_pytest/assertion/rewrite.py
+index 2903b899..a3230121 100755
+--- a/src/_pytest/assertion/rewrite.py
++++ b/src/_pytest/assertion/rewrite.py
+@@ -549,6 +549,19 @@ def _call_reprcompare(ops, results, expls, each_obj):
+     return expl
+ 
+ 
++def _format_all_any(explanations, is_all):
++    """Format the explanation for an ``all()``/``any()`` call.
++
++    The explanations are collected in the order in which the elements of
++    the iterable were evaluated.  Since evaluation stops at the first
++    element that makes the whole expression fail, the last collected
++    explanation describes that element.
++    """
++    if explanations:
++        return explanations[-1]
++    return ""
++
++
+ unary_map = {ast.Not: "not %s", ast.Invert: "~%s", ast.USub: "-%s", ast.UAdd: "+%s"}
+ 
+ binop_map = {
+@@ -964,10 +977,183 @@ warn_explicit(
+         res = self.assign(ast.BinOp(left_expr, binop.op, right_expr))
+         return res, explanation
+ 
++    def _visit_aux(self, node, body):
++        """Visit *node* for auxiliary purposes, discarding any explanation
++        information so that it does not leak into the outer assertion report.
++        """
++        save_stmt = self.statements
++        save_fail = self.on_failure
++        self.statements = body
++        self.on_failure = []
++        self.push_format_context()
++        try:
++            res, expl = self.visit(node)
++            self.pop_format_context(ast.Str(expl))
++        finally:
++            self.statements = save_stmt
++            self.on_failure = save_fail
++        return res
++
++    def _is_all_any_call(self, call):
++        """Return True if *call* is an ``all()``/``any()`` call we can unroll."""
++        if not isinstance(call.func, ast.Name):
++            return False
++        if call.func.id not in ("all", "any"):
++            return False
++        if len(call.args) != 1 or call.keywords:
++            return False
++        arg = call.args[0]
++        if not isinstance(arg, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
++            return False
++        return True
++
++    def _visit_all_any(self, call):
++        """Unroll an ``all()``/``any()`` call over a comprehension.
++
++        This rewrites e.g. ``all(pred(x) for x in it)`` into a loop which
++        evaluates ``pred(x)`` for every element until one makes the whole
++        expression fail.  The explanation of that element is recorded so
++        that it can be reported, giving a message similar to the one
++        produced by an explicit ``for`` loop.
++        """
++        is_all = call.func.id == "all"
++        arg = call.args[0]
++
++        # ``@py_assertN`` holding the overall result.  If the loop never
++        # breaks the result is the default value (True for all, False for
++        # any).
++        result_name = self.variable()
++        self.statements.append(
++            ast.Assign([ast.Name(result_name, ast.Store())], _NameConstant(is_all))
++        )
++        # List collecting the explanation of every evaluated element.
++        expls_name = self.variable()
++        self.statements.append(
++            ast.Assign([ast.Name(expls_name, ast.Store())], ast.List([], ast.Load()))
++        )
++
++        self._unroll_generators(
++            arg.generators, 0, self.statements, is_all, arg.elt, result_name, expls_name
++        )
++
++        expl_template = self.helper(
++            "_format_all_any",
++            ast.Name(expls_name, ast.Load()),
++            _NameConstant(is_all),
++        )
++        expl = self.explanation_param(expl_template)
++        return ast.Name(result_name, ast.Load()), expl
++
++    def _unroll_generators(
++        self, generators, index, body, is_all, elt, result_name, expls_name
++    ):
++        """Build the nested ``for``/``if`` statements for *generators* into *body*."""
++        if index == len(generators):
++            self._build_predicate_check(
++                body, is_all, elt, result_name, expls_name
++            )
++            return
++
++        gen = generators[index]
++        # The iterable of a ``for`` clause is evaluated once, in the scope
++        # enclosing the loop.
++        iter_node = self._visit_aux(gen.iter, body)
++
++        # The ``if`` clauses are evaluated for every iteration, so they
++        # belong inside the loop body.
++        for_body = []
++        self._build_filters(
++            gen, 0, for_body, generators, index, is_all, elt, result_name, expls_name
++        )
++        body.append(ast.For(gen.target, iter_node, for_body, []))
++
++    def _build_filters(
++        self,
++        gen,
++        filter_index,
++        body,
++        generators,
++        index,
++        is_all,
++        elt,
++        result_name,
++        expls_name,
++    ):
++        """Build the ``if`` clauses of a comprehension generator into *body*."""
++        if filter_index == len(gen.ifs):
++            # No more filters: descend into the next generator (or emit the
++            # predicate check for the innermost one).
++            self._unroll_generators(
++                generators, index + 1, body, is_all, elt, result_name, expls_name
++            )
++            return
++
++        cond = gen.ifs[filter_index]
++        cond_node = self._visit_aux(cond, body)
++
++        inner = []
++        body.append(ast.If(cond_node, inner, []))
++        self._build_filters(
++            gen,
++            filter_index + 1,
++            inner,
++            generators,
++            index,
++            is_all,
++            elt,
++            result_name,
++            expls_name,
++        )
++
++    def _build_predicate_check(
++        self, body, is_all, elt, result_name, expls_name
++    ):
++        """Evaluate ``elt`` and record whether it makes the assertion fail."""
++        save_stmt = self.statements
++        save_fail = self.on_failure
++        self.statements = body
++        self.on_failure = body
++        try:
++            self.push_format_context()
++            pred_res, pred_expl = self.visit(elt)
++            expl_format = self.pop_format_context(ast.Str(pred_expl))
++        finally:
++            self.statements = save_stmt
++            self.on_failure = save_fail
++
++        body.append(
++            ast.Expr(
++                ast_Call(
++                    ast.Attribute(
++                        ast.Name(expls_name, ast.Load()), "append", ast.Load()
++                    ),
++                    [expl_format],
++                    [],
++                )
++            )
++        )
++
++        if is_all:
++            test = ast.UnaryOp(ast.Not(), pred_res)
++        else:
++            test = pred_res
++        set_result = ast.Assign(
++            [ast.Name(result_name, ast.Store())], _NameConstant(not is_all)
++        )
++        body.append(ast.If(test, [set_result, ast.Break()], []))
++
+     def visit_Call_35(self, call):
+         """
+         visit `ast.Call` nodes on Python3.5 and after
+         """
++        # Special-case ``all(...)``/``any(...)`` so that the iterable is
++        # unrolled and the report points at the element that made the
++        # assertion fail (see issue #5086).
++        if self._is_all_any_call(call):
++            res, expl = self._visit_all_any(call)
++            if res is not None:
++                return res, expl
++
+         new_func, func_expl = self.visit(call.func)
+         arg_expls = []
+         new_args = []
